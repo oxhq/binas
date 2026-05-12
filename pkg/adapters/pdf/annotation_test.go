@@ -2,6 +2,7 @@ package pdf
 
 import (
 	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -34,7 +35,7 @@ func TestApplyAnnotationContentsEditUpdatesContentsAndCanonicalWrites(t *testing
 	if report.OldContents != "old note" || report.NewContents != "new (note) - ok" {
 		t.Fatalf("contents report = old %q new %q", report.OldContents, report.NewContents)
 	}
-	if report.AppearanceRegenerated || !strings.Contains(report.AppearanceNote, "not implemented") {
+	if report.AppearanceRegenerated || !strings.Contains(report.AppearanceNote, "left unchanged") {
 		t.Fatalf("appearance report = regenerated %v note %q", report.AppearanceRegenerated, report.AppearanceNote)
 	}
 	if report.AppearanceInvalidated || report.AppearanceRemoved {
@@ -92,6 +93,137 @@ func TestApplyAnnotationContentsEditCanRemoveStaleAppearance(t *testing.T) {
 	}
 }
 
+func TestApplyAnnotationContentsEditCanRegenerateBasicTextAppearance(t *testing.T) {
+	input := testPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Page /Annots [3 0 R] >>",
+		"<< /Type /Annot /Subtype /FreeText /Rect [10 20 90 50] /Contents (old note) /AP << /N 4 0 R >> >>",
+		"<< /Length 0 >>\nstream\n\nendstream",
+	)
+
+	output, report, verification, err := ApplyAnnotationContentsEdit(input, 0, "fresh (note) - ok", AnnotationContentsEditOptions{
+		RegenerateAppearance: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !report.AppearanceRegenerated || report.AppearanceInvalidated || report.AppearanceRemoved {
+		t.Fatalf("appearance report = regenerated %v invalidated %v removed %v note %q", report.AppearanceRegenerated, report.AppearanceInvalidated, report.AppearanceRemoved, report.AppearanceNote)
+	}
+	if !strings.Contains(report.AppearanceNote, "basic") {
+		t.Fatalf("appearance note = %q, want basic regeneration note", report.AppearanceNote)
+	}
+	if !verification.ReparseOK || !verification.ContentsUpdated || !verification.PageUnchanged || !verification.AppearanceRegenerated || verification.AppearanceInvalidated || verification.AppearanceRemoved {
+		t.Fatalf("verification = %+v", verification)
+	}
+	if !annotationCandidateHasNormalAppearanceStream(t, output, 0) {
+		t.Fatalf("updated annotation missing reparsed /AP /N stream:\n%s", output)
+	}
+	for _, want := range [][]byte{
+		[]byte("/AP << /N 5 0 R >>"),
+		[]byte("/Subtype /Form"),
+		[]byte("/BBox [0 0 80 30]"),
+		[]byte("/BaseFont /Helvetica"),
+		[]byte(`/Helv 10 Tf`),
+		[]byte(`(fresh \(note\) \055) Tj`),
+		[]byte(`(ok) Tj`),
+	} {
+		if !bytes.Contains(output, want) {
+			t.Fatalf("output missing %q:\n%s", want, output)
+		}
+	}
+}
+
+func TestApplyAnnotationContentsEditRegeneratesMultilineWrappedAppearance(t *testing.T) {
+	input := testPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Page /Annots [3 0 R] >>",
+		"<< /Type /Annot /Subtype /FreeText /Rect [10 20 74 60] /Contents (old note) >>",
+	)
+
+	output, _, verification, err := ApplyAnnotationContentsEdit(input, 0, "first (line)\nsecond wraps here", AnnotationContentsEditOptions{
+		RegenerateAppearance: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.AppearanceRegenerated {
+		t.Fatalf("verification = %+v", verification)
+	}
+	for _, want := range [][]byte{
+		[]byte("0 0 64 40 re W n"),
+		[]byte(`(first \(line\)) Tj`),
+		[]byte("(second wraps) Tj"),
+		[]byte("(here) Tj"),
+		[]byte("0 -12 Td"),
+	} {
+		if !bytes.Contains(output, want) {
+			t.Fatalf("output missing %q:\n%s", want, output)
+		}
+	}
+}
+
+func TestApplyAnnotationContentsEditRegenerateAppearanceTruncatesToRectHeight(t *testing.T) {
+	input := testPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Page /Annots [3 0 R] >>",
+		"<< /Type /Annot /Subtype /Text /Rect [0 0 100 16] /Contents (old note) >>",
+	)
+
+	output, _, verification, err := ApplyAnnotationContentsEdit(input, 0, "visible\ntruncated", AnnotationContentsEditOptions{
+		RegenerateAppearance: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.AppearanceRegenerated {
+		t.Fatalf("verification = %+v", verification)
+	}
+	if !bytes.Contains(output, []byte("(visible) Tj")) {
+		t.Fatalf("visible line missing:\n%s", output)
+	}
+	if bytes.Contains(output, []byte("(truncated) Tj")) {
+		t.Fatalf("line outside rectangle was not truncated:\n%s", output)
+	}
+}
+
+func TestApplyAnnotationContentsEditRegenerateAppearanceFailsWithoutUsableRect(t *testing.T) {
+	input := testPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Page /Annots [3 0 R] >>",
+		"<< /Type /Annot /Subtype /Text /Contents (old note) >>",
+	)
+
+	_, _, _, err := ApplyAnnotationContentsEdit(input, 0, "new note", AnnotationContentsEditOptions{
+		RegenerateAppearance: true,
+	})
+	if err == nil {
+		t.Fatal("expected regenerate appearance to fail without a usable Rect")
+	}
+	if !strings.Contains(err.Error(), "no usable /Rect") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestApplyAnnotationContentsEditRegenerateAppearanceFailsForUnsupportedSubtype(t *testing.T) {
+	input := testPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Page /Annots [3 0 R] >>",
+		"<< /Type /Annot /Subtype /Square /Rect [0 0 10 10] /Contents (old note) >>",
+	)
+
+	_, _, _, err := ApplyAnnotationContentsEdit(input, 0, "new note", AnnotationContentsEditOptions{
+		RegenerateAppearance: true,
+	})
+	if err == nil {
+		t.Fatal("expected regenerate appearance to fail for unsupported subtype")
+	}
+	if !strings.Contains(err.Error(), `unsupported annotation subtype "Square"`) {
+		t.Fatalf("error = %q", err)
+	}
+}
+
 func TestApplyAnnotationContentsEditUsesZeroBasedIndex(t *testing.T) {
 	input := testPDF(
 		"<< /Type /Catalog /Pages 2 0 R >>",
@@ -122,8 +254,8 @@ func TestApplyAnnotationContentsEditUsesZeroBasedIndex(t *testing.T) {
 func TestListAnnotationCandidatesIncludesStableMetadata(t *testing.T) {
 	input := testPDF(
 		"<< /Type /Catalog /Pages 2 0 R >>",
-		"<< /Type /Page /Annots [3 0 R << /Subtype /FreeText /Rect [0.5 -1 20 20.25] /Contents <FEFF0069006E006C0069006E0065> /F 513 >> << /Subtype /Square /Rect [0 0 10] /Contents (unsupported rect) >>] >>",
-		"<< /Type /Annot /Subtype /Text /Rect [0 0 10 10] /Contents (indirect note) /F 628 /AP << /N 4 0 R >> >>",
+		"<< /Type /Page /Annots [3 0 R << /Subtype /FreeText /Rect [0.5 -1 20 20.25] /Contents <FEFF0069006E006C0069006E0065> /NM <696E6C696E652D6E616D65> /M (D:20260505090200-08'00') /T (Inline Reviewer) /F 513 /C [0.25 0.5 0.75] /Border [1 2 3.5] /QuadPoints [0 0 20 0 20 20 0 20] >> << /Subtype /Square /Rect [0 0 10] /Contents (unsupported rect) /NM /not-text /M 42 /T [ (bad) ] /C /Red /Border [0 /solid 1] /QuadPoints [0 0 1 1] >>] >>",
+		"<< /Type /Annot /Subtype /Text /Rect [0 0 10 10] /Contents (indirect note) /NM (note-001) /M (D:20260505090100-08'00') /T <FEFF00440061007600690064> /F 628 /AP << /N 4 0 R >> /C [1 0.5 0] /Border [0 0 2] /QuadPoints [0 0 10 0 10 10 0 10 1 1 11 1 11 11 1 11] >>",
 		"<< /Length 0 >>\nstream\n\nendstream",
 	)
 
@@ -145,7 +277,15 @@ func TestListAnnotationCandidatesIncludesStableMetadata(t *testing.T) {
 	if first.Subtype != "Text" || first.Contents != "indirect note" || !first.HasAppearance {
 		t.Fatalf("first annotation metadata = %+v", first)
 	}
+	if first.Name != "note-001" || first.Modified != "D:20260505090100-08'00'" || first.Title != "David" {
+		t.Fatalf("first annotation common fields = name %q modified %q title %q", first.Name, first.Modified, first.Title)
+	}
 	assertFloat64SliceEqual(t, first.Rect, []float64{0, 0, 10, 10})
+	assertFloat64SliceEqual(t, first.Color, []float64{1, 0.5, 0})
+	assertFloat64SliceEqual(t, first.Border, []float64{0, 0, 2})
+	if first.QuadPointsCount != 2 {
+		t.Fatalf("first quad points count = %d, want 2", first.QuadPointsCount)
+	}
 	if first.Flags != 628 {
 		t.Fatalf("first flags = %d, want 628", first.Flags)
 	}
@@ -163,7 +303,15 @@ func TestListAnnotationCandidatesIncludesStableMetadata(t *testing.T) {
 	if second.Subtype != "FreeText" || second.Contents != "inline" || second.HasAppearance {
 		t.Fatalf("second annotation metadata = %+v", second)
 	}
+	if second.Name != "inline-name" || second.Modified != "D:20260505090200-08'00'" || second.Title != "Inline Reviewer" {
+		t.Fatalf("second annotation common fields = name %q modified %q title %q", second.Name, second.Modified, second.Title)
+	}
 	assertFloat64SliceEqual(t, second.Rect, []float64{0.5, -1, 20, 20.25})
+	assertFloat64SliceEqual(t, second.Color, []float64{0.25, 0.5, 0.75})
+	assertFloat64SliceEqual(t, second.Border, []float64{1, 2, 3.5})
+	if second.QuadPointsCount != 1 {
+		t.Fatalf("second quad points count = %d, want 1", second.QuadPointsCount)
+	}
 	if second.Flags != 513 {
 		t.Fatalf("second flags = %d, want 513", second.Flags)
 	}
@@ -178,11 +326,27 @@ func TestListAnnotationCandidatesIncludesStableMetadata(t *testing.T) {
 	if third.Subtype != "Square" || third.Contents != "unsupported rect" || third.HasAppearance {
 		t.Fatalf("third annotation metadata = %+v", third)
 	}
+	if third.Name != "" || third.Modified != "" || third.Title != "" {
+		t.Fatalf("third unsupported common fields = name %q modified %q title %q, want empty", third.Name, third.Modified, third.Title)
+	}
 	if third.Rect != nil {
 		t.Fatalf("third rect = %+v, want omitted", third.Rect)
 	}
+	if third.Color != nil || third.Border != nil || third.QuadPointsCount != 0 {
+		t.Fatalf("third style metadata = color %+v border %+v quad count %d, want omitted/zero", third.Color, third.Border, third.QuadPointsCount)
+	}
 	if third.Flags != 0 || len(third.FlagNames) != 0 || third.Invisible || third.Hidden || third.Print || third.NoZoom || third.NoRotate || third.NoView || third.ReadOnly || third.Locked || third.ToggleNoView || third.LockedContents {
 		t.Fatalf("third flags = %+v, want zero-value flags", third)
+	}
+
+	encoded, err := json.Marshal(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{`"color"`, `"border"`, `"quad_points_count"`} {
+		if !bytes.Contains(encoded, []byte(key)) {
+			t.Fatalf("encoded metadata %s missing key %s", encoded, key)
+		}
 	}
 }
 
@@ -265,6 +429,36 @@ func annotationCandidateHasAP(t *testing.T, input []byte, index int) bool {
 	}
 	_, ok := candidates[index].Dict["AP"]
 	return ok
+}
+
+func annotationCandidateHasNormalAppearanceStream(t *testing.T, input []byte, index int) bool {
+	t.Helper()
+
+	graph, err := parsePDFGraph(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates := graph.annotationCandidates()
+	if index < 0 || index >= len(candidates) {
+		t.Fatalf("annotation index %d out of range for %d annotations", index, len(candidates))
+	}
+	ap, ok := candidates[index].Dict["AP"].(pdfDict)
+	if !ok {
+		return false
+	}
+	switch normal := ap["N"].(type) {
+	case pdfRef:
+		object := graph.Objects[normal.ID]
+		if object == nil {
+			return false
+		}
+		_, ok := object.Value.(pdfStreamObject)
+		return ok
+	case pdfStreamObject:
+		return true
+	default:
+		return false
+	}
 }
 
 func assertFloat64SliceEqual(t *testing.T, got, want []float64) {

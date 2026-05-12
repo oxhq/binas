@@ -3,7 +3,13 @@ package main
 import (
 	"bytes"
 	"compress/zlib"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/md5"
+	"crypto/rc4"
 	"encoding/ascii85"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -345,9 +351,9 @@ func TestCLIValidateReportsAcroFormAnnotAndCMapWarnings(t *testing.T) {
 		t.Fatalf("valid = false, errors = %v", result.Errors)
 	}
 	for _, want := range []string{
-		"PDF boundary detected: AcroForm field values require form set; widget appearances are not regenerated",
-		"PDF boundary detected: annotations can update /Contents only; appearance regeneration is not implemented",
-		"PDF boundary detected: font/CMap support is limited to page font-scoped ToUnicode CMaps for simple Tf flows plus one unambiguous fallback; glyph metrics and layout are not verified",
+		"PDF boundary detected: AcroForm field values require form set; simple text/choice widget appearances require --regenerate-appearance",
+		"PDF boundary detected: annotation /Contents updates require annot set-contents; simple text-like appearances require --regenerate-appearance",
+		"PDF boundary detected: font/CMap support is limited to page font-scoped ToUnicode CMaps for simple Tf flows, CMap-backed TJ arrays, and one unambiguous fallback; glyph metrics and layout are not verified",
 	} {
 		if !containsString(result.Warnings, want) {
 			t.Fatalf("warnings = %v, missing %q", result.Warnings, want)
@@ -399,6 +405,399 @@ func TestCLIValidateFailOnInvalidReportsEncryptSignatureAndXFA(t *testing.T) {
 				t.Fatalf("errors = %v, want %q", result.Errors, tc.wantError)
 			}
 		})
+	}
+}
+
+func TestCLIInspectEncryptedPDFJSONIncludesSecurityMetadata(t *testing.T) {
+	path := writeEncryptedFixture(t)
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{"inspect", path, "--format", "pdf", "--json"})
+	})
+	var result struct {
+		Format     string `json:"format"`
+		ParseError string `json:"parse_error"`
+		Root       struct {
+			Security struct {
+				Encrypted  bool `json:"encrypted"`
+				Encryption struct {
+					Present         bool   `json:"present"`
+					Filter          string `json:"filter"`
+					SubFilter       string `json:"sub_filter"`
+					V               int    `json:"v"`
+					R               int    `json:"r"`
+					Length          int    `json:"length"`
+					EncryptMetadata *bool  `json:"encrypt_metadata"`
+					ObjectNumber    int    `json:"object_number"`
+				} `json:"encryption"`
+			} `json:"security"`
+		} `json:"root"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.ParseError != "unsupported PDF: encrypted PDFs require an explicit password-capable path; Adapter.Parse does not decrypt" {
+		t.Fatalf("parse_error = %q", result.ParseError)
+	}
+	enc := result.Root.Security.Encryption
+	if !result.Root.Security.Encrypted || !enc.Present || enc.Filter != "Standard" || enc.SubFilter != "adbe.pkcs7.s5" {
+		t.Fatalf("security metadata = %+v", result.Root.Security)
+	}
+	if enc.V != 4 || enc.R != 4 || enc.Length != 128 || enc.EncryptMetadata == nil || *enc.EncryptMetadata || enc.ObjectNumber != 2 {
+		t.Fatalf("encryption metadata = %+v, want parsed Standard metadata", enc)
+	}
+}
+
+func TestCLIValidateEncryptedPDFJSONIncludesSecurityMetadata(t *testing.T) {
+	path := writeEncryptedFixture(t)
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{"validate", path, "--format", "pdf", "--json"})
+	})
+	var result validationResult
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Valid {
+		t.Fatal("valid = true, want false")
+	}
+	root := result.Root.(map[string]any)
+	security := root["security"].(map[string]any)
+	encryption := security["encryption"].(map[string]any)
+	if security["encrypted"] != true || encryption["filter"] != "Standard" || encryption["v"] != float64(4) || encryption["r"] != float64(4) {
+		t.Fatalf("security metadata = %+v", security)
+	}
+}
+
+func TestCLIValidateEncryptedPDFPasswordReportsUnsupportedAlgorithmMetadata(t *testing.T) {
+	path := writeEncryptedFixture(t)
+
+	stdout, err := captureStdoutAndError(t, func() error {
+		return run([]string{"validate", path, "--format", "pdf", "--password", "secret", "--json", "--fail-on-invalid"})
+	})
+	if err == nil {
+		t.Fatal("validate succeeded, want unsupported encryption algorithm error")
+	}
+	if !strings.Contains(err.Error(), "unsupported encryption algorithm/handler") || !strings.Contains(err.Error(), "Filter=Standard") {
+		t.Fatalf("error = %q, want unsupported encryption algorithm metadata", err)
+	}
+	var result validationResult
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Valid || len(result.Errors) != 1 || !strings.Contains(result.Errors[0], "unsupported encryption algorithm/handler") {
+		t.Fatalf("validation result = %+v, want unsupported encryption algorithm error", result)
+	}
+}
+
+func TestCLIQueryEncryptedPDFWithPasswordFindsSelectableText(t *testing.T) {
+	path := writeSupportedEncryptedFixture(t, "08-15-2024")
+
+	validateOut := captureStdout(t, func() error {
+		return run([]string{"validate", path, "--format", "pdf", "--password", "user", "--json", "--fail-on-invalid"})
+	})
+	var validation validationResult
+	if err := json.Unmarshal([]byte(validateOut), &validation); err != nil {
+		t.Fatal(err)
+	}
+	if !validation.Valid || len(validation.Errors) != 0 {
+		t.Fatalf("validation = %+v, want valid encrypted PDF with password", validation)
+	}
+
+	inspectOut := captureStdout(t, func() error {
+		return run([]string{"inspect", path, "--format", "pdf", "--password", "user", "--json"})
+	})
+	var inspect struct {
+		Nodes int `json:"nodes"`
+	}
+	if err := json.Unmarshal([]byte(inspectOut), &inspect); err != nil {
+		t.Fatal(err)
+	}
+	if inspect.Nodes == 0 {
+		t.Fatalf("inspect nodes = %d, want parsed encrypted tree", inspect.Nodes)
+	}
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{"query", path, "--format", "pdf", "--password", "user", "--kind", "pdf.content.text_show", "--text", "08-15-2024", "--json"})
+	})
+	assertCLIQueryCount(t, stdout, 1)
+
+	_, err := captureStdoutAndError(t, func() error {
+		return run([]string{"query", path, "--format", "pdf", "--kind", "pdf.content.text_show", "--text", "08-15-2024", "--json"})
+	})
+	if err == nil || !strings.Contains(err.Error(), "encrypted PDFs require an explicit password") {
+		t.Fatalf("query without password error = %v, want encrypted-PDF refusal", err)
+	}
+}
+
+func TestCLIEditEncryptedPDFWithPasswordCanonicalReencryptsAndVerifies(t *testing.T) {
+	path := writeSupportedEncryptedFixture(t, "08-15-2024")
+	out := filepath.Join(t.TempDir(), "encrypted-out.pdf")
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{
+			"edit", path,
+			"--format", "pdf",
+			"--password", "user",
+			"--rewrite", "auto",
+			"--kind", "pdf.content.text_show",
+			"--text", "08-15-2024",
+			"--replace", "05-05-2026",
+			"-o", out,
+			"--json",
+		})
+	})
+	var result struct {
+		Report struct {
+			Edit          string `json:"edit"`
+			NodesModified int    `json:"nodes_modified"`
+			FallbackUsed  bool   `json:"fallback_used"`
+			OutputPath    string `json:"output_path"`
+		} `json:"report"`
+		Verification struct {
+			ReparseOK      bool `json:"reparse_ok"`
+			OldTextRemoved bool `json:"old_text_removed"`
+			NewSelectable  bool `json:"new_text_selectable"`
+			PageUnchanged  bool `json:"page_count_unchanged"`
+		} `json:"verification"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Report.Edit != "pdf.canonical_content_stream_text_rewrite" || result.Report.NodesModified != 1 || result.Report.FallbackUsed || result.Report.OutputPath != out {
+		t.Fatalf("report = %+v, want canonical encrypted edit", result.Report)
+	}
+	if !result.Verification.ReparseOK || !result.Verification.OldTextRemoved || !result.Verification.NewSelectable || !result.Verification.PageUnchanged {
+		t.Fatalf("verification = %+v, want all text invariants true", result.Verification)
+	}
+	output, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(output, []byte("05-05-2026")) {
+		t.Fatal("output contains plaintext replacement; want re-encrypted content")
+	}
+
+	oldQueryOut := captureStdout(t, func() error {
+		return run([]string{"query", out, "--format", "pdf", "--password", "user", "--kind", "pdf.content.text_show", "--text", "08-15-2024", "--json"})
+	})
+	assertCLIQueryCount(t, oldQueryOut, 0)
+
+	newQueryOut := captureStdout(t, func() error {
+		return run([]string{"query", out, "--format", "pdf", "--password", "user", "--kind", "pdf.content.text_show", "--text", "05-05-2026", "--json"})
+	})
+	assertCLIQueryCount(t, newQueryOut, 1)
+}
+
+func TestCLIEditAESV2EncryptedPDFWithPasswordCanonicalReencryptsAndVerifies(t *testing.T) {
+	path := writeSupportedAESV2EncryptedFixture(t, "08-15-2024")
+	out := filepath.Join(t.TempDir(), "encrypted-aes-out.pdf")
+
+	initialQueryOut := captureStdout(t, func() error {
+		return run([]string{"query", path, "--format", "pdf", "--password", "user", "--kind", "pdf.content.text_show", "--text", "08-15-2024", "--json"})
+	})
+	assertCLIQueryCount(t, initialQueryOut, 1)
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{
+			"edit", path,
+			"--format", "pdf",
+			"--password", "user",
+			"--rewrite", "auto",
+			"--kind", "pdf.content.text_show",
+			"--text", "08-15-2024",
+			"--replace", "05-05-2026",
+			"-o", out,
+			"--json",
+		})
+	})
+	var result struct {
+		Report struct {
+			Edit          string `json:"edit"`
+			NodesModified int    `json:"nodes_modified"`
+			FallbackUsed  bool   `json:"fallback_used"`
+			OutputPath    string `json:"output_path"`
+		} `json:"report"`
+		Verification struct {
+			ReparseOK      bool `json:"reparse_ok"`
+			OldTextRemoved bool `json:"old_text_removed"`
+			NewSelectable  bool `json:"new_text_selectable"`
+			PageUnchanged  bool `json:"page_count_unchanged"`
+		} `json:"verification"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Report.Edit != "pdf.canonical_content_stream_text_rewrite" || result.Report.NodesModified != 1 || result.Report.FallbackUsed || result.Report.OutputPath != out {
+		t.Fatalf("report = %+v, want canonical AESV2 encrypted edit", result.Report)
+	}
+	if !result.Verification.ReparseOK || !result.Verification.OldTextRemoved || !result.Verification.NewSelectable || !result.Verification.PageUnchanged {
+		t.Fatalf("verification = %+v, want all text invariants true", result.Verification)
+	}
+	output, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(output, []byte("05-05-2026")) {
+		t.Fatal("AESV2 output contains plaintext replacement; want re-encrypted content")
+	}
+
+	newQueryOut := captureStdout(t, func() error {
+		return run([]string{"query", out, "--format", "pdf", "--password", "user", "--kind", "pdf.content.text_show", "--text", "05-05-2026", "--json"})
+	})
+	assertCLIQueryCount(t, newQueryOut, 1)
+}
+
+func TestCLIEditAESV2EncryptedPDFStreamLevelCryptWithPasswordCanonicalReencryptsAndVerifies(t *testing.T) {
+	path := writeSupportedAESV2StreamCryptEncryptedFixture(t, "08-15-2024")
+	out := filepath.Join(t.TempDir(), "encrypted-aes-crypt-out.pdf")
+
+	initialQueryOut := captureStdout(t, func() error {
+		return run([]string{"query", path, "--format", "pdf", "--password", "user", "--kind", "pdf.content.text_show", "--text", "08-15-2024", "--json"})
+	})
+	assertCLIQueryCount(t, initialQueryOut, 1)
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{
+			"edit", path,
+			"--format", "pdf",
+			"--password", "user",
+			"--rewrite", "auto",
+			"--kind", "pdf.content.text_show",
+			"--text", "08-15-2024",
+			"--replace", "05-05-2026",
+			"-o", out,
+			"--json",
+		})
+	})
+	var result struct {
+		Report struct {
+			Edit          string `json:"edit"`
+			NodesModified int    `json:"nodes_modified"`
+			FallbackUsed  bool   `json:"fallback_used"`
+			OutputPath    string `json:"output_path"`
+		} `json:"report"`
+		Verification struct {
+			ReparseOK      bool `json:"reparse_ok"`
+			OldTextRemoved bool `json:"old_text_removed"`
+			NewSelectable  bool `json:"new_text_selectable"`
+			PageUnchanged  bool `json:"page_count_unchanged"`
+		} `json:"verification"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Report.Edit != "pdf.canonical_content_stream_text_rewrite" || result.Report.NodesModified != 1 || result.Report.FallbackUsed || result.Report.OutputPath != out {
+		t.Fatalf("report = %+v, want canonical AESV2 stream-level /Crypt edit", result.Report)
+	}
+	if !result.Verification.ReparseOK || !result.Verification.OldTextRemoved || !result.Verification.NewSelectable || !result.Verification.PageUnchanged {
+		t.Fatalf("verification = %+v, want all text invariants true", result.Verification)
+	}
+	output, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(output, []byte("05-05-2026")) {
+		t.Fatal("AESV2 stream-level /Crypt output contains plaintext replacement; want re-encrypted content")
+	}
+
+	oldQueryOut := captureStdout(t, func() error {
+		return run([]string{"query", out, "--format", "pdf", "--password", "user", "--kind", "pdf.content.text_show", "--text", "08-15-2024", "--json"})
+	})
+	assertCLIQueryCount(t, oldQueryOut, 0)
+
+	newQueryOut := captureStdout(t, func() error {
+		return run([]string{"query", out, "--format", "pdf", "--password", "user", "--kind", "pdf.content.text_show", "--text", "05-05-2026", "--json"})
+	})
+	assertCLIQueryCount(t, newQueryOut, 1)
+}
+
+func TestCLIEditEncryptedObjectStreamPDFWithPasswordCanonicalInflatesReencryptsAndVerifies(t *testing.T) {
+	path := writeSupportedEncryptedObjectStreamFixture(t, "08-15-2024")
+	out := filepath.Join(t.TempDir(), "encrypted-object-stream-out.pdf")
+
+	initialQueryOut := captureStdout(t, func() error {
+		return run([]string{"query", path, "--format", "pdf", "--password", "user", "--kind", "pdf.content.text_show", "--text", "08-15-2024", "--json"})
+	})
+	assertCLIQueryCount(t, initialQueryOut, 1)
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{
+			"edit", path,
+			"--format", "pdf",
+			"--password", "user",
+			"--rewrite", "auto",
+			"--kind", "pdf.content.text_show",
+			"--text", "08-15-2024",
+			"--replace", "05-05-2026",
+			"-o", out,
+			"--json",
+		})
+	})
+	var result struct {
+		Report struct {
+			Edit          string `json:"edit"`
+			NodesModified int    `json:"nodes_modified"`
+			FallbackUsed  bool   `json:"fallback_used"`
+			OutputPath    string `json:"output_path"`
+		} `json:"report"`
+		Verification struct {
+			ReparseOK      bool `json:"reparse_ok"`
+			OldTextRemoved bool `json:"old_text_removed"`
+			NewSelectable  bool `json:"new_text_selectable"`
+			PageUnchanged  bool `json:"page_count_unchanged"`
+		} `json:"verification"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Report.Edit != "pdf.canonical_content_stream_text_rewrite" || result.Report.NodesModified != 1 || result.Report.FallbackUsed || result.Report.OutputPath != out {
+		t.Fatalf("report = %+v, want canonical encrypted object-stream edit", result.Report)
+	}
+	if !result.Verification.ReparseOK || !result.Verification.OldTextRemoved || !result.Verification.NewSelectable || !result.Verification.PageUnchanged {
+		t.Fatalf("verification = %+v, want all text invariants true", result.Verification)
+	}
+	output, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(output, []byte("/Type /ObjStm")) {
+		t.Fatal("canonical encrypted output preserved object stream container")
+	}
+	if bytes.Contains(output, []byte("05-05-2026")) {
+		t.Fatal("encrypted object-stream output contains plaintext replacement")
+	}
+
+	oldQueryOut := captureStdout(t, func() error {
+		return run([]string{"query", out, "--format", "pdf", "--password", "user", "--kind", "pdf.content.text_show", "--text", "08-15-2024", "--json"})
+	})
+	assertCLIQueryCount(t, oldQueryOut, 0)
+
+	newQueryOut := captureStdout(t, func() error {
+		return run([]string{"query", out, "--format", "pdf", "--password", "user", "--kind", "pdf.content.text_show", "--text", "05-05-2026", "--json"})
+	})
+	assertCLIQueryCount(t, newQueryOut, 1)
+}
+
+func TestCLIEditEncryptedPDFSurgicalPasswordFailsClosed(t *testing.T) {
+	path := writeSupportedEncryptedFixture(t, "08-15-2024")
+	out := filepath.Join(t.TempDir(), "encrypted-out.pdf")
+
+	_, err := captureStdoutAndError(t, func() error {
+		return run([]string{
+			"edit", path,
+			"--format", "pdf",
+			"--password", "user",
+			"--rewrite", "surgical",
+			"--kind", "pdf.content.text_show",
+			"--text", "08-15-2024",
+			"--replace", "05-05-2026",
+			"-o", out,
+			"--json",
+		})
+	})
+	if err == nil || !strings.Contains(err.Error(), "surgical rewrite does not support encrypted PDFs") {
+		t.Fatalf("error = %v, want surgical encrypted-PDF refusal", err)
 	}
 }
 
@@ -458,6 +857,55 @@ func TestCLIFormSetWritesVerifiedFieldUpdate(t *testing.T) {
 	}
 }
 
+func TestCLIFormSetRegeneratesTextWidgetAppearance(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "form.pdf")
+	input := pdfFixture(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /FT /Tx /T (payer.name) /V (Old Name) /Rect [0 0 120 20] >>",
+	)
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "form-out.pdf")
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{
+			"form", "set", path,
+			"--format", "pdf",
+			"--field", "payer.name",
+			"--value", "New Name",
+			"--regenerate-appearance",
+			"-o", out,
+			"--json",
+		})
+	})
+	var result struct {
+		Report struct {
+			AppearanceRegenerated bool `json:"appearance_regenerated"`
+		} `json:"report"`
+		Verification struct {
+			ReparseOK             bool `json:"reparse_ok"`
+			AppearanceRegenerated bool `json:"appearance_regenerated"`
+		} `json:"verification"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.Report.AppearanceRegenerated || !result.Verification.ReparseOK || !result.Verification.AppearanceRegenerated {
+		t.Fatalf("result = %+v", result)
+	}
+	written, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range [][]byte{[]byte("/AP << /N 4 0 R >>"), []byte("/Subtype /Form"), []byte("/Helv 10 Tf"), []byte("(New Name) Tj")} {
+		if !bytes.Contains(written, required) {
+			t.Fatalf("expected %q in regenerated output:\n%s", required, written)
+		}
+	}
+}
+
 func TestCLIFormListEmitsStableJSONFields(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "form-list.pdf")
 	input := pdfFixture(
@@ -502,6 +950,42 @@ func TestCLIFormListEmitsStableJSONFields(t *testing.T) {
 	}
 	if child.FieldType != "Btn" || child.Value == nil || *child.Value != "Off" || child.KidCount != 0 || !child.ButtonWidgetAppearanceProof {
 		t.Fatalf("child field metadata = %+v", child)
+	}
+}
+
+func TestCLIFormListPlainTextIncludesSemanticMetadata(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "form-list-text.pdf")
+	input := pdfFixture(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R 4 0 R] >>",
+		"<< /FT /Ch /T (payer.plan) /TU (Payer Plan) /TM (payer_plan_export) /V (Basic) /DV (Basic Default) /Ff 131075 /Opt [(Basic) [(pro) (Pro Plan)]] >>",
+		"<< /FT /Btn /T (payer.choice) /Kids [5 0 R] >>",
+		"<< /AP << /N << /Off <<>> /Yes <<>> >> >> /AS /Off /T (accept) /V /Off /Parent 4 0 R >>",
+	)
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{"form", "list", path, "--format", "pdf"})
+	})
+
+	for _, want := range []string{
+		`name="payer.plan"`,
+		`flags=131075`,
+		`flag_names=["read_only" "required"]`,
+		`type_flag_names=["combo"]`,
+		`alternate_name="Payer Plan"`,
+		`mapping_name="payer_plan_export"`,
+		`default_value="Basic Default"`,
+		`options_count=2`,
+		`options=["Basic" "Pro Plan"]`,
+		`name="payer.choice.accept"`,
+		`button_states=["Off" "Yes"]`,
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("stdout missing %q:\n%s", want, stdout)
+		}
 	}
 }
 
@@ -622,6 +1106,43 @@ func TestCLIAnnotListEmitsStableJSONCandidates(t *testing.T) {
 	}
 }
 
+func TestCLIAnnotListPlainTextIncludesSemanticMetadata(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "annot-list-text.pdf")
+	input := pdfFixture(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Page /Annots [3 0 R] >>",
+		"<< /Type /Annot /Subtype /Text /Rect [0.5 -1 20 20.25] /Contents (flagged note) /NM (note-001) /M (D:20260505090100-08'00') /T (David) /F 628 /AP << /N 4 0 R >> /C [1 0.5 0] /Border [0 0 2] /QuadPoints [0 0 10 0 10 10 0 10 1 1 11 1 11 11 1 11] >>",
+		"<< /Length 0 >>\nstream\n\nendstream",
+	)
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{"annot", "list", path, "--format", "pdf"})
+	})
+
+	for _, want := range []string{
+		`subtype=Text`,
+		`contents="flagged note"`,
+		`page_index=0`,
+		`page_object=2 0 R`,
+		`rect=[0.5 -1 20 20.25]`,
+		`color=[1 0.5 0]`,
+		`border=[0 0 2]`,
+		`quad_points_count=2`,
+		`name="note-001"`,
+		`modified="D:20260505090100-08'00'"`,
+		`title="David"`,
+		`flags=628`,
+		`flag_names=["print" "no_rotate" "no_view" "read_only" "locked_contents"]`,
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("stdout missing %q:\n%s", want, stdout)
+		}
+	}
+}
+
 func TestCLIAnnotSetContentsCanRemoveAppearance(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "annot-remove-ap.pdf")
 	input := pdfFixture(
@@ -674,6 +1195,97 @@ func TestCLIAnnotSetContentsCanRemoveAppearance(t *testing.T) {
 	}
 	if bytes.Contains(written, []byte("/AP ")) {
 		t.Fatalf("annotation appearance remains:\n%s", written)
+	}
+}
+
+func TestCLIAnnotSetContentsCanRegenerateAppearance(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "annot-regenerate-ap.pdf")
+	input := pdfFixture(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Page /Annots [3 0 R] >>",
+		"<< /Type /Annot /Subtype /FreeText /Rect [0 0 80 20] /Contents (old note) >>",
+	)
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "annot-regenerate-ap-out.pdf")
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{
+			"annot", "set-contents", path,
+			"--format", "pdf",
+			"--index", "0",
+			"--contents", "visible note",
+			"--regenerate-appearance",
+			"-o", out,
+			"--json",
+		})
+	})
+	var result struct {
+		Report struct {
+			AppearanceRegenerated bool `json:"appearance_regenerated"`
+		} `json:"report"`
+		Verification struct {
+			ReparseOK             bool `json:"reparse_ok"`
+			AppearanceRegenerated bool `json:"appearance_regenerated"`
+		} `json:"verification"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.Report.AppearanceRegenerated {
+		t.Fatalf("report = %+v, want regenerated appearance", result.Report)
+	}
+	if !result.Verification.ReparseOK || !result.Verification.AppearanceRegenerated {
+		t.Fatalf("verification = %+v", result.Verification)
+	}
+	written, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range [][]byte{
+		[]byte("/AP << /N 4 0 R >>"),
+		[]byte("/Subtype /Form"),
+		[]byte("/BBox [0 0 80 20]"),
+		[]byte("/BaseFont /Helvetica"),
+		[]byte("(visible note) Tj"),
+	} {
+		if !bytes.Contains(written, want) {
+			t.Fatalf("written PDF missing %q:\n%s", want, written)
+		}
+	}
+}
+
+func TestCLIAnnotSetContentsRejectsAppearanceFlagConflict(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "annot-flag-conflict.pdf")
+	input := pdfFixture(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Page /Annots [3 0 R] >>",
+		"<< /Type /Annot /Subtype /Text /Rect [0 0 10 10] /Contents (old note) /AP << /N 4 0 R >> >>",
+		"<< /Length 0 >>\nstream\n\nendstream",
+	)
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "annot-conflict-out.pdf")
+
+	_, err := captureStdoutAndError(t, func() error {
+		return run([]string{
+			"annot", "set-contents", path,
+			"--contents", "new note",
+			"--remove-appearance",
+			"--regenerate-appearance",
+			"-o", out,
+		})
+	})
+	if err == nil {
+		t.Fatal("expected conflicting appearance flags to fail")
+	}
+	if err.Error() != "use only one of --remove-appearance or --regenerate-appearance" {
+		t.Fatalf("error = %q", err)
+	}
+	if _, statErr := os.Stat(out); !os.IsNotExist(statErr) {
+		t.Fatalf("output path exists after flag conflict, stat err = %v", statErr)
 	}
 }
 
@@ -777,6 +1389,51 @@ func TestCLIXFAReplaceMatchIndexSelectsPacket(t *testing.T) {
 	}
 }
 
+func TestCLIXFAReplaceSelectorSelectsPacketKind(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "xfa-kind.pdf")
+	input := pdfFixture("<< /Type /Catalog /AcroForm << /XFA [(template) (<template>old</template>) (datasets) (<datasets>old</datasets>)] >> >>")
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "xfa-kind-out.pdf")
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{
+			"xfa", "replace", path,
+			"--format", "pdf",
+			"--text", "old",
+			"--replace", "new",
+			"--packet-kind", "datasets",
+			"-o", out,
+			"--json",
+		})
+	})
+	var result struct {
+		Report struct {
+			Edit string `json:"edit"`
+		} `json:"report"`
+		Verification struct {
+			ReparseOK bool `json:"reparse_ok"`
+		} `json:"verification"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Report.Edit != "pdf.xfa_replace" || !result.Verification.ReparseOK {
+		t.Fatalf("result = %+v", result)
+	}
+	written, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(written, []byte("<template>old</template>")) {
+		t.Fatalf("unselected XFA packet changed:\n%s", written)
+	}
+	if !bytes.Contains(written, []byte("<datasets>new</datasets>")) || bytes.Contains(written, []byte("<datasets>old</datasets>")) {
+		t.Fatalf("selected XFA packet was not updated:\n%s", written)
+	}
+}
+
 func TestCLIXFAListEmitsStableJSONPackets(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "xfa-list.pdf")
 	input := pdfFixture(
@@ -821,6 +1478,71 @@ func TestCLIXFAListEmitsStableJSONPackets(t *testing.T) {
 	}
 	if second.TextLength != len("<datasets>direct</datasets>") || second.Preview != "<datasets>direct</datasets>" {
 		t.Fatalf("second packet text = %+v", second)
+	}
+}
+
+func TestCLIXFAListSelectorFiltersJSONPackets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "xfa-list-filtered.pdf")
+	input := pdfFixture("<< /Type /Catalog /AcroForm << /XFA [(template) (<template>direct</template>) /datasets (<datasets>direct</datasets>)] >> >>")
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{"xfa", "list", path, "--format", "pdf", "--packet-kind", "datasets", "--label", "datasets", "--json"})
+	})
+	var result struct {
+		Count   int `json:"count"`
+		Packets []struct {
+			Index      int    `json:"index"`
+			Label      string `json:"label"`
+			PacketKind string `json:"packet_kind"`
+			Preview    string `json:"preview"`
+		} `json:"packets"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Count != 1 || len(result.Packets) != 1 {
+		t.Fatalf("result = %+v, want one filtered packet", result)
+	}
+	if result.Packets[0].Index != 1 || result.Packets[0].Label != "datasets" || result.Packets[0].PacketKind != "datasets" || result.Packets[0].Preview != "<datasets>direct</datasets>" {
+		t.Fatalf("filtered packet = %+v", result.Packets[0])
+	}
+}
+
+func TestCLIXFAListPlainTextIncludesSemanticMetadata(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "xfa-list-text.pdf")
+	input := pdfFixture(
+		"<< /Type /Catalog /AcroForm << /XFA [(template) 2 0 R (datasets) (<datasets>direct</datasets>)] >> >>",
+		"<< /Length 6 /Filter /FlateDecode /DecodeParms 12 >>\nstream\nabcdef\nendstream",
+	)
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{"xfa", "list", path, "--format", "pdf"})
+	})
+
+	for _, want := range []string{
+		`label=template`,
+		`stream=true`,
+		`byte_length=0`,
+		`packet_kind=template`,
+		`filter=/FlateDecode`,
+		`decode_parms="12"`,
+		`decode_error="unsupported stream: /DecodeParms must be a dictionary, array, or null"`,
+		`label=datasets`,
+		`stream=false`,
+		`length=27`,
+		`byte_length=27`,
+		`preview="<datasets>direct</datasets>"`,
+		`packet_kind=datasets`,
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("stdout missing %q:\n%s", want, stdout)
+		}
 	}
 }
 
@@ -1055,6 +1777,126 @@ func TestCLIEditSignedPDFAllowsExplicitCanonicalSignatureInvalidation(t *testing
 	}
 	if !bytes.Contains(written, []byte(`May 5, 2026`)) {
 		t.Fatal("new encoded date missing")
+	}
+}
+
+func TestCLIEditSignedPDFAllowsSignatureModeInvalidate(t *testing.T) {
+	path := writeSignedTextFixture(t)
+	out := filepath.Join(t.TempDir(), "out.pdf")
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{
+			"edit", path,
+			"--format", "pdf",
+			"--kind", "pdf.content.text_show",
+			"--text", "08-15-2024",
+			"--replace", "May 5, 2026",
+			"--rewrite", "canonical",
+			"--signature-mode", "invalidate",
+			"--verify", "reparse,old-gone,new-selectable",
+			"-o", out,
+			"--json",
+		})
+	})
+	assertCanonicalCLIEditResult(t, stdout)
+}
+
+func TestCLIEditSignedPDFPreserveIncrementalAppendsUpdateAndPreservesByteRanges(t *testing.T) {
+	path := writeSignedTextFixture(t)
+	out := filepath.Join(t.TempDir(), "out.pdf")
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{
+			"edit", path,
+			"--format", "pdf",
+			"--kind", "pdf.content.text_show",
+			"--text", "08-15-2024",
+			"--replace", "May 5, 2026",
+			"--signature-mode", "preserve-incremental",
+			"--verify", "reparse,old-gone,new-selectable,page-count-unchanged",
+			"-o", out,
+			"--json",
+		})
+	})
+	var result struct {
+		Report struct {
+			Edit          string `json:"edit"`
+			NodesModified int    `json:"nodes_modified"`
+			OutputPath    string `json:"output_path"`
+		} `json:"report"`
+		Verification struct {
+			ReparseOK      bool `json:"reparse_ok"`
+			OldTextRemoved bool `json:"old_text_removed"`
+			NewSelectable  bool `json:"new_text_selectable"`
+			PageUnchanged  bool `json:"page_count_unchanged"`
+		} `json:"verification"`
+		SignaturePreservation struct {
+			IncrementalUpdate         bool `json:"incremental_update"`
+			OriginalBytesPreserved    bool `json:"original_bytes_preserved"`
+			ByteRangeProof            bool `json:"byte_range_proof"`
+			ByteRangesChecked         int  `json:"byte_ranges_checked"`
+			SignedByteRangesUnchanged bool `json:"signed_byte_ranges_unchanged"`
+			CryptographicValidation   bool `json:"cryptographic_validation"`
+		} `json:"signature_preservation"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Report.Edit != "pdf.incremental_content_stream_text_rewrite" || result.Report.NodesModified != 1 || result.Report.OutputPath != out {
+		t.Fatalf("report = %+v", result.Report)
+	}
+	if !result.Verification.ReparseOK || !result.Verification.OldTextRemoved || !result.Verification.NewSelectable || !result.Verification.PageUnchanged {
+		t.Fatalf("verification = %+v", result.Verification)
+	}
+	if !result.SignaturePreservation.IncrementalUpdate ||
+		!result.SignaturePreservation.OriginalBytesPreserved ||
+		!result.SignaturePreservation.ByteRangeProof ||
+		result.SignaturePreservation.ByteRangesChecked != 2 ||
+		!result.SignaturePreservation.SignedByteRangesUnchanged ||
+		result.SignaturePreservation.CryptographicValidation {
+		t.Fatalf("signature preservation = %+v", result.SignaturePreservation)
+	}
+	written, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(written, original) {
+		t.Fatal("incremental output does not preserve original signed bytes as prefix")
+	}
+	appended := written[len(original):]
+	if !bytes.Contains(appended, []byte("(May 5, 2026) Tj")) || !bytes.Contains(appended, []byte("/Prev ")) {
+		t.Fatalf("incremental append missing replacement or /Prev:\n%s", appended)
+	}
+}
+
+func TestCLIEditSignedPDFPreserveIncrementalRequiresAutoRewrite(t *testing.T) {
+	path := writeSignedTextFixture(t)
+	out := filepath.Join(t.TempDir(), "out.pdf")
+
+	err := run([]string{
+		"edit", path,
+		"--format", "pdf",
+		"--kind", "pdf.content.text_show",
+		"--text", "08-15-2024",
+		"--replace", "May 5, 2026",
+		"--rewrite", "canonical",
+		"--signature-mode", "preserve-incremental",
+		"-o", out,
+		"--json",
+	})
+	if err == nil {
+		t.Fatal("edit succeeded, want rewrite mode conflict")
+	}
+	want := "signature preservation requires --rewrite auto because it uses append-only incremental updates"
+	if err.Error() != want {
+		t.Fatalf("error = %q, want %q", err, want)
+	}
+	if _, statErr := os.Stat(out); !os.IsNotExist(statErr) {
+		t.Fatalf("output file exists after preserve-incremental rewrite conflict: %v", statErr)
 	}
 }
 
@@ -1574,6 +2416,65 @@ func TestCLIEditFlateDecodeParmsPredictor12Columns4BitsPerComponent16WritesVerif
 	assertCLIQueryCount(t, newQueryOut, 1)
 }
 
+func TestCLIEditFlateDecodeParmsPredictor2BitPackedWritesVerifiedPDF(t *testing.T) {
+	path := writeFlateDecodeParmsPredictor2BitPackedFixture(t)
+	out := filepath.Join(t.TempDir(), "out.pdf")
+	const replacement = "May 6, 2026"
+
+	stdout, err := captureStdoutAndError(t, func() error {
+		return run([]string{
+			"edit", path,
+			"--format", "pdf",
+			"--kind", "pdf.content.text_show",
+			"--text", "08-15-2024",
+			"--replace", replacement,
+			"--verify", "reparse,old-gone,new-selectable",
+			"-o", out,
+			"--json",
+		})
+	})
+	if err != nil {
+		t.Fatalf("edit failed: %v\nstdout: %s", err, stdout)
+	}
+	var result struct {
+		Report struct {
+			FallbackUsed  bool   `json:"fallback_used"`
+			NodesModified int    `json:"nodes_modified"`
+			OutputPath    string `json:"output_path"`
+		} `json:"report"`
+		Verification struct {
+			ReparseOK      bool `json:"reparse_ok"`
+			OldTextRemoved bool `json:"old_text_removed"`
+			NewSelectable  bool `json:"new_text_selectable"`
+		} `json:"verification"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Report.FallbackUsed {
+		t.Fatal("edit used fallback path")
+	}
+	if result.Report.NodesModified != 1 {
+		t.Fatalf("nodes modified = %d, want 1", result.Report.NodesModified)
+	}
+	if result.Report.OutputPath != out {
+		t.Fatalf("output path = %q, want %q", result.Report.OutputPath, out)
+	}
+	if !result.Verification.ReparseOK || !result.Verification.OldTextRemoved || !result.Verification.NewSelectable {
+		t.Fatalf("verification = %+v", result.Verification)
+	}
+
+	oldQueryOut := captureStdout(t, func() error {
+		return run([]string{"query", out, "--format", "pdf", "--kind", "pdf.content.text_show", "--text", "08-15-2024", "--json"})
+	})
+	assertCLIQueryCount(t, oldQueryOut, 0)
+
+	newQueryOut := captureStdout(t, func() error {
+		return run([]string{"query", out, "--format", "pdf", "--kind", "pdf.content.text_show", "--text", replacement, "--json"})
+	})
+	assertCLIQueryCount(t, newQueryOut, 1)
+}
+
 func writeFixture(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "fixture.pdf")
@@ -1599,6 +2500,447 @@ func writeSignedTextFixture(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func writeEncryptedFixture(t *testing.T) string {
+	t.Helper()
+	var input bytes.Buffer
+	input.WriteString("%PDF-1.3\n")
+	offsets := make([]int, 0, 3)
+	writeObject := func(number int, body []byte) {
+		t.Helper()
+		offsets = append(offsets, input.Len())
+		fmt.Fprintf(&input, "%d 0 obj\n", number)
+		input.Write(body)
+		input.WriteString("\nendobj\n")
+	}
+	writeObject(1, []byte("<< /Type /Catalog /Pages 3 0 R >>"))
+	writeObject(2, []byte("<< /Filter /Standard /SubFilter /adbe.pkcs7.s5 /V 4 /R 4 /Length 128 /EncryptMetadata false >>"))
+	writeObject(3, []byte("<< /Type /Page >>"))
+	xrefOffset := input.Len()
+	input.WriteString("xref\n0 4\n")
+	input.WriteString("0000000000 65535 f \n")
+	for _, offset := range offsets {
+		fmt.Fprintf(&input, "%010d 00000 n \n", offset)
+	}
+	fmt.Fprintf(&input, "trailer\n<< /Size 4 /Root 1 0 R /Encrypt 2 0 R >>\nstartxref\n%d\n%%%%EOF\n", xrefOffset)
+	path := filepath.Join(t.TempDir(), "encrypted.pdf")
+	if err := os.WriteFile(path, input.Bytes(), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func writeSupportedEncryptedFixture(t *testing.T, text string) string {
+	t.Helper()
+	fileID := []byte("fixture-file-id1")
+	fileKey := cliStandardR2FileKey(t, "user", fileID)
+	content := []byte(fmt.Sprintf("BT\n(%s) Tj\nET\n", strings.ReplaceAll(text, "-", `\055`)))
+	encryptedContent := cliRC4Object(t, fileKey, 4, 0, content)
+	encryptedTitle := cliRC4Object(t, fileKey, 5, 0, []byte("Sensitive Title"))
+
+	var input bytes.Buffer
+	input.WriteString("%PDF-1.3\n")
+	offsets := make([]int, 0, 6)
+	writeObject := func(number int, body []byte) {
+		t.Helper()
+		offsets = append(offsets, input.Len())
+		fmt.Fprintf(&input, "%d 0 obj\n", number)
+		input.Write(body)
+		input.WriteString("\nendobj\n")
+	}
+	writeObject(1, []byte("<< /Type /Catalog /Pages 2 0 R >>"))
+	writeObject(2, []byte("<< /Type /Pages /Kids [3 0 R] /Count 1 >>"))
+	writeObject(3, []byte("<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>"))
+	offsets = append(offsets, input.Len())
+	input.WriteString("4 0 obj\n")
+	fmt.Fprintf(&input, "<< /Length %d >>\nstream\n", len(encryptedContent))
+	input.Write(encryptedContent)
+	input.WriteString("\nendstream\nendobj\n")
+	writeObject(5, []byte(fmt.Sprintf("<< /Title <%s> >>", hex.EncodeToString(encryptedTitle))))
+	writeObject(6, []byte(`<<
+/Filter /Standard
+/V 1
+/R 2
+/O <000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f>
+/U <f2e39758794025127846c07006961602075fb11d4b5c227e0b27c9a2abb73e61>
+/P -44
+>>`))
+
+	xrefOffset := input.Len()
+	input.WriteString("xref\n0 7\n")
+	input.WriteString("0000000000 65535 f \n")
+	for _, offset := range offsets {
+		fmt.Fprintf(&input, "%010d 00000 n \n", offset)
+	}
+	fmt.Fprintf(&input, "trailer\n<< /Size 7 /Root 1 0 R /Info 5 0 R /Encrypt 6 0 R /ID [<%s> <%s>] >>\nstartxref\n%d\n%%%%EOF\n",
+		hex.EncodeToString(fileID),
+		hex.EncodeToString(fileID),
+		xrefOffset,
+	)
+	path := filepath.Join(t.TempDir(), "supported-encrypted.pdf")
+	if err := os.WriteFile(path, input.Bytes(), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func writeSupportedEncryptedObjectStreamFixture(t *testing.T, text string) string {
+	t.Helper()
+	fileID := []byte("fixture-file-id1")
+	fileKey := cliStandardR2FileKey(t, "user", fileID)
+	content := []byte(fmt.Sprintf("BT\n(%s) Tj\nET\n", strings.ReplaceAll(text, "-", `\055`)))
+	encryptedContent := cliRC4Object(t, fileKey, 4, 0, content)
+	encryptedTitle := cliRC4Object(t, fileKey, 5, 0, []byte("Sensitive Title"))
+	objectStreamData := cliObjectStreamData(
+		cliObjectStreamEntry{number: 1, value: "<< /Type /Catalog /Pages 2 0 R >>"},
+		cliObjectStreamEntry{number: 2, value: "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"},
+		cliObjectStreamEntry{number: 3, value: "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>"},
+	)
+	encryptedObjectStream := cliRC4Object(t, fileKey, 7, 0, objectStreamData)
+	first := bytes.IndexByte(objectStreamData, '\n') + 1
+
+	var input bytes.Buffer
+	input.WriteString("%PDF-1.5\n")
+	offsets := map[int]int{}
+	writeObject := func(number int, body []byte) {
+		t.Helper()
+		offsets[number] = input.Len()
+		fmt.Fprintf(&input, "%d 0 obj\n", number)
+		input.Write(body)
+		input.WriteString("\nendobj\n")
+	}
+	offsets[4] = input.Len()
+	input.WriteString("4 0 obj\n")
+	fmt.Fprintf(&input, "<< /Length %d >>\nstream\n", len(encryptedContent))
+	input.Write(encryptedContent)
+	input.WriteString("\nendstream\nendobj\n")
+	writeObject(5, []byte(fmt.Sprintf("<< /Title <%s> >>", hex.EncodeToString(encryptedTitle))))
+	writeObject(6, []byte(`<<
+/Filter /Standard
+/V 1
+/R 2
+/O <000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f>
+/U <f2e39758794025127846c07006961602075fb11d4b5c227e0b27c9a2abb73e61>
+/P -44
+>>`))
+	offsets[7] = input.Len()
+	input.WriteString("7 0 obj\n")
+	fmt.Fprintf(&input, "<< /Type /ObjStm /N 3 /First %d /Length %d >>\nstream\n", first, len(encryptedObjectStream))
+	input.Write(encryptedObjectStream)
+	input.WriteString("\nendstream\nendobj\n")
+
+	xrefOffset := input.Len()
+	input.WriteString("xref\n0 8\n")
+	input.WriteString("0000000000 65535 f \n")
+	for number := 1; number <= 7; number++ {
+		if offset, ok := offsets[number]; ok {
+			fmt.Fprintf(&input, "%010d 00000 n \n", offset)
+			continue
+		}
+		input.WriteString("0000000000 65535 f \n")
+	}
+	fmt.Fprintf(&input, "trailer\n<< /Size 8 /Root 1 0 R /Info 5 0 R /Encrypt 6 0 R /ID [<%s> <%s>] >>\nstartxref\n%d\n%%%%EOF\n",
+		hex.EncodeToString(fileID),
+		hex.EncodeToString(fileID),
+		xrefOffset,
+	)
+	path := filepath.Join(t.TempDir(), "supported-encrypted-object-stream.pdf")
+	if err := os.WriteFile(path, input.Bytes(), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func writeSupportedAESV2EncryptedFixture(t *testing.T, text string) string {
+	t.Helper()
+	fileID := []byte("revision4-aes-id")
+	ownerKey := mustDecodeHex(t, "00112233445566778899aabbccddeeff102132435465768798a9babbdcddfeff")
+	fileKey := cliStandardR4FileKey(t, "user", fileID, ownerKey)
+	userEntry := cliStandardR4UserEntry(t, fileKey, fileID)
+	content := []byte(fmt.Sprintf("BT\n(%s) Tj\nET\n", strings.ReplaceAll(text, "-", `\055`)))
+	encryptedContent := cliAESV2Object(t, fileKey, 4, 0, content)
+	encryptedTitle := cliAESV2Object(t, fileKey, 5, 0, []byte("Sensitive Title"))
+
+	encryptObject := fmt.Sprintf(`<<
+/CF << /StdCF << /CFM /AESV2 /Length 128 >> >>
+/Filter /Standard
+/Length 128
+/O <%s>
+/P -1028
+/R 4
+/StmF /StdCF
+/StrF /StdCF
+/U <%s>
+/V 4
+>>`, hex.EncodeToString(ownerKey), hex.EncodeToString(userEntry))
+
+	var input bytes.Buffer
+	input.WriteString("%PDF-1.6\n")
+	offsets := make([]int, 0, 6)
+	writeObject := func(number int, body []byte) {
+		t.Helper()
+		offsets = append(offsets, input.Len())
+		fmt.Fprintf(&input, "%d 0 obj\n", number)
+		input.Write(body)
+		input.WriteString("\nendobj\n")
+	}
+	writeObject(1, []byte("<< /Type /Catalog /Pages 2 0 R >>"))
+	writeObject(2, []byte("<< /Type /Pages /Kids [3 0 R] /Count 1 >>"))
+	writeObject(3, []byte("<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>"))
+	offsets = append(offsets, input.Len())
+	input.WriteString("4 0 obj\n")
+	fmt.Fprintf(&input, "<< /Length %d >>\nstream\n", len(encryptedContent))
+	input.Write(encryptedContent)
+	input.WriteString("\nendstream\nendobj\n")
+	writeObject(5, []byte(fmt.Sprintf("<< /Title <%s> >>", hex.EncodeToString(encryptedTitle))))
+	writeObject(6, []byte(encryptObject))
+
+	xrefOffset := input.Len()
+	input.WriteString("xref\n0 7\n")
+	input.WriteString("0000000000 65535 f \n")
+	for _, offset := range offsets {
+		fmt.Fprintf(&input, "%010d 00000 n \n", offset)
+	}
+	fmt.Fprintf(&input, "trailer\n<< /Size 7 /Root 1 0 R /Info 5 0 R /Encrypt 6 0 R /ID [<%s> <%s>] >>\nstartxref\n%d\n%%%%EOF\n",
+		hex.EncodeToString(fileID),
+		hex.EncodeToString(fileID),
+		xrefOffset,
+	)
+	path := filepath.Join(t.TempDir(), "supported-aesv2-encrypted.pdf")
+	if err := os.WriteFile(path, input.Bytes(), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func writeSupportedAESV2StreamCryptEncryptedFixture(t *testing.T, text string) string {
+	t.Helper()
+	fileID := []byte("revision4-cryptf")
+	ownerKey := mustDecodeHex(t, "00112233445566778899aabbccddeeff102132435465768798a9babbdcddfeff")
+	fileKey := cliStandardR4FileKey(t, "user", fileID, ownerKey)
+	userEntry := cliStandardR4UserEntry(t, fileKey, fileID)
+	content := []byte(fmt.Sprintf("BT\n(%s) Tj\nET\n", strings.ReplaceAll(text, "-", `\055`)))
+	filteredContent := cliFlate(t, content)
+	encryptedContent := cliAESV2Object(t, fileKey, 4, 0, filteredContent)
+	encryptedTitle := cliAESV2Object(t, fileKey, 5, 0, []byte("Sensitive Title"))
+
+	encryptObject := fmt.Sprintf(`<<
+/CF << /StdCF << /CFM /AESV2 /Length 128 >> >>
+/Filter /Standard
+/Length 128
+/O <%s>
+/P -1028
+/R 4
+/StmF /StdCF
+/StrF /StdCF
+/U <%s>
+/V 4
+>>`, hex.EncodeToString(ownerKey), hex.EncodeToString(userEntry))
+
+	var input bytes.Buffer
+	input.WriteString("%PDF-1.6\n")
+	offsets := make([]int, 0, 6)
+	writeObject := func(number int, body []byte) {
+		t.Helper()
+		offsets = append(offsets, input.Len())
+		fmt.Fprintf(&input, "%d 0 obj\n", number)
+		input.Write(body)
+		input.WriteString("\nendobj\n")
+	}
+	writeObject(1, []byte("<< /Type /Catalog /Pages 2 0 R >>"))
+	writeObject(2, []byte("<< /Type /Pages /Kids [3 0 R] /Count 1 >>"))
+	writeObject(3, []byte("<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>"))
+	offsets = append(offsets, input.Len())
+	input.WriteString("4 0 obj\n")
+	fmt.Fprintf(&input, "<< /Length %d /Filter [/Crypt /FlateDecode] /DecodeParms [<< /Name /StdCF >> null] >>\nstream\n", len(encryptedContent))
+	input.Write(encryptedContent)
+	input.WriteString("\nendstream\nendobj\n")
+	writeObject(5, []byte(fmt.Sprintf("<< /Title <%s> >>", hex.EncodeToString(encryptedTitle))))
+	writeObject(6, []byte(encryptObject))
+
+	xrefOffset := input.Len()
+	input.WriteString("xref\n0 7\n")
+	input.WriteString("0000000000 65535 f \n")
+	for _, offset := range offsets {
+		fmt.Fprintf(&input, "%010d 00000 n \n", offset)
+	}
+	fmt.Fprintf(&input, "trailer\n<< /Size 7 /Root 1 0 R /Info 5 0 R /Encrypt 6 0 R /ID [<%s> <%s>] >>\nstartxref\n%d\n%%%%EOF\n",
+		hex.EncodeToString(fileID),
+		hex.EncodeToString(fileID),
+		xrefOffset,
+	)
+	path := filepath.Join(t.TempDir(), "supported-aesv2-stream-crypt-encrypted.pdf")
+	if err := os.WriteFile(path, input.Bytes(), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+var cliStandardPadding = []byte{
+	0x28, 0xbf, 0x4e, 0x5e, 0x4e, 0x75, 0x8a, 0x41,
+	0x64, 0x00, 0x4e, 0x56, 0xff, 0xfa, 0x01, 0x08,
+	0x2e, 0x2e, 0x00, 0xb6, 0xd0, 0x68, 0x3e, 0x80,
+	0x2f, 0x0c, 0xa9, 0xfe, 0x64, 0x53, 0x69, 0x7a,
+}
+
+func cliStandardR2FileKey(t *testing.T, password string, fileID []byte) []byte {
+	t.Helper()
+	ownerKey, err := hex.DecodeString("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	padded := make([]byte, 32)
+	copy(padded, []byte(password))
+	copy(padded[len(password):], cliStandardPadding)
+	h := md5.New()
+	h.Write(padded)
+	h.Write(ownerKey)
+	var permissions [4]byte
+	permissionValue := int32(-44)
+	binary.LittleEndian.PutUint32(permissions[:], uint32(permissionValue))
+	h.Write(permissions[:])
+	h.Write(fileID)
+	return h.Sum(nil)[:5]
+}
+
+func cliStandardR4FileKey(t *testing.T, password string, fileID, ownerKey []byte) []byte {
+	t.Helper()
+	padded := make([]byte, 32)
+	copy(padded, []byte(password))
+	copy(padded[len(password):], cliStandardPadding)
+	h := md5.New()
+	h.Write(padded)
+	h.Write(ownerKey)
+	var permissions [4]byte
+	permissionValue := int32(-1028)
+	binary.LittleEndian.PutUint32(permissions[:], uint32(permissionValue))
+	h.Write(permissions[:])
+	h.Write(fileID)
+	digest := h.Sum(nil)
+	for i := 0; i < 50; i++ {
+		next := md5.Sum(digest[:16])
+		digest = next[:]
+	}
+	return bytes.Clone(digest[:16])
+}
+
+func cliStandardR4UserEntry(t *testing.T, fileKey, fileID []byte) []byte {
+	t.Helper()
+	h := md5.New()
+	h.Write(cliStandardPadding)
+	h.Write(fileID)
+	digest := h.Sum(nil)
+	out := cliRC4Crypt(t, fileKey, digest)
+	for i := 1; i <= 19; i++ {
+		key := bytes.Clone(fileKey)
+		for j := range key {
+			key[j] ^= byte(i)
+		}
+		out = cliRC4Crypt(t, key, out)
+	}
+	entry := make([]byte, 32)
+	copy(entry, out)
+	copy(entry[16:], []byte("binas-aes-fixture"))
+	return entry
+}
+
+func cliRC4Object(t *testing.T, fileKey []byte, number, generation int, input []byte) []byte {
+	t.Helper()
+	keyInput := append([]byte{}, fileKey...)
+	keyInput = append(keyInput, byte(number), byte(number>>8), byte(number>>16), byte(generation), byte(generation>>8))
+	sum := md5.Sum(keyInput)
+	objectKey := sum[:min(len(fileKey)+5, 16)]
+	return cliRC4Crypt(t, objectKey, input)
+}
+
+func cliRC4Crypt(t *testing.T, key, input []byte) []byte {
+	t.Helper()
+	cipher, err := rc4.NewCipher(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := bytes.Clone(input)
+	cipher.XORKeyStream(out, out)
+	return out
+}
+
+type cliObjectStreamEntry struct {
+	number int
+	value  string
+}
+
+func cliObjectStreamData(entries ...cliObjectStreamEntry) []byte {
+	var body bytes.Buffer
+	offsets := make([]int, 0, len(entries))
+	for _, entry := range entries {
+		offsets = append(offsets, body.Len())
+		body.WriteString(entry.value)
+		body.WriteByte('\n')
+	}
+	var header bytes.Buffer
+	for i, entry := range entries {
+		fmt.Fprintf(&header, "%d %d ", entry.number, offsets[i])
+	}
+	header.WriteByte('\n')
+	out := append(bytes.Clone(header.Bytes()), body.Bytes()...)
+	return out
+}
+
+func cliAESV2Object(t *testing.T, fileKey []byte, number, generation int, input []byte) []byte {
+	t.Helper()
+	keyInput := append([]byte{}, fileKey...)
+	keyInput = append(keyInput, byte(number), byte(number>>8), byte(number>>16), byte(generation), byte(generation>>8))
+	keyInput = append(keyInput, 's', 'A', 'l', 'T')
+	sum := md5.Sum(keyInput)
+	objectKey := sum[:min(len(fileKey)+5, 16)]
+	block, err := aes.NewCipher(objectKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	iv := []byte("binas-aes-iv-000")
+	data := cliPKCS7Pad(input, aes.BlockSize)
+	cipher.NewCBCEncrypter(block, iv).CryptBlocks(data, data)
+	out := make([]byte, 0, len(iv)+len(data))
+	out = append(out, iv...)
+	out = append(out, data...)
+	return out
+}
+
+func cliFlate(t *testing.T, input []byte) []byte {
+	t.Helper()
+	var output bytes.Buffer
+	writer := zlib.NewWriter(&output)
+	if _, err := writer.Write(input); err != nil {
+		writer.Close()
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return output.Bytes()
+}
+
+func cliPKCS7Pad(input []byte, blockSize int) []byte {
+	padding := blockSize - len(input)%blockSize
+	if padding == 0 {
+		padding = blockSize
+	}
+	out := make([]byte, 0, len(input)+padding)
+	out = append(out, input...)
+	for i := 0; i < padding; i++ {
+		out = append(out, byte(padding))
+	}
+	return out
+}
+
+func mustDecodeHex(t *testing.T, input string) []byte {
+	t.Helper()
+	out, err := hex.DecodeString(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
 }
 
 func writeResidualBoundaryFixture(t *testing.T) string {
@@ -1700,6 +3042,21 @@ func writeFlateDecodeParmsPredictor12Columns4BitsPerComponent16Fixture(t *testin
 	return path
 }
 
+func writeFlateDecodeParmsPredictor2BitPackedFixture(t *testing.T) string {
+	t.Helper()
+	decoded := []byte("BT\n(08-15-2024) Tj\nET\n")
+	encoded := encodeFlatePredictor2PackedStream(t, decoded, 7, 1, 1)
+	input := pdfFixture(
+		"<< /Type /Page >>",
+		fmt.Sprintf("<< /Length %d /Filter /FlateDecode /DecodeParms << /Predictor 2 /Columns 7 /Colors 1 /BitsPerComponent 1 >> >>\nstream\n%sendstream", len(encoded), encoded),
+	)
+	path := filepath.Join(t.TempDir(), "flate-decodeparms-predictor2-bitpacked.pdf")
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 func encodeFlatePredictor12Columns1Stream(t *testing.T, decoded []byte) []byte {
 	t.Helper()
 	predicted := make([]byte, 0, len(decoded)*2)
@@ -1718,6 +3075,65 @@ func encodeFlatePredictor12Columns1Stream(t *testing.T, decoded []byte) []byte {
 		t.Fatal(err)
 	}
 	return compressed.Bytes()
+}
+
+func encodeFlatePredictor2PackedStream(t *testing.T, decoded []byte, columns, colors, bitsPerComponent int) []byte {
+	t.Helper()
+	rowBits := columns * colors * bitsPerComponent
+	rowBytes := (rowBits + 7) / 8
+	sampleCount := columns * colors
+	mask := (uint64(1) << bitsPerComponent) - 1
+	predicted := make([]byte, 0, len(decoded))
+	for rowStart := 0; rowStart < len(decoded); rowStart += rowBytes {
+		rowEnd := rowStart + rowBytes
+		if rowEnd > len(decoded) {
+			t.Fatalf("decoded stream has partial TIFF predictor row: len=%d rowBytes=%d", len(decoded), rowBytes)
+		}
+		decodedRow := decoded[rowStart:rowEnd]
+		predictedRow := bytes.Clone(decodedRow)
+		for sample := 0; sample < sampleCount; sample++ {
+			value := readPackedPredictorSampleForTest(decodedRow, sample, bitsPerComponent)
+			if sample >= colors {
+				left := readPackedPredictorSampleForTest(decodedRow, sample-colors, bitsPerComponent)
+				value = (value - left) & mask
+			}
+			writePackedPredictorSampleForTest(predictedRow, sample, bitsPerComponent, value)
+		}
+		predicted = append(predicted, predictedRow...)
+	}
+	var compressed bytes.Buffer
+	writer := zlib.NewWriter(&compressed)
+	if _, err := writer.Write(predicted); err != nil {
+		writer.Close()
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return compressed.Bytes()
+}
+
+func readPackedPredictorSampleForTest(row []byte, sample, bitsPerComponent int) uint64 {
+	bitOffset := sample * bitsPerComponent
+	var value uint64
+	for bit := 0; bit < bitsPerComponent; bit++ {
+		position := bitOffset + bit
+		value = value<<1 | uint64((row[position/8]>>(7-position%8))&1)
+	}
+	return value
+}
+
+func writePackedPredictorSampleForTest(row []byte, sample, bitsPerComponent int, value uint64) {
+	bitOffset := sample * bitsPerComponent
+	for bit := 0; bit < bitsPerComponent; bit++ {
+		position := bitOffset + bit
+		mask := byte(1 << (7 - position%8))
+		if (value>>(bitsPerComponent-1-bit))&1 == 1 {
+			row[position/8] |= mask
+			continue
+		}
+		row[position/8] &^= mask
+	}
 }
 
 func encodeFlatePredictor12RowWidthStream(t *testing.T, decoded []byte, rowWidth int) []byte {

@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>binas WASM PDF smoke</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", sans-serif;
+      }
+
+      body {
+        margin: 0;
+        background: Canvas;
+        color: CanvasText;
+      }
+
+      main {
+        width: min(960px, calc(100vw - 32px));
+        margin: 24px auto 40px;
+      }
+
+      h1 {
+        margin: 0 0 6px;
+        font-size: 24px;
+        line-height: 1.2;
+      }
+
+      p {
+        margin: 0;
+        color: color-mix(in srgb, CanvasText 72%, Canvas);
+      }
+
+      section {
+        margin-top: 18px;
+        padding: 16px;
+        border: 1px solid color-mix(in srgb, CanvasText 18%, Canvas);
+        border-radius: 8px;
+      }
+
+      label {
+        display: block;
+        margin-bottom: 6px;
+        font-weight: 650;
+      }
+
+      input[type="file"],
+      input[type="text"] {
+        width: 100%;
+        box-sizing: border-box;
+      }
+
+      input[type="text"] {
+        min-height: 38px;
+        padding: 8px 10px;
+        border: 1px solid color-mix(in srgb, CanvasText 22%, Canvas);
+        border-radius: 6px;
+        background: Canvas;
+        color: CanvasText;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 12px;
+      }
+
+      button,
+      a[download] {
+        display: inline-flex;
+        align-items: center;
+        min-height: 36px;
+        padding: 0 12px;
+        border: 1px solid color-mix(in srgb, CanvasText 22%, Canvas);
+        border-radius: 6px;
+        background: ButtonFace;
+        color: ButtonText;
+        font: inherit;
+        text-decoration: none;
+        cursor: pointer;
+      }
+
+      button:disabled,
+      a[aria-disabled="true"] {
+        cursor: not-allowed;
+        opacity: 0.55;
+      }
+
+      pre {
+        overflow: auto;
+        min-height: 180px;
+        margin: 0;
+        padding: 12px;
+        border-radius: 8px;
+        background: color-mix(in srgb, CanvasText 8%, Canvas);
+        white-space: pre-wrap;
+      }
+
+      .status {
+        margin-top: 10px;
+        font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+        font-size: 13px;
+      }
+
+      .error {
+        color: #b42318;
+      }
+
+      .ok {
+        color: #067647;
+      }
+
+      @media (max-width: 680px) {
+        .grid {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>binas WASM PDF smoke</h1>
+      <p>
+        Minimal local smoke surface for the current WASM globals. It is not a
+        production editor and only reports what the loaded helper returns.
+      </p>
+
+      <section>
+        <label for="runtime">Optional Go runtime fallback</label>
+        <input id="runtime" type="file" accept=".js,text/javascript,application/javascript">
+        <label for="wasm">Optional WASM file fallback</label>
+        <input id="wasm" type="file" accept=".wasm,application/wasm">
+        <div id="wasm-status" class="status">Loading Go runtime from ../../tmp/wasm_exec.js or ./wasm_exec.js and ../../tmp/binas.wasm...</div>
+      </section>
+
+      <section>
+        <label for="pdf">PDF file</label>
+        <input id="pdf" type="file" accept="application/pdf,.pdf">
+        <div id="pdf-status" class="status">No PDF loaded.</div>
+        <div class="actions">
+          <button id="inspect" type="button" disabled>Inspect</button>
+        </div>
+      </section>
+
+      <section>
+        <div class="grid">
+          <div>
+            <label for="query-text">Query text</label>
+            <input id="query-text" type="text" autocomplete="off" placeholder="Text to find">
+          </div>
+          <div>
+            <label for="old-text">Old text</label>
+            <input id="old-text" type="text" autocomplete="off" placeholder="Text to replace">
+          </div>
+          <div>
+            <label for="new-text">New text</label>
+            <input id="new-text" type="text" autocomplete="off" placeholder="Replacement text">
+          </div>
+        </div>
+        <div class="actions">
+          <button id="query" type="button" disabled>Query</button>
+          <button id="edit" type="button" disabled>Edit text</button>
+          <a id="download" download="binas-edited.pdf" aria-disabled="true">Download edited PDF</a>
+        </div>
+      </section>
+
+      <section>
+        <label for="output">Output</label>
+        <pre id="output">Waiting for WASM and PDF input.</pre>
+      </section>
+    </main>
+
+    <script>
+      const state = {
+        wasmReady: false,
+        pdfBytes: null,
+        pdfName: "document.pdf",
+        editedUrl: null,
+      };
+
+      const els = {
+        runtime: document.getElementById("runtime"),
+        wasm: document.getElementById("wasm"),
+        wasmStatus: document.getElementById("wasm-status"),
+        pdf: document.getElementById("pdf"),
+        pdfStatus: document.getElementById("pdf-status"),
+        inspect: document.getElementById("inspect"),
+        query: document.getElementById("query"),
+        edit: document.getElementById("edit"),
+        download: document.getElementById("download"),
+        queryText: document.getElementById("query-text"),
+        oldText: document.getElementById("old-text"),
+        newText: document.getElementById("new-text"),
+        output: document.getElementById("output"),
+      };
+
+      function setStatus(element, message, kind) {
+        element.textContent = message;
+        element.classList.toggle("ok", kind === "ok");
+        element.classList.toggle("error", kind === "error");
+      }
+
+      function show(value) {
+        if (typeof value === "string") {
+          try {
+            els.output.textContent = JSON.stringify(JSON.parse(value), null, 2);
+            return;
+          } catch (_) {
+            els.output.textContent = value;
+            return;
+          }
+        }
+        els.output.textContent = JSON.stringify(value, replacer, 2);
+      }
+
+      function replacer(_key, value) {
+        if (value instanceof Uint8Array) {
+          return {
+            type: "Uint8Array",
+            byteLength: value.byteLength,
+          };
+        }
+        return value;
+      }
+
+      function showError(error) {
+        const message = error && error.message ? error.message : String(error);
+        show({ ok: false, error: message });
+      }
+
+      function updateControls() {
+        const ready = state.wasmReady && state.pdfBytes;
+        els.inspect.disabled = !ready;
+        els.query.disabled = !ready;
+        els.edit.disabled = !ready;
+      }
+
+      function clearEditedDownload() {
+        if (state.editedUrl) {
+          URL.revokeObjectURL(state.editedUrl);
+        }
+        state.editedUrl = null;
+        els.download.removeAttribute("href");
+        els.download.setAttribute("aria-disabled", "true");
+      }
+
+      function setEditedDownload(bytes) {
+        clearEditedDownload();
+        const blob = new Blob([bytes], { type: "application/pdf" });
+        state.editedUrl = URL.createObjectURL(blob);
+        els.download.href = state.editedUrl;
+        els.download.download = state.pdfName.replace(/\.pdf$/i, "") + ".edited.pdf";
+        els.download.setAttribute("aria-disabled", "false");
+      }
+
+      async function instantiateWASM(source) {
+        if (!window.Go) {
+          throw new Error(
+            "Go runtime is missing. Select wasm_exec.js from your Go toolchain, copy it next to smoke.html, or serve it beside this file."
+          );
+        }
+        const go = new Go();
+        const { instance } = await WebAssembly.instantiate(source, go.importObject);
+        go.run(instance);
+        if (
+          typeof window.binasInspectPDF !== "function" ||
+          typeof window.binasQueryPDF !== "function" ||
+          typeof window.binasEditPDFText !== "function"
+        ) {
+          throw new Error("WASM loaded, but the expected binas globals were not registered.");
+        }
+        state.wasmReady = true;
+        setStatus(els.wasmStatus, "WASM loaded. Choose a PDF or run an operation.", "ok");
+        updateControls();
+      }
+
+      async function loadDefaultWASM() {
+        const errors = [];
+        if (!window.Go) {
+          for (const runtimePath of ["../../tmp/wasm_exec.js", "./wasm_exec.js"]) {
+            try {
+              await loadRuntimeScript(runtimePath);
+              break;
+            } catch (error) {
+              errors.push(error && error.message ? error.message : String(error));
+            }
+          }
+        }
+        const candidates = ["../../tmp/binas.wasm", "./binas.wasm"];
+        for (const path of candidates) {
+          try {
+            const response = await fetch(path);
+            if (!response.ok) {
+              throw new Error(`${path}: HTTP ${response.status}`);
+            }
+            await instantiateWASM(await response.arrayBuffer());
+            return;
+          } catch (error) {
+            errors.push(error && error.message ? error.message : String(error));
+          }
+        }
+        setStatus(
+          els.wasmStatus,
+          "Automatic WASM load failed. Select tmp/binas.wasm above. Details: " + errors.join(" | "),
+          "error"
+        );
+      }
+
+      function loadRuntimeScript(path) {
+        return new Promise((resolve, reject) => {
+          const script = document.createElement("script");
+          script.src = path;
+          script.onload = resolve;
+          script.onerror = () => reject(new Error(path + " could not be loaded"));
+          document.head.appendChild(script);
+        });
+      }
+
+      function loadRuntimeSource(source) {
+        const script = document.createElement("script");
+        script.textContent = source;
+        document.head.appendChild(script);
+        if (!window.Go) {
+          throw new Error("Selected JavaScript did not register the Go WASM runtime.");
+        }
+      }
+
+      els.runtime.addEventListener("change", async (event) => {
+        const file = event.target.files && event.target.files[0];
+        if (!file) return;
+        try {
+          loadRuntimeSource(await file.text());
+          setStatus(els.wasmStatus, "Go runtime loaded. Select tmp/binas.wasm if automatic loading failed.", "ok");
+        } catch (error) {
+          setStatus(els.wasmStatus, "Go runtime load failed: " + error.message, "error");
+          showError(error);
+        }
+      });
+
+      els.wasm.addEventListener("change", async (event) => {
+        const file = event.target.files && event.target.files[0];
+        if (!file) return;
+        try {
+          await instantiateWASM(await file.arrayBuffer());
+        } catch (error) {
+          state.wasmReady = false;
+          updateControls();
+          setStatus(els.wasmStatus, "WASM load failed: " + error.message, "error");
+          showError(error);
+        }
+      });
+
+      els.pdf.addEventListener("change", async (event) => {
+        const file = event.target.files && event.target.files[0];
+        if (!file) return;
+        clearEditedDownload();
+        state.pdfBytes = new Uint8Array(await file.arrayBuffer());
+        state.pdfName = file.name || "document.pdf";
+        setStatus(
+          els.pdfStatus,
+          `${state.pdfName} loaded (${state.pdfBytes.byteLength.toLocaleString()} bytes).`,
+          "ok"
+        );
+        updateControls();
+      });
+
+      els.inspect.addEventListener("click", () => {
+        try {
+          show(window.binasInspectPDF(state.pdfBytes));
+        } catch (error) {
+          showError(error);
+        }
+      });
+
+      els.query.addEventListener("click", () => {
+        try {
+          show(window.binasQueryPDF(state.pdfBytes, els.queryText.value));
+        } catch (error) {
+          showError(error);
+        }
+      });
+
+      els.edit.addEventListener("click", () => {
+        try {
+          clearEditedDownload();
+          const result = window.binasEditPDFText(
+            state.pdfBytes,
+            els.oldText.value,
+            els.newText.value
+          );
+          show(result);
+          if (result && result.ok && result.bytes instanceof Uint8Array) {
+            state.pdfBytes = result.bytes;
+            setEditedDownload(result.bytes);
+            setStatus(
+              els.pdfStatus,
+              `Edited bytes ready (${result.bytes.byteLength.toLocaleString()} bytes).`,
+              "ok"
+            );
+          }
+        } catch (error) {
+          showError(error);
+        }
+      });
+
+      els.download.addEventListener("click", (event) => {
+        if (!state.editedUrl) {
+          event.preventDefault();
+        }
+      });
+
+      loadDefaultWASM();
+    </script>
+  </body>
+</html>

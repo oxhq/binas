@@ -148,6 +148,64 @@ func TestCMapUsesActiveTfFontResourceForHexTextShow(t *testing.T) {
 	}
 }
 
+func TestCMapUsesActiveTfFontResourceForTJArrayHexTextShow(t *testing.T) {
+	content := []byte("BT\n/F1 12 Tf\n[<01> 20 <02>] TJ\nET\n")
+	input := testPDF(
+		"<< /Type /Catalog >>",
+		"<< /Type /Page /Contents 4 0 R /Resources << /Font << /F1 3 0 R >> >> >>",
+		"<< /Type /Font /Subtype /Type0 /ToUnicode 5 0 R >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
+		testTwoCharToUnicodeCMapStream("0041", "0042"),
+	)
+	adapter := NewAdapter()
+	tree, err := adapter.Parse(input, core.ParseOptions{Strict: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	matches := tree.Query(core.Match{Kind: KindTextShow, Text: "AB"})
+	if len(matches) != 1 {
+		t.Fatalf("AB matches = %d, want 1", len(matches))
+	}
+	if matches[0].Meta["encoding"] != "tj-array-cmap" {
+		t.Fatalf("encoding meta = %v, want tj-array-cmap", matches[0].Meta["encoding"])
+	}
+
+	plan, err := adapter.PlanEdit(tree, core.Match{Kind: KindTextShow, Text: "AB"}, core.Mutation{Replace: "BA"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, _, err := adapter.Apply(input, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(output, []byte("[<0201>] TJ")) {
+		t.Fatalf("expected CMap TJ array replacement to preserve hex/CMap encoding:\n%s", output)
+	}
+	verification, err := adapter.Verify(output, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.ReparseOK || !verification.OldTextRemoved || !verification.NewSelectable || !verification.PageUnchanged {
+		t.Fatalf("verification failed: %+v", verification)
+	}
+}
+
+func TestCMapEncodeHexUsesLongestDecodedTextMapping(t *testing.T) {
+	cmap := pdfToUnicodeMap{
+		"01": "fi",
+		"02": "f",
+		"03": "i",
+		"04": "x",
+	}
+	encoded, ok := cmap.EncodeHex("fix")
+	if !ok {
+		t.Fatal("expected ligature text to encode")
+	}
+	if encoded != "0104" {
+		t.Fatalf("encoded = %q, want longest mapping 0104", encoded)
+	}
+}
+
 func TestCMapInheritsPageResourcesFromParentPages(t *testing.T) {
 	content := []byte("BT\n/F1 12 Tf\n<0102030405> Tj\nET\n")
 	input := testPDF(

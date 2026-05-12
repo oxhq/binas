@@ -23,6 +23,7 @@ type pdfRef struct {
 type pdfName string
 type pdfLiteralString string
 type pdfHexString string
+type pdfDecryptedString []byte
 type pdfArray []pdfValue
 type pdfDict map[string]pdfValue
 type pdfValue any
@@ -49,6 +50,7 @@ type pdfGraph struct {
 	Boundaries residualBoundarySummary
 	Xref       xrefSummary
 	XrefStream []pdfXrefEntry
+	Encryption *pdfGraphEncryption
 }
 
 type pdfXrefEntry struct {
@@ -69,10 +71,12 @@ type pdfGraphParseOptions struct {
 	AllowEncryption bool
 	AllowSignature  bool
 	AllowXFA        bool
+	Password        string
 }
 
 type pdfCanonicalWriteOptions struct {
 	AllowSignatureInvalidation bool
+	AllowEncryption            bool
 }
 
 func parsePDFGraph(input []byte) (*pdfGraph, error) {
@@ -83,8 +87,8 @@ func parsePDFGraphWithOptions(input []byte, opts pdfGraphParseOptions) (*pdfGrap
 	if !bytes.HasPrefix(input, []byte("%PDF-")) {
 		return nil, errors.New("not a PDF file")
 	}
-	boundaries := summarizeResidualBoundaries(input)
-	if boundaries.HasEncryption {
+	boundaries := summarizeResidualBoundariesForInput(input)
+	if boundaries.HasEncryption && (!opts.AllowEncryption || opts.Password == "") {
 		return nil, ErrEncryptedPDFPasswordRequired
 	}
 	if boundaries.HasSignature && !opts.AllowSignature {
@@ -103,6 +107,19 @@ func parsePDFGraphWithOptions(input []byte, opts pdfGraphParseOptions) (*pdfGrap
 		return nil, err
 	}
 	graph.Trailer = parseLastTrailerDictionary(input)
+	if boundaries.HasEncryption {
+		encryption, err := graph.prepareStandardSecurityEncryption([]byte(opts.Password))
+		if err != nil {
+			return nil, err
+		}
+		graph.Encryption = encryption
+		if err := graph.decryptStandardSecurityObjects(); err != nil {
+			return nil, err
+		}
+	}
+	if err := graph.validateHybridXrefStream(); err != nil {
+		return nil, err
+	}
 	for _, object := range sortedPDFObjects(graph.Objects) {
 		stream, ok := object.Value.(pdfStreamObject)
 		if !ok || !dictHasType(stream.Dict, "ObjStm") {
@@ -132,6 +149,40 @@ func parsePDFGraphWithOptions(input []byte, opts pdfGraphParseOptions) (*pdfGrap
 		graph.Root = &root
 	}
 	return graph, nil
+}
+
+func (g *pdfGraph) validateHybridXrefStream() error {
+	if g.Trailer == nil {
+		return nil
+	}
+	if _, exists := g.Trailer["XRefStm"]; !exists {
+		return nil
+	}
+	offset, ok := dictInt(g.Trailer, "XRefStm")
+	if !ok {
+		return errors.New("hybrid xref /XRefStm must be an integer offset")
+	}
+	if offset < 0 {
+		return fmt.Errorf("hybrid xref /XRefStm offset %d is invalid", offset)
+	}
+	var object *pdfIndirectObject
+	for _, candidate := range g.Objects {
+		if candidate.Offset == offset {
+			object = candidate
+			break
+		}
+	}
+	if object == nil {
+		return fmt.Errorf("hybrid xref /XRefStm offset %d does not point to an indirect object", offset)
+	}
+	stream, ok := object.Value.(pdfStreamObject)
+	if !ok || !dictHasType(stream.Dict, "XRef") {
+		return fmt.Errorf("hybrid xref /XRefStm offset %d does not point to an xref stream", offset)
+	}
+	if _, err := parsePDFXrefStream(stream.Dict, stream.Data); err != nil {
+		return fmt.Errorf("hybrid xref /XRefStm stream: %w", err)
+	}
+	return nil
 }
 
 func parsePDFGraphTree(input []byte, opts core.ParseOptions) (*core.Tree, error) {
@@ -616,7 +667,7 @@ func (g *pdfGraph) toTree(input []byte) *core.Tree {
 		if !ok || dictHasType(stream.Dict, "ObjStm") || dictHasType(stream.Dict, "XRef") {
 			continue
 		}
-		decoded, err := decodePDFGraphStream(stream)
+		decoded, err := g.decodePDFGraphObjectStream(object.ID, stream)
 		streamMeta := map[string]any{
 			"object_number":     object.ID.Number,
 			"object_generation": object.ID.Generation,
@@ -650,6 +701,7 @@ func (g *pdfGraph) toTree(input []byte) *core.Tree {
 			decodedContent:    bytes.Clone(decoded),
 			toUnicode:         cmapContext.fallback,
 			fontToUnicode:     cmapContext.fontCMapsForStream(stream.SourceStart),
+			fontMetrics:       cmapContext.fontMetricsForStream(stream.SourceStart),
 		})
 	}
 	return tree
@@ -708,6 +760,28 @@ func EditCanonicalInvalidatingSignatures(input []byte, selector core.Match, muta
 		invariants,
 		pdfGraphParseOptions{AllowSignature: true},
 		pdfCanonicalWriteOptions{AllowSignatureInvalidation: true},
+	)
+}
+
+func EditCanonicalWithPassword(input []byte, password string, selector core.Match, mutation core.Mutation, invariants []core.Invariant) ([]byte, core.Report, core.Verification, error) {
+	return editCanonicalWithOptions(
+		input,
+		selector,
+		mutation,
+		invariants,
+		pdfGraphParseOptions{AllowEncryption: true, Password: password},
+		pdfCanonicalWriteOptions{AllowEncryption: true},
+	)
+}
+
+func EditCanonicalWithPasswordInvalidatingSignatures(input []byte, password string, selector core.Match, mutation core.Mutation, invariants []core.Invariant) ([]byte, core.Report, core.Verification, error) {
+	return editCanonicalWithOptions(
+		input,
+		selector,
+		mutation,
+		invariants,
+		pdfGraphParseOptions{AllowEncryption: true, AllowSignature: true, Password: password},
+		pdfCanonicalWriteOptions{AllowEncryption: true, AllowSignatureInvalidation: true},
 	)
 }
 
@@ -796,7 +870,7 @@ func editCanonicalWithOptions(input []byte, selector core.Match, mutation core.M
 }
 
 func verifyCanonicalEditOutput(output []byte, plan *core.EditPlan, parseOpts pdfGraphParseOptions) (core.Verification, error) {
-	if !parseOpts.AllowSignature {
+	if !parseOpts.AllowSignature && !parseOpts.AllowEncryption && !parseOpts.AllowXFA {
 		return NewAdapter().Verify(output, plan)
 	}
 	graph, err := parsePDFGraphWithOptions(output, parseOpts)
@@ -839,7 +913,7 @@ func (g *pdfGraph) textShowCandidatesWithCMapContext(text string, cmapContext pd
 		if !ok || dictHasType(stream.Dict, "ObjStm") || dictHasType(stream.Dict, "XRef") {
 			continue
 		}
-		decoded, err := decodePDFGraphStream(stream)
+		decoded, err := g.decodePDFGraphObjectStream(object.ID, stream)
 		if err != nil {
 			continue
 		}
@@ -880,7 +954,7 @@ func parseCanonicalTextShows(input []byte, cmap *toUnicodeCMap, fontCMaps map[st
 		)
 		switch input[i] {
 		case '[':
-			arrayDecoded, arrayEncoded, arrayEnd, arrayOK := parseSimpleTJArrayText(input, i, len(input), ctx.cmapForFont(activeFont))
+			arrayDecoded, arrayEncoded, arrayEnd, arrayUsedCMap, arrayOK := parseSimpleTJArrayText(input, i, len(input), ctx.cmapForFont(activeFont))
 			if !arrayOK {
 				continue
 			}
@@ -895,6 +969,9 @@ func parseCanonicalTextShows(input []byte, cmap *toUnicodeCMap, fontCMaps map[st
 			encoded = arrayEncoded
 			decoded = arrayDecoded
 			encoding = "tj-array"
+			if arrayUsedCMap {
+				encoding = "tj-array-cmap"
+			}
 		case '(':
 			closeAt, ok = findLiteralEnd(input, i+1, len(input))
 			if !ok {
@@ -954,6 +1031,12 @@ func encodeCanonicalTextReplacement(show parsedTextShow, replacement string) (st
 		return encodeLiteralString(replacement), nil
 	case "tj-array":
 		return "[(" + encodeLiteralString(replacement) + ")]", nil
+	case "tj-array-cmap":
+		encoded, ok := show.CMap.EncodeHex(replacement)
+		if !ok {
+			return "", errors.New("replacement for ToUnicode TJ array text is not representable by the CMap")
+		}
+		return "[<" + encoded + ">]", nil
 	case "hex":
 		return encodeHexTextString(replacement)
 	case "hex-cmap":
@@ -973,7 +1056,12 @@ func writeCanonicalPDF(graph *pdfGraph) ([]byte, error) {
 
 func writeCanonicalPDFWithOptions(graph *pdfGraph, opts pdfCanonicalWriteOptions) ([]byte, error) {
 	if graph.Boundaries.HasEncryption {
-		return nil, ErrEncryptedPDFPasswordRequired
+		if !opts.AllowEncryption {
+			return nil, ErrEncryptedPDFPasswordRequired
+		}
+		if graph.Encryption == nil || graph.Encryption.security == nil {
+			return nil, unsupportedPDFEncryption("canonical encrypted rewrite requires an authenticated Standard Security graph")
+		}
 	}
 	if graph.Boundaries.HasSignature && !opts.AllowSignatureInvalidation {
 		return nil, ErrSignedPDFRequiresInvalidation
@@ -1004,7 +1092,15 @@ func writeCanonicalPDFWithOptions(graph *pdfGraph, opts pdfCanonicalWriteOptions
 	for _, object := range objects {
 		offsets[object.ID] = out.Len()
 		fmt.Fprintf(&out, "%d %d obj\n", object.ID.Number, object.ID.Generation)
-		if err := writePDFValue(&out, object.Value); err != nil {
+		value := object.Value
+		if graph.Boundaries.HasEncryption && (graph.Encryption.encryptObject == nil || object.ID != *graph.Encryption.encryptObject) {
+			encrypted, err := encryptPDFObjectValue(graph.Encryption.security, graph.Encryption.fileKey, object.ID, value)
+			if err != nil {
+				return nil, fmt.Errorf("encrypt object %d %d: %w", object.ID.Number, object.ID.Generation, err)
+			}
+			value = encrypted
+		}
+		if err := writePDFValue(&out, value); err != nil {
 			return nil, fmt.Errorf("write object %d %d: %w", object.ID.Number, object.ID.Generation, err)
 		}
 		out.WriteString("\nendobj\n")
@@ -1029,7 +1125,7 @@ func writeCanonicalPDFWithOptions(graph *pdfGraph, opts pdfCanonicalWriteOptions
 			fmt.Fprintf(&out, "%010d 00000 n \n", offset)
 		}
 	}
-	trailer := canonicalTrailer(graph, maxObject+1)
+	trailer := canonicalTrailer(graph, maxObject+1, graph.Boundaries.HasEncryption)
 	out.WriteString("trailer\n")
 	if err := writePDFValue(&out, trailer); err != nil {
 		return nil, err
@@ -1040,14 +1136,16 @@ func writeCanonicalPDFWithOptions(graph *pdfGraph, opts pdfCanonicalWriteOptions
 	return out.Bytes(), nil
 }
 
-func canonicalTrailer(graph *pdfGraph, size int) pdfDict {
+func canonicalTrailer(graph *pdfGraph, size int, preserveEncrypt bool) pdfDict {
 	trailer := clonePDFDict(graph.Trailer)
 	if trailer == nil {
 		trailer = make(pdfDict)
 	}
 	delete(trailer, "Prev")
 	delete(trailer, "XRefStm")
-	delete(trailer, "Encrypt")
+	if !preserveEncrypt {
+		delete(trailer, "Encrypt")
+	}
 	delete(trailer, "Length")
 	delete(trailer, "Filter")
 	delete(trailer, "DecodeParms")
@@ -1186,6 +1284,15 @@ func clonePDFDict(in pdfDict) pdfDict {
 
 func decodePDFGraphStream(stream pdfStreamObject) ([]byte, error) {
 	return decodeStreamFilterWithDecodeParms(pdfGraphStreamFilterString(stream.Dict), pdfGraphDecodeParmsString(stream.Dict), stream.Data)
+}
+
+func (g *pdfGraph) decodePDFGraphObjectStream(id pdfObjectID, stream pdfStreamObject) ([]byte, error) {
+	return decodeStreamFilterWithDecodeParmsAndCrypt(
+		pdfGraphStreamFilterString(stream.Dict),
+		pdfGraphDecodeParmsString(stream.Dict),
+		stream.Data,
+		g.streamCryptHandler(id),
+	)
 }
 
 func pdfGraphStreamFilterString(dict pdfDict) string {

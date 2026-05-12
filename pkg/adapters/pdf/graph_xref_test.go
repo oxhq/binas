@@ -3,6 +3,7 @@ package pdf
 import (
 	"bytes"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -101,6 +102,62 @@ func TestCanonicalWriterPreservesNonZeroGenerationObjectXref(t *testing.T) {
 	}
 }
 
+func TestHybridXRefStmGraphParsesAndCanonicalWriterDropsStreamTrailer(t *testing.T) {
+	fixture := buildHybridXrefPDFFixture(t, validHybridXrefStreamData)
+
+	graph, err := parsePDFGraph(fixture.input)
+	if err != nil {
+		t.Fatalf("parse hybrid xref graph: %v", err)
+	}
+
+	if !graph.Xref.HasTable || !graph.Xref.HasHybridStream || !graph.Xref.HasStream {
+		t.Fatalf("hybrid xref summary = %+v", graph.Xref)
+	}
+	if graph.Xref.HybridStreamOffset != fixture.xrefStreamOffset {
+		t.Fatalf("hybrid xref stream offset = %d, want %d", graph.Xref.HybridStreamOffset, fixture.xrefStreamOffset)
+	}
+	if len(graph.XrefStream) != 4 {
+		t.Fatalf("xref stream entries = %d, want 4", len(graph.XrefStream))
+	}
+	if _, ok := graph.Objects[pdfObjectID{Number: 3, Generation: 0}]; !ok {
+		t.Fatalf("graph missing hybrid xref object 3 0: %+v", graph.Objects)
+	}
+	if _, ok := graph.Trailer["XRefStm"]; !ok {
+		t.Fatalf("graph trailer missing original /XRefStm: %+v", graph.Trailer)
+	}
+
+	output, err := writeCanonicalPDF(graph)
+	if err != nil {
+		t.Fatalf("write canonical hybrid PDF: %v", err)
+	}
+	if !bytes.Contains(output, []byte("\nxref\n0 4\n")) {
+		t.Fatalf("canonical output did not rebuild table xref:\n%s", output)
+	}
+	if bytes.Contains(output, []byte("/XRefStm")) {
+		t.Fatalf("canonical output preserved /XRefStm:\n%s", output)
+	}
+	if bytes.Contains(output, []byte("/Type /XRef")) {
+		t.Fatalf("canonical output preserved xref stream object:\n%s", output)
+	}
+	if _, err := parsePDFGraph(output); err != nil {
+		t.Fatalf("reparse canonical hybrid output: %v\n%s", err, output)
+	}
+}
+
+func TestHybridXRefStmMalformedStreamFailsClosed(t *testing.T) {
+	fixture := buildHybridXrefPDFFixture(t, func(catalogOffset, hybridObjectOffset int) []byte {
+		return []byte{0, 0, 0, 0, 0, 0, 1}
+	})
+
+	_, err := parsePDFGraph(fixture.input)
+	if err == nil {
+		t.Fatal("expected malformed hybrid xref stream error")
+	}
+	if !strings.Contains(err.Error(), "hybrid xref /XRefStm stream: xref stream data ended before all entries") {
+		t.Fatalf("error = %q, want focused hybrid xref stream failure", err)
+	}
+}
+
 func assertXrefGraphEntry(t *testing.T, entries []xrefObjectOffset, number, generation, offset int) {
 	t.Helper()
 	got := mustXrefGraphEntry(t, entries, number, generation)
@@ -118,4 +175,62 @@ func mustXrefGraphEntry(t *testing.T, entries []xrefObjectOffset, number, genera
 	}
 	t.Fatalf("object %d %d not found in %+v", number, generation, entries)
 	return xrefObjectOffset{}
+}
+
+type hybridXrefPDFFixture struct {
+	input              []byte
+	tableOffset        int
+	catalogOffset      int
+	hybridObjectOffset int
+	xrefStreamOffset   int
+}
+
+func buildHybridXrefPDFFixture(t *testing.T, streamData func(catalogOffset, hybridObjectOffset int) []byte) hybridXrefPDFFixture {
+	t.Helper()
+
+	var input bytes.Buffer
+	input.WriteString("%PDF-1.5\n")
+	catalogOffset := input.Len()
+	input.WriteString("1 0 obj\n<< /Type /Catalog >>\nendobj\n")
+	hybridObjectOffset := input.Len()
+	input.WriteString("3 0 obj\n<< /Hybrid true >>\nendobj\n")
+	data := streamData(catalogOffset, hybridObjectOffset)
+	xrefStreamOffset := input.Len()
+	fmt.Fprintf(&input, "8 0 obj\n<< /Type /XRef /Size 9 /W [1 4 1] /Index [0 4] /Length %d >>\nstream\n", len(data))
+	input.Write(data)
+	input.WriteString("\nendstream\nendobj\n")
+	tableOffset := input.Len()
+	input.WriteString("xref\n")
+	input.WriteString("0 2\n")
+	input.WriteString("0000000000 65535 f \n")
+	fmt.Fprintf(&input, "%010d 00000 n \n", catalogOffset)
+	input.WriteString("8 1\n")
+	fmt.Fprintf(&input, "%010d 00000 n \n", xrefStreamOffset)
+	fmt.Fprintf(&input, "trailer\n<< /Size 9 /Root 1 0 R /XRefStm %d >>\nstartxref\n%d\n%%%%EOF\n", xrefStreamOffset, tableOffset)
+
+	return hybridXrefPDFFixture{
+		input:              input.Bytes(),
+		tableOffset:        tableOffset,
+		catalogOffset:      catalogOffset,
+		hybridObjectOffset: hybridObjectOffset,
+		xrefStreamOffset:   xrefStreamOffset,
+	}
+}
+
+func validHybridXrefStreamData(catalogOffset, hybridObjectOffset int) []byte {
+	var data bytes.Buffer
+	writeXrefStreamEntry(&data, 0, 0, 0)
+	writeXrefStreamEntry(&data, 1, catalogOffset, 0)
+	writeXrefStreamEntry(&data, 0, 0, 0)
+	writeXrefStreamEntry(&data, 1, hybridObjectOffset, 0)
+	return data.Bytes()
+}
+
+func writeXrefStreamEntry(out *bytes.Buffer, entryType, field2, field3 int) {
+	out.WriteByte(byte(entryType))
+	out.WriteByte(byte(field2 >> 24))
+	out.WriteByte(byte(field2 >> 16))
+	out.WriteByte(byte(field2 >> 8))
+	out.WriteByte(byte(field2))
+	out.WriteByte(byte(field3))
 }

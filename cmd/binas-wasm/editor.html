@@ -1,0 +1,1045 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>binas browser PDF editor</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", sans-serif;
+        --border: color-mix(in srgb, CanvasText 18%, Canvas);
+        --muted: color-mix(in srgb, CanvasText 68%, Canvas);
+        --panel: color-mix(in srgb, CanvasText 5%, Canvas);
+        --ok: #067647;
+        --error: #b42318;
+        --highlight: rgba(255, 214, 10, 0.42);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background: Canvas;
+        color: CanvasText;
+      }
+
+      main {
+        width: min(1180px, calc(100vw - 32px));
+        margin: 24px auto 40px;
+      }
+
+      header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 18px;
+      }
+
+      h1,
+      h2,
+      p {
+        margin: 0;
+      }
+
+      h1 {
+        font-size: 24px;
+        line-height: 1.2;
+      }
+
+      h2 {
+        margin-bottom: 12px;
+        font-size: 15px;
+        line-height: 1.2;
+      }
+
+      p {
+        color: var(--muted);
+      }
+
+      .badge {
+        flex: 0 0 auto;
+        padding: 6px 9px;
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1;
+      }
+
+      .layout {
+        display: grid;
+        grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
+        gap: 16px;
+        align-items: start;
+      }
+
+      section {
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 16px;
+        background: Canvas;
+      }
+
+      .stack {
+        display: grid;
+        gap: 16px;
+      }
+
+      label {
+        display: block;
+        margin-bottom: 6px;
+        font-weight: 650;
+      }
+
+      input[type="file"],
+      input[type="text"] {
+        width: 100%;
+      }
+
+      input[type="text"] {
+        min-height: 38px;
+        padding: 8px 10px;
+        border: 1px solid color-mix(in srgb, CanvasText 22%, Canvas);
+        border-radius: 6px;
+        background: Canvas;
+        color: CanvasText;
+        font: inherit;
+      }
+
+      .field {
+        margin-top: 12px;
+      }
+
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 12px;
+      }
+
+      button,
+      a[download] {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 36px;
+        padding: 0 12px;
+        border: 1px solid color-mix(in srgb, CanvasText 22%, Canvas);
+        border-radius: 6px;
+        background: ButtonFace;
+        color: ButtonText;
+        font: inherit;
+        text-decoration: none;
+        cursor: pointer;
+      }
+
+      button.primary {
+        border-color: color-mix(in srgb, Highlight 70%, CanvasText);
+        background: Highlight;
+        color: HighlightText;
+      }
+
+      button:disabled,
+      a[aria-disabled="true"] {
+        cursor: not-allowed;
+        opacity: 0.55;
+      }
+
+      .status {
+        margin-top: 8px;
+        color: var(--muted);
+        font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+        font-size: 12px;
+        line-height: 1.5;
+      }
+
+      .status.ok {
+        color: var(--ok);
+      }
+
+      .status.error {
+        color: var(--error);
+      }
+
+      .viewer-shell {
+        margin-top: 16px;
+      }
+
+      .viewer-toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 10px;
+      }
+
+      .viewer-toolbar input {
+        width: 72px;
+        min-height: 36px;
+        padding: 6px 8px;
+        border: 1px solid color-mix(in srgb, CanvasText 22%, Canvas);
+        border-radius: 6px;
+        background: Canvas;
+        color: CanvasText;
+        font: inherit;
+      }
+
+      .viewer-toolbar .spacer {
+        flex: 1 1 auto;
+      }
+
+      .canvas-frame {
+        position: relative;
+        min-height: 360px;
+        overflow: auto;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background:
+          linear-gradient(45deg, color-mix(in srgb, CanvasText 5%, Canvas) 25%, transparent 25%),
+          linear-gradient(-45deg, color-mix(in srgb, CanvasText 5%, Canvas) 25%, transparent 25%),
+          linear-gradient(45deg, transparent 75%, color-mix(in srgb, CanvasText 5%, Canvas) 75%),
+          linear-gradient(-45deg, transparent 75%, color-mix(in srgb, CanvasText 5%, Canvas) 75%);
+        background-color: color-mix(in srgb, CanvasText 3%, Canvas);
+        background-position: 0 0, 0 10px, 10px -10px, -10px 0;
+        background-size: 20px 20px;
+      }
+
+      .canvas-stage {
+        position: relative;
+        width: max-content;
+        min-width: 100%;
+        padding: 12px;
+      }
+
+      #pdf-canvas {
+        display: block;
+        margin: 0 auto;
+        background: white;
+        box-shadow: 0 1px 8px color-mix(in srgb, CanvasText 20%, transparent);
+      }
+
+      #highlight-layer {
+        position: absolute;
+        left: 12px;
+        top: 12px;
+        pointer-events: none;
+      }
+
+      .highlight-box {
+        position: absolute;
+        border: 1px solid color-mix(in srgb, #f6c000 70%, CanvasText);
+        background: var(--highlight);
+        mix-blend-mode: multiply;
+      }
+
+      .summary {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+      }
+
+      .metric {
+        min-height: 68px;
+        padding: 10px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--panel);
+      }
+
+      .metric span {
+        display: block;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .metric strong {
+        display: block;
+        margin-top: 6px;
+        overflow: hidden;
+        font-size: 18px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .results {
+        display: grid;
+        grid-template-columns: minmax(220px, 320px) minmax(0, 1fr);
+        gap: 12px;
+        margin-top: 16px;
+      }
+
+      .matches {
+        min-height: 240px;
+        max-height: 480px;
+        overflow: auto;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--panel);
+      }
+
+      .match {
+        display: block;
+        width: 100%;
+        min-height: 46px;
+        padding: 9px 10px;
+        border: 0;
+        border-bottom: 1px solid var(--border);
+        border-radius: 0;
+        background: transparent;
+        color: CanvasText;
+        text-align: left;
+      }
+
+      .match:last-child {
+        border-bottom: 0;
+      }
+
+      .match.active {
+        background: color-mix(in srgb, Highlight 15%, Canvas);
+      }
+
+      .match small {
+        display: block;
+        margin-top: 3px;
+        color: var(--muted);
+      }
+
+      .empty {
+        padding: 12px;
+        color: var(--muted);
+      }
+
+      pre {
+        min-height: 240px;
+        max-height: 480px;
+        margin: 0;
+        overflow: auto;
+        padding: 12px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: color-mix(in srgb, CanvasText 8%, Canvas);
+        white-space: pre-wrap;
+      }
+
+      @media (max-width: 860px) {
+        header,
+        .layout,
+        .results {
+          grid-template-columns: 1fr;
+        }
+
+        header {
+          display: block;
+        }
+
+        .badge {
+          display: inline-flex;
+          margin-top: 10px;
+        }
+
+        .summary {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>binas browser PDF editor</h1>
+          <p>Local browser PDF rendering, exact text query, verified WASM text edits, visual highlights, and edited byte download.</p>
+        </div>
+        <span class="badge" id="runtime-badge">WASM loading</span>
+      </header>
+
+      <div class="layout">
+        <div class="stack">
+          <section>
+            <h2>Runtime</h2>
+            <label for="runtime-file">Go runtime fallback</label>
+            <input id="runtime-file" type="file" accept=".js,text/javascript,application/javascript">
+            <div class="field">
+              <label for="wasm-file">WASM file fallback</label>
+              <input id="wasm-file" type="file" accept=".wasm,application/wasm">
+            </div>
+            <div class="field">
+              <label for="pdfjs-file">PDF.js module fallback</label>
+              <input id="pdfjs-file" type="file" accept=".mjs,.js,text/javascript,application/javascript">
+            </div>
+            <div class="field">
+              <label for="pdfjs-worker-file">PDF.js worker fallback</label>
+              <input id="pdfjs-worker-file" type="file" accept=".mjs,.js,text/javascript,application/javascript">
+            </div>
+            <div id="runtime-status" class="status">Trying ../../tmp/wasm_exec.js or ./wasm_exec.js with ../../tmp/binas.wasm, then ./binas.wasm.</div>
+          </section>
+
+          <section>
+            <h2>PDF</h2>
+            <label for="pdf-file">PDF file</label>
+            <input id="pdf-file" type="file" accept="application/pdf,.pdf">
+            <div id="pdf-status" class="status">No PDF loaded.</div>
+            <div class="actions">
+              <button id="inspect-button" type="button" disabled>Inspect</button>
+            </div>
+          </section>
+
+          <section>
+            <h2>Query Text</h2>
+            <label for="query-text">Text to find</label>
+            <input id="query-text" type="text" autocomplete="off" placeholder="Exact text">
+            <div class="actions">
+              <button id="query-button" type="button" disabled>Query</button>
+            </div>
+          </section>
+
+          <section>
+            <h2>Edit Text</h2>
+            <label for="old-text">Old text</label>
+            <input id="old-text" type="text" autocomplete="off" placeholder="Existing exact text">
+            <div class="field">
+              <label for="new-text">New text</label>
+              <input id="new-text" type="text" autocomplete="off" placeholder="Replacement text">
+            </div>
+            <div class="actions">
+              <button id="edit-button" class="primary" type="button" disabled>Edit bytes</button>
+              <a id="download-link" download="binas-edited.pdf" aria-disabled="true">Download edited PDF</a>
+            </div>
+          </section>
+        </div>
+
+        <section>
+          <h2>Result</h2>
+          <div class="summary" aria-live="polite">
+            <div class="metric">
+              <span>File</span>
+              <strong id="metric-file">No PDF</strong>
+            </div>
+            <div class="metric">
+              <span>Bytes</span>
+              <strong id="metric-bytes">0</strong>
+            </div>
+            <div class="metric">
+              <span>Matches</span>
+              <strong id="metric-matches">-</strong>
+            </div>
+          </div>
+
+          <div class="viewer-shell">
+            <h2>Rendered Page</h2>
+            <div class="viewer-toolbar">
+              <button id="prev-page" type="button" disabled aria-label="Previous page">Prev</button>
+              <label for="page-number">Page</label>
+              <input id="page-number" type="number" min="1" value="1" disabled>
+              <span id="page-count">/ -</span>
+              <button id="next-page" type="button" disabled aria-label="Next page">Next</button>
+              <span class="spacer"></span>
+              <button id="zoom-out" type="button" disabled aria-label="Zoom out">-</button>
+              <span id="zoom-level">100%</span>
+              <button id="zoom-in" type="button" disabled aria-label="Zoom in">+</button>
+            </div>
+            <div id="render-status" class="status">Load PDF.js and a PDF to render pages.</div>
+            <div class="canvas-frame">
+              <div class="canvas-stage">
+                <canvas id="pdf-canvas" width="1" height="1" aria-label="Rendered PDF page"></canvas>
+                <div id="highlight-layer" aria-hidden="true"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="results">
+            <div>
+              <h2>Matches</h2>
+              <div id="matches" class="matches">
+                <div class="empty">Run a query to show match count and details.</div>
+              </div>
+            </div>
+            <div>
+              <h2>Structured Output</h2>
+              <pre id="output">Waiting for WASM and PDF input.</pre>
+            </div>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <script>
+      const state = {
+        wasmReady: false,
+        pdfjsReady: false,
+        pdfjsLib: null,
+        pdfjsWorkerUrl: null,
+        pdfDoc: null,
+        currentPage: 1,
+        pageCount: 0,
+        scale: 1.2,
+        renderTask: null,
+        pdfBytes: null,
+        pdfName: "document.pdf",
+        editedUrl: null,
+        lastMatches: [],
+        lastQuery: "",
+      };
+
+      const els = {
+        runtimeBadge: document.getElementById("runtime-badge"),
+        runtimeFile: document.getElementById("runtime-file"),
+        wasmFile: document.getElementById("wasm-file"),
+        pdfjsFile: document.getElementById("pdfjs-file"),
+        pdfjsWorkerFile: document.getElementById("pdfjs-worker-file"),
+        runtimeStatus: document.getElementById("runtime-status"),
+        pdfFile: document.getElementById("pdf-file"),
+        pdfStatus: document.getElementById("pdf-status"),
+        inspectButton: document.getElementById("inspect-button"),
+        queryButton: document.getElementById("query-button"),
+        editButton: document.getElementById("edit-button"),
+        downloadLink: document.getElementById("download-link"),
+        queryText: document.getElementById("query-text"),
+        oldText: document.getElementById("old-text"),
+        newText: document.getElementById("new-text"),
+        metricFile: document.getElementById("metric-file"),
+        metricBytes: document.getElementById("metric-bytes"),
+        metricMatches: document.getElementById("metric-matches"),
+        prevPage: document.getElementById("prev-page"),
+        nextPage: document.getElementById("next-page"),
+        pageNumber: document.getElementById("page-number"),
+        pageCount: document.getElementById("page-count"),
+        zoomOut: document.getElementById("zoom-out"),
+        zoomIn: document.getElementById("zoom-in"),
+        zoomLevel: document.getElementById("zoom-level"),
+        renderStatus: document.getElementById("render-status"),
+        pdfCanvas: document.getElementById("pdf-canvas"),
+        highlightLayer: document.getElementById("highlight-layer"),
+        matches: document.getElementById("matches"),
+        output: document.getElementById("output"),
+      };
+
+      function setStatus(element, message, kind) {
+        element.textContent = message;
+        element.classList.toggle("ok", kind === "ok");
+        element.classList.toggle("error", kind === "error");
+      }
+
+      function setRuntimeBadge(message, kind) {
+        els.runtimeBadge.textContent = message;
+        els.runtimeBadge.style.borderColor = kind === "ok" ? "var(--ok)" : kind === "error" ? "var(--error)" : "var(--border)";
+        els.runtimeBadge.style.color = kind === "ok" ? "var(--ok)" : kind === "error" ? "var(--error)" : "var(--muted)";
+      }
+
+      function updateControls() {
+        const ready = Boolean(state.wasmReady && state.pdfBytes);
+        els.inspectButton.disabled = !ready;
+        els.queryButton.disabled = !ready;
+        els.editButton.disabled = !ready;
+        const canRender = Boolean(state.pdfjsReady && state.pdfDoc);
+        els.prevPage.disabled = !canRender || state.currentPage <= 1;
+        els.nextPage.disabled = !canRender || state.currentPage >= state.pageCount;
+        els.pageNumber.disabled = !canRender;
+        els.zoomOut.disabled = !canRender || state.scale <= 0.6;
+        els.zoomIn.disabled = !canRender || state.scale >= 3;
+      }
+
+      function updateMetrics() {
+        els.metricFile.textContent = state.pdfBytes ? state.pdfName : "No PDF";
+        els.metricBytes.textContent = state.pdfBytes ? state.pdfBytes.byteLength.toLocaleString() : "0";
+        els.metricMatches.textContent = Array.isArray(state.lastMatches) ? String(state.lastMatches.length) : "-";
+        els.pageCount.textContent = `/ ${state.pageCount || "-"}`;
+        els.pageNumber.value = String(state.currentPage || 1);
+        els.pageNumber.max = String(state.pageCount || 1);
+        els.zoomLevel.textContent = `${Math.round(state.scale * 100)}%`;
+      }
+
+      function show(value) {
+        els.output.textContent = JSON.stringify(normalizeResult(value), replacer, 2);
+      }
+
+      function normalizeResult(value) {
+        if (typeof value !== "string") {
+          return value;
+        }
+        try {
+          return JSON.parse(value);
+        } catch (_) {
+          return { ok: false, error: "WASM returned non-JSON text", raw: value };
+        }
+      }
+
+      function replacer(_key, value) {
+        if (value instanceof Uint8Array) {
+          return {
+            type: "Uint8Array",
+            byteLength: value.byteLength,
+          };
+        }
+        return value;
+      }
+
+      function structuredError(error, context) {
+        return {
+          ok: false,
+          context,
+          error: error && error.message ? error.message : String(error),
+        };
+      }
+
+      function showError(error, context) {
+        const payload = structuredError(error, context);
+        state.lastMatches = [];
+        renderMatches([]);
+        updateMetrics();
+        show(payload);
+      }
+
+      function renderMatches(matches) {
+        els.matches.replaceChildren();
+        if (!matches.length) {
+          const empty = document.createElement("div");
+          empty.className = "empty";
+          empty.textContent = "No matches to display.";
+          els.matches.appendChild(empty);
+          return;
+        }
+        matches.forEach((match, index) => {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "match";
+          button.innerHTML = "";
+          const title = document.createElement("strong");
+          title.textContent = match.value || match.text || "(match)";
+          const detail = document.createElement("small");
+          detail.textContent = matchDetail(match, index);
+          button.append(title, detail);
+          button.addEventListener("click", () => {
+            els.matches.querySelectorAll(".match").forEach((item) => item.classList.remove("active"));
+            button.classList.add("active");
+            show({ ok: true, selected_match: index + 1, match });
+          });
+          els.matches.appendChild(button);
+        });
+      }
+
+      function matchDetail(match, index) {
+        const parts = [`#${index + 1}`];
+        for (const key of ["kind", "id", "node", "object", "page"]) {
+          if (match[key] !== undefined && match[key] !== null && match[key] !== "") {
+            parts.push(`${key}: ${match[key]}`);
+          }
+        }
+        return parts.join(" | ");
+      }
+
+      function clearEditedDownload() {
+        if (state.editedUrl) {
+          URL.revokeObjectURL(state.editedUrl);
+        }
+        state.editedUrl = null;
+        els.downloadLink.removeAttribute("href");
+        els.downloadLink.setAttribute("aria-disabled", "true");
+      }
+
+      function setEditedDownload(bytes) {
+        clearEditedDownload();
+        const blob = new Blob([bytes], { type: "application/pdf" });
+        state.editedUrl = URL.createObjectURL(blob);
+        els.downloadLink.href = state.editedUrl;
+        els.downloadLink.download = state.pdfName.replace(/\.pdf$/i, "") + ".edited.pdf";
+        els.downloadLink.setAttribute("aria-disabled", "false");
+      }
+
+      async function loadPDFJSModule(moduleUrl, workerUrl) {
+        const lib = await import(moduleUrl);
+        const pdfjsLib = lib && (lib.default || lib);
+        if (!pdfjsLib || typeof pdfjsLib.getDocument !== "function") {
+          throw new Error("Selected PDF.js module did not expose getDocument.");
+        }
+        pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
+        state.pdfjsLib = pdfjsLib;
+        state.pdfjsWorkerUrl = workerUrl;
+        state.pdfjsReady = true;
+        setStatus(els.renderStatus, "PDF.js renderer loaded. Choose a PDF to render pages.", "ok");
+        updateControls();
+        if (state.pdfBytes) {
+          await openPDFForRendering(state.pdfBytes);
+        }
+      }
+
+      async function loadDefaultPDFJS() {
+        const candidates = [
+          {
+            module: "https://cdn.jsdelivr.net/npm/pdfjs-dist@5.7.284/build/pdf.min.mjs",
+            worker: "https://cdn.jsdelivr.net/npm/pdfjs-dist@5.7.284/build/pdf.worker.min.mjs",
+          },
+          { module: "./pdf.min.mjs", worker: "./pdf.worker.min.mjs" },
+          { module: "./pdf.mjs", worker: "./pdf.worker.mjs" },
+        ];
+        const errors = [];
+        for (const candidate of candidates) {
+          try {
+            await loadPDFJSModule(candidate.module, candidate.worker);
+            return;
+          } catch (error) {
+            errors.push(error && error.message ? `${candidate.module}: ${error.message}` : String(error));
+          }
+        }
+        state.pdfjsReady = false;
+        setStatus(els.renderStatus, `PDF.js renderer unavailable. Select a PDF.js module and worker manually. Details: ${errors.join(" | ")}`, "error");
+        updateControls();
+      }
+
+      async function openPDFForRendering(bytes) {
+        if (!state.pdfjsReady || !state.pdfjsLib) {
+          setStatus(els.renderStatus, "PDF.js is not loaded; structured inspect/query/edit still works through WASM.", "error");
+          return;
+        }
+        try {
+          if (state.renderTask) {
+            state.renderTask.cancel();
+            state.renderTask = null;
+          }
+          const data = new Uint8Array(bytes);
+          state.pdfDoc = await state.pdfjsLib.getDocument({ data }).promise;
+          state.pageCount = state.pdfDoc.numPages || 0;
+          state.currentPage = Math.min(Math.max(1, state.currentPage || 1), Math.max(1, state.pageCount));
+          updateMetrics();
+          updateControls();
+          await renderPage(state.currentPage);
+        } catch (error) {
+          state.pdfDoc = null;
+          state.pageCount = 0;
+          clearRenderedPage();
+          setStatus(els.renderStatus, `PDF render load failed: ${error.message}`, "error");
+          updateMetrics();
+          updateControls();
+        }
+      }
+
+      function clearRenderedPage() {
+        const ctx = els.pdfCanvas.getContext("2d");
+        els.pdfCanvas.width = 1;
+        els.pdfCanvas.height = 1;
+        ctx.clearRect(0, 0, 1, 1);
+        els.highlightLayer.replaceChildren();
+        els.highlightLayer.style.width = "1px";
+        els.highlightLayer.style.height = "1px";
+      }
+
+      async function renderPage(pageNumber) {
+        if (!state.pdfDoc) return;
+        const page = await state.pdfDoc.getPage(pageNumber);
+        const viewport = page.getViewport({ scale: state.scale });
+        const canvas = els.pdfCanvas;
+        const context = canvas.getContext("2d", { alpha: false });
+        canvas.width = Math.ceil(viewport.width);
+        canvas.height = Math.ceil(viewport.height);
+        canvas.style.width = `${Math.ceil(viewport.width)}px`;
+        canvas.style.height = `${Math.ceil(viewport.height)}px`;
+        els.highlightLayer.style.width = canvas.style.width;
+        els.highlightLayer.style.height = canvas.style.height;
+        els.highlightLayer.replaceChildren();
+        if (state.renderTask) {
+          state.renderTask.cancel();
+        }
+        state.renderTask = page.render({ canvasContext: context, viewport });
+        try {
+          await state.renderTask.promise;
+        } catch (error) {
+          if (error && error.name === "RenderingCancelledException") {
+            return;
+          }
+          throw error;
+        } finally {
+          state.renderTask = null;
+        }
+        const highlights = await renderHighlights(page, viewport, state.lastQuery);
+        setStatus(
+          els.renderStatus,
+          `Rendered page ${state.currentPage} of ${state.pageCount}${state.lastQuery ? ` with ${highlights} visual text highlight${highlights === 1 ? "" : "s"}` : ""}.`,
+          "ok",
+        );
+        updateMetrics();
+        updateControls();
+      }
+
+      async function renderHighlights(page, viewport, query) {
+        els.highlightLayer.replaceChildren();
+        const needle = String(query || "");
+        if (!needle) {
+          return 0;
+        }
+        const textContent = await page.getTextContent();
+        let count = 0;
+        for (const item of textContent.items || []) {
+          if (!item || typeof item.str !== "string" || !item.str.includes(needle)) {
+            continue;
+          }
+          const transform = state.pdfjsLib.Util.transform(viewport.transform, item.transform);
+          const fontHeight = Math.max(8, Math.hypot(transform[2], transform[3]));
+          const width = Math.max(fontHeight * 0.75, item.width * state.scale);
+          const left = transform[4];
+          const top = transform[5] - fontHeight;
+          const box = document.createElement("div");
+          box.className = "highlight-box";
+          box.style.left = `${left}px`;
+          box.style.top = `${top}px`;
+          box.style.width = `${width}px`;
+          box.style.height = `${fontHeight}px`;
+          els.highlightLayer.appendChild(box);
+          count++;
+        }
+        return count;
+      }
+
+      async function findFirstVisualMatchPage(query) {
+        if (!state.pdfDoc || !query) {
+          return state.currentPage;
+        }
+        for (let pageNumber = 1; pageNumber <= state.pageCount; pageNumber++) {
+          const page = await state.pdfDoc.getPage(pageNumber);
+          const textContent = await page.getTextContent();
+          const combined = (textContent.items || []).map((item) => item.str || "").join("");
+          if (combined.includes(query) || (textContent.items || []).some((item) => String(item.str || "").includes(query))) {
+            return pageNumber;
+          }
+        }
+        return state.currentPage;
+      }
+
+      async function instantiateWASM(source) {
+        if (!window.Go) {
+          throw new Error("Go runtime is missing. Select wasm_exec.js from your Go toolchain, copy it to tmp/wasm_exec.js, or place it beside editor.html.");
+        }
+        const go = new Go();
+        const { instance } = await WebAssembly.instantiate(source, go.importObject);
+        go.run(instance);
+        for (const name of ["binasInspectPDF", "binasQueryPDF", "binasEditPDFText"]) {
+          if (typeof window[name] !== "function") {
+            throw new Error(`WASM loaded, but ${name} was not registered.`);
+          }
+        }
+        state.wasmReady = true;
+        setRuntimeBadge("WASM ready", "ok");
+        setStatus(els.runtimeStatus, "WASM loaded. Choose a PDF and run an operation.", "ok");
+        updateControls();
+      }
+
+      async function loadDefaultRuntimeAndWASM() {
+        const errors = [];
+        if (!window.Go) {
+          for (const runtimePath of ["../../tmp/wasm_exec.js", "./wasm_exec.js"]) {
+            try {
+              await loadRuntimeScript(runtimePath);
+              break;
+            } catch (error) {
+              errors.push(error.message);
+            }
+          }
+        }
+
+        const candidates = ["../../tmp/binas.wasm", "./binas.wasm"];
+        for (const path of candidates) {
+          try {
+            const response = await fetch(path);
+            if (!response.ok) {
+              throw new Error(`${path}: HTTP ${response.status}`);
+            }
+            await instantiateWASM(await response.arrayBuffer());
+            return;
+          } catch (error) {
+            errors.push(error && error.message ? error.message : String(error));
+          }
+        }
+
+        state.wasmReady = false;
+        updateControls();
+        setRuntimeBadge("Manual WASM load needed", "error");
+        setStatus(els.runtimeStatus, `Automatic load failed. Select wasm_exec.js and binas.wasm manually. Details: ${errors.join(" | ")}`, "error");
+      }
+
+      function loadRuntimeScript(path) {
+        return new Promise((resolve, reject) => {
+          const script = document.createElement("script");
+          script.src = path;
+          script.onload = resolve;
+          script.onerror = () => reject(new Error(`${path} could not be loaded`));
+          document.head.appendChild(script);
+        });
+      }
+
+      function loadRuntimeSource(source) {
+        const script = document.createElement("script");
+        script.textContent = source;
+        document.head.appendChild(script);
+        if (!window.Go) {
+          throw new Error("Selected JavaScript did not register the Go WASM runtime.");
+        }
+      }
+
+      els.runtimeFile.addEventListener("change", async (event) => {
+        const file = event.target.files && event.target.files[0];
+        if (!file) return;
+        try {
+          loadRuntimeSource(await file.text());
+          setStatus(els.runtimeStatus, "Go runtime loaded. Select binas.wasm if automatic WASM loading failed.", "ok");
+        } catch (error) {
+          setStatus(els.runtimeStatus, `Go runtime load failed: ${error.message}`, "error");
+          showError(error, "load runtime");
+        }
+      });
+
+      els.wasmFile.addEventListener("change", async (event) => {
+        const file = event.target.files && event.target.files[0];
+        if (!file) return;
+        try {
+          await instantiateWASM(await file.arrayBuffer());
+        } catch (error) {
+          state.wasmReady = false;
+          updateControls();
+          setRuntimeBadge("WASM failed", "error");
+          setStatus(els.runtimeStatus, `WASM load failed: ${error.message}`, "error");
+          showError(error, "load wasm");
+        }
+      });
+
+      els.pdfjsFile.addEventListener("change", async (event) => {
+        const moduleFile = event.target.files && event.target.files[0];
+        if (!moduleFile) return;
+        const workerFile = els.pdfjsWorkerFile.files && els.pdfjsWorkerFile.files[0];
+        if (!workerFile) {
+          setStatus(els.renderStatus, "Select a PDF.js worker file before loading a manual PDF.js module.", "error");
+          return;
+        }
+        try {
+          const moduleUrl = URL.createObjectURL(moduleFile);
+          const workerUrl = URL.createObjectURL(workerFile);
+          await loadPDFJSModule(moduleUrl, workerUrl);
+        } catch (error) {
+          state.pdfjsReady = false;
+          setStatus(els.renderStatus, `Manual PDF.js load failed: ${error.message}`, "error");
+          showError(error, "load pdf.js");
+          updateControls();
+        }
+      });
+
+      els.pdfjsWorkerFile.addEventListener("change", () => {
+        if (!state.pdfjsReady) {
+          setStatus(els.renderStatus, "PDF.js worker selected. Select the PDF.js module file to load the renderer.", "ok");
+        }
+      });
+
+      els.pdfFile.addEventListener("change", async (event) => {
+        const file = event.target.files && event.target.files[0];
+        if (!file) return;
+        clearEditedDownload();
+        state.pdfBytes = new Uint8Array(await file.arrayBuffer());
+        state.pdfName = file.name || "document.pdf";
+        state.lastMatches = [];
+        renderMatches([]);
+        updateMetrics();
+        setStatus(els.pdfStatus, `${state.pdfName} loaded (${state.pdfBytes.byteLength.toLocaleString()} bytes).`, "ok");
+        updateControls();
+        show({ ok: true, event: "pdf_loaded", file: state.pdfName, bytes: state.pdfBytes.byteLength });
+        await openPDFForRendering(state.pdfBytes);
+      });
+
+      els.inspectButton.addEventListener("click", () => {
+        try {
+          const result = normalizeResult(window.binasInspectPDF(state.pdfBytes));
+          show(result);
+        } catch (error) {
+          showError(error, "inspect pdf");
+        }
+      });
+
+      els.queryButton.addEventListener("click", async () => {
+        try {
+          const query = els.queryText.value;
+          const result = normalizeResult(window.binasQueryPDF(state.pdfBytes, query));
+          state.lastQuery = query;
+          state.lastMatches = Array.isArray(result.matches) ? result.matches : [];
+          renderMatches(state.lastMatches);
+          updateMetrics();
+          if (state.pdfDoc) {
+            state.currentPage = await findFirstVisualMatchPage(query);
+            await renderPage(state.currentPage);
+          }
+          show({
+            ok: Boolean(result.ok),
+            query,
+            count: result.count !== undefined ? result.count : state.lastMatches.length,
+            matches: state.lastMatches,
+            error: result.error,
+          });
+        } catch (error) {
+          showError(error, "query pdf");
+        }
+      });
+
+      els.editButton.addEventListener("click", async () => {
+        try {
+          clearEditedDownload();
+          const result = window.binasEditPDFText(state.pdfBytes, els.oldText.value, els.newText.value);
+          show(result);
+          if (result && result.ok && result.bytes instanceof Uint8Array) {
+            state.pdfBytes = result.bytes;
+            state.lastQuery = els.newText.value;
+            state.lastMatches = [];
+            renderMatches([]);
+            updateMetrics();
+            setEditedDownload(result.bytes);
+            setStatus(els.pdfStatus, `Edited bytes ready (${result.bytes.byteLength.toLocaleString()} bytes).`, "ok");
+            await openPDFForRendering(result.bytes);
+          }
+        } catch (error) {
+          showError(error, "edit pdf text");
+        }
+      });
+
+      els.downloadLink.addEventListener("click", (event) => {
+        if (!state.editedUrl) {
+          event.preventDefault();
+        }
+      });
+
+      els.prevPage.addEventListener("click", async () => {
+        if (state.currentPage > 1) {
+          state.currentPage--;
+          await renderPage(state.currentPage);
+        }
+      });
+
+      els.nextPage.addEventListener("click", async () => {
+        if (state.currentPage < state.pageCount) {
+          state.currentPage++;
+          await renderPage(state.currentPage);
+        }
+      });
+
+      els.pageNumber.addEventListener("change", async () => {
+        const next = Number.parseInt(els.pageNumber.value, 10);
+        if (!Number.isFinite(next)) return;
+        state.currentPage = Math.min(Math.max(1, next), Math.max(1, state.pageCount));
+        await renderPage(state.currentPage);
+      });
+
+      els.zoomOut.addEventListener("click", async () => {
+        state.scale = Math.max(0.6, state.scale - 0.2);
+        await renderPage(state.currentPage);
+      });
+
+      els.zoomIn.addEventListener("click", async () => {
+        state.scale = Math.min(3, state.scale + 0.2);
+        await renderPage(state.currentPage);
+      });
+
+      updateMetrics();
+      loadDefaultRuntimeAndWASM();
+      loadDefaultPDFJS();
+    </script>
+  </body>
+</html>

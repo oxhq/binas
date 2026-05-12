@@ -71,6 +71,10 @@ func TestFilterFlateDecodePredictor1DecodeParmsRejectsNonDefaultGeometry(t *test
 			name:        "unsupported predictor",
 			decodeParms: "<< /Predictor 9 /Columns 1 >>",
 		},
+		{
+			name:        "tiff predictor oversized bits per component",
+			decodeParms: "<< /Predictor 2 /Columns 1 /BitsPerComponent 33 >>",
+		},
 	}
 
 	for _, tc := range cases {

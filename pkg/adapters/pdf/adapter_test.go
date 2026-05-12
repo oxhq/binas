@@ -848,14 +848,9 @@ func TestFlateDecodeUnsupportedParametersFailClosed(t *testing.T) {
 		want string
 	}{
 		{
-			name: "unsupported multi-filter array",
-			dict: fmt.Sprintf("<< /Length %d /Filter [/FlateDecode /ASCIIHexDecode] >>", len(encoded)),
-			want: "unsupported stream: /Filter arrays are not implemented",
-		},
-		{
-			name: "decode parms unsupported colors without columns",
-			dict: fmt.Sprintf("<< /Length %d /Filter /FlateDecode /DecodeParms << /Predictor 12 /Colors 3 >> >>", len(encoded)),
-			want: "unsupported stream: /DecodeParms PNG predictors require /Colors 1",
+			name: "unsupported filter in multi-filter array",
+			dict: fmt.Sprintf("<< /Length %d /Filter [/DCTDecode /FlateDecode] >>", len(encoded)),
+			want: `unsupported PDF stream filter "DCTDecode FlateDecode"`,
 		},
 	}
 	for _, tc := range cases {
@@ -896,24 +891,9 @@ func TestDecodeParmsUnsupportedParametersFailClosed(t *testing.T) {
 			want: "unsupported stream: /DecodeParms TIFF predictor requires /Columns >= 1",
 		},
 		{
-			name: "tiff predictor bit-level row",
-			dict: fmt.Sprintf("<< /Length %d /Filter /FlateDecode /DecodeParms << /Predictor 2 /Columns 3 /BitsPerComponent 1 >> >>", len(encoded)),
-			want: "unsupported stream: /DecodeParms TIFF predictor row width must be byte-aligned",
-		},
-		{
 			name: "png predictor columns zero",
 			dict: fmt.Sprintf("<< /Length %d /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 0 >> >>", len(encoded)),
 			want: "unsupported stream: /DecodeParms PNG predictors require /Columns >= 1",
-		},
-		{
-			name: "png predictor colors 3",
-			dict: fmt.Sprintf("<< /Length %d /Filter /FlateDecode /DecodeParms << /Predictor 12 /Colors 3 >> >>", len(encoded)),
-			want: "unsupported stream: /DecodeParms PNG predictors require /Colors 1",
-		},
-		{
-			name: "png predictor bit-level row",
-			dict: fmt.Sprintf("<< /Length %d /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 1 /BitsPerComponent 1 >> >>", len(encoded)),
-			want: "unsupported stream: /DecodeParms PNG predictor row width must be byte-aligned",
 		},
 		{
 			name: "missing predictor",
@@ -950,6 +930,57 @@ func TestDecodeParmsUnsupportedParametersFailClosed(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			assertPDFDecodeParmsUnsupportedParametersFailClosed(t, tc.dict, encoded, tc.want)
 		})
+	}
+}
+
+func TestFlateDecodeTIFFBitPackedPredictorRewriteReencodesRowsAndXref(t *testing.T) {
+	decoded := []byte("BT\n(A1) Tj\nET\n")
+	decodeParms := "<< /Predictor 2 /Columns 7 /Colors 1 /BitsPerComponent 1 >>"
+	encoded, err := encodeStreamFilterWithDecodeParms("/FlateDecode", decodeParms, decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := testPDF(
+		"<< /Type /Page >>",
+		fmt.Sprintf("<< /Length %d /Filter /FlateDecode /DecodeParms %s >>\nstream\n%sendstream", len(encoded), decodeParms, encoded),
+	)
+
+	adapter := NewAdapter()
+	tree, err := adapter.Parse(input, core.ParseOptions{Strict: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if matches := tree.Query(core.Match{Kind: KindTextShow, Text: "A1"}); len(matches) != 1 {
+		t.Fatalf("text matches = %d, want 1", len(matches))
+	}
+	plan, err := adapter.PlanEdit(tree, core.Match{Kind: KindTextShow, Text: "A1"}, core.Mutation{Replace: "B2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, _, err := adapter.Apply(input, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verification, err := adapter.Verify(output, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.ReparseOK || !verification.OldTextRemoved || !verification.NewSelectable || !verification.PageUnchanged {
+		t.Fatalf("verification failed: %+v", verification)
+	}
+	stream, ok, err := findNextStream(output, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("missing stream")
+	}
+	updatedDecoded, err := decodeStreamFilterWithDecodeParms("/FlateDecode", decodeParms, output[stream.dataStart:stream.dataEnd])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(updatedDecoded, []byte("(B2) Tj")) {
+		t.Fatalf("updated decoded stream = %q, want replacement", updatedDecoded)
 	}
 }
 

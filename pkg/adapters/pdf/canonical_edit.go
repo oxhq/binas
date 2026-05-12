@@ -15,3 +15,11 @@ func ApplyCanonicalEdit(input []byte, selector core.Match, mutation core.Mutatio
 func ApplyCanonicalEditInvalidatingSignatures(input []byte, selector core.Match, mutation core.Mutation, invariants []core.Invariant) ([]byte, core.Report, core.Verification, error) {
 	return EditCanonicalInvalidatingSignatures(input, selector, mutation, invariants)
 }
+
+func ApplyCanonicalEditWithPassword(input []byte, password string, selector core.Match, mutation core.Mutation, invariants []core.Invariant) ([]byte, core.Report, core.Verification, error) {
+	return EditCanonicalWithPassword(input, password, selector, mutation, invariants)
+}
+
+func ApplyCanonicalEditWithPasswordInvalidatingSignatures(input []byte, password string, selector core.Match, mutation core.Mutation, invariants []core.Invariant) ([]byte, core.Report, core.Verification, error) {
+	return EditCanonicalWithPasswordInvalidatingSignatures(input, password, selector, mutation, invariants)
+}

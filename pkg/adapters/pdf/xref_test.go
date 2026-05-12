@@ -64,6 +64,35 @@ func TestXrefSummaryDetectsUnsupportedXrefStreamObject(t *testing.T) {
 	assertObjectOffset(t, summary.Objects, 8, 0, 45)
 }
 
+func TestXrefSummaryDetectsHybridXRefStmBoundary(t *testing.T) {
+	fixture := buildHybridXrefPDFFixture(t, validHybridXrefStreamData)
+
+	summary := summarizeXref(fixture.input)
+
+	if !summary.HasTable {
+		t.Fatal("expected table xref marker")
+	}
+	if summary.TableOffset != fixture.tableOffset {
+		t.Fatalf("table offset = %d, want %d", summary.TableOffset, fixture.tableOffset)
+	}
+	if !summary.HasHybridStream {
+		t.Fatal("expected hybrid /XRefStm marker")
+	}
+	if summary.HybridStreamOffset != fixture.xrefStreamOffset {
+		t.Fatalf("hybrid xref stream offset = %d, want %d", summary.HybridStreamOffset, fixture.xrefStreamOffset)
+	}
+	if summary.HybridStreamObject.Number != 8 || summary.HybridStreamObject.Generation != 0 || summary.HybridStreamObject.Offset != fixture.xrefStreamOffset {
+		t.Fatalf("hybrid xref stream object = %+v, want 8 0 at %d", summary.HybridStreamObject, fixture.xrefStreamOffset)
+	}
+	if !summary.HasStream {
+		t.Fatal("expected xref stream marker")
+	}
+	if summary.UnsupportedXrefStream {
+		t.Fatal("valid hybrid xref stream should be supported")
+	}
+	assertObjectOffset(t, summary.Objects, 3, 0, fixture.hybridObjectOffset)
+}
+
 func TestXrefSummaryDetectsSupportedObjectStreamObject(t *testing.T) {
 	input := []byte("%PDF-1.5\n1 0 obj\n<< /Type /Catalog >>\nendobj\n3 0 obj\n<< /Length 4 >>\nstream\nwxyz\nendstream\nendobj\n7 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length 8 >>\nstream\n0 0 \nendstream\nendobj\nxref\n0 8\n0000000000 65535 f \ntrailer\n<< /Size 8 >>\nstartxref\n145\n%%EOF\n")
 

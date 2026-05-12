@@ -115,6 +115,250 @@ func TestApplyFormFieldEditMatchesHierarchicalFieldName(t *testing.T) {
 	}
 }
 
+func TestApplyFormFieldEditAcceptsListedChoiceValue(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /FT /Ch /T (payer.plan) /V (Basic) /Opt [(Basic) (Pro)] >>",
+	)
+
+	output, _, verification, err := ApplyFormFieldEdit(input, "payer.plan", "Pro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.ReparseOK {
+		t.Fatalf("verification = %+v", verification)
+	}
+
+	graph, err := parsePDFGraph(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	field, ok := graph.Objects[pdfObjectID{Number: 3, Generation: 0}].Value.(pdfDict)
+	if !ok {
+		t.Fatal("field object was not a dictionary")
+	}
+	if got := field["V"]; got != pdfLiteralString("Pro") {
+		t.Fatalf("/V = %#v, want listed literal value", got)
+	}
+	acroForm, ok := graph.Objects[pdfObjectID{Number: 2, Generation: 0}].Value.(pdfDict)
+	if !ok {
+		t.Fatal("AcroForm object was not a dictionary")
+	}
+	if got := acroForm["NeedAppearances"]; got != true {
+		t.Fatalf("/NeedAppearances = %#v, want true", got)
+	}
+}
+
+func TestApplyFormFieldEditRegeneratesTextWidgetAppearance(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /FT /Tx /T (payer.name) /V (Old Name) /Rect [0 0 120 20] >>",
+	)
+
+	output, report, verification, err := ApplyFormFieldEditWithOptions(input, "payer.name", "New Name", FormFieldEditOptions{RegenerateAppearance: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.AppearanceRegenerated {
+		t.Fatalf("report did not record appearance regeneration: %+v", report)
+	}
+	if !verification.ReparseOK || !verification.AppearanceRegenerated {
+		t.Fatalf("verification = %+v", verification)
+	}
+
+	graph, err := parsePDFGraph(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	field, ok := graph.Objects[pdfObjectID{Number: 3, Generation: 0}].Value.(pdfDict)
+	if !ok {
+		t.Fatal("field object was not a dictionary")
+	}
+	stream := formTestNormalAppearanceStream(t, graph, field)
+	if got := stream.Dict["Subtype"]; got != pdfName("Form") {
+		t.Fatalf("appearance subtype = %#v, want /Form", got)
+	}
+	if !bytes.Contains(stream.Data, []byte("/Helv 10 Tf")) || !bytes.Contains(stream.Data, []byte("(New Name) Tj")) {
+		t.Fatalf("appearance stream did not draw new text:\n%s", stream.Data)
+	}
+}
+
+func TestApplyFormFieldEditRegeneratesMultilineWrappedTextWidgetAppearance(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /FT /Tx /T (payer.notes) /V (Old Notes) /Rect [0 0 64 40] >>",
+	)
+
+	output, _, verification, err := ApplyFormFieldEditWithOptions(input, "payer.notes", "first line\nsecond wraps here", FormFieldEditOptions{RegenerateAppearance: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.AppearanceRegenerated {
+		t.Fatalf("verification = %+v", verification)
+	}
+
+	graph, err := parsePDFGraph(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	field, ok := graph.Objects[pdfObjectID{Number: 3, Generation: 0}].Value.(pdfDict)
+	if !ok {
+		t.Fatal("field object was not a dictionary")
+	}
+	stream := formTestNormalAppearanceStream(t, graph, field)
+	for _, want := range [][]byte{
+		[]byte("0 0 64 40 re W n"),
+		[]byte("(first line) Tj"),
+		[]byte("(second wraps) Tj"),
+		[]byte("(here) Tj"),
+		[]byte("0 -12 Td"),
+	} {
+		if !bytes.Contains(stream.Data, want) {
+			t.Fatalf("appearance stream missing %q:\n%s", want, stream.Data)
+		}
+	}
+}
+
+func TestApplyFormFieldEditRegeneratesAppearanceTruncatesToRectHeight(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /FT /Tx /T (payer.notes) /V (Old Notes) /Rect [0 0 100 16] >>",
+	)
+
+	output, _, verification, err := ApplyFormFieldEditWithOptions(input, "payer.notes", "visible\ntruncated", FormFieldEditOptions{RegenerateAppearance: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.AppearanceRegenerated {
+		t.Fatalf("verification = %+v", verification)
+	}
+
+	graph, err := parsePDFGraph(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	field, ok := graph.Objects[pdfObjectID{Number: 3, Generation: 0}].Value.(pdfDict)
+	if !ok {
+		t.Fatal("field object was not a dictionary")
+	}
+	stream := formTestNormalAppearanceStream(t, graph, field)
+	if !bytes.Contains(stream.Data, []byte("(visible) Tj")) {
+		t.Fatalf("visible line missing:\n%s", stream.Data)
+	}
+	if bytes.Contains(stream.Data, []byte("truncated")) {
+		t.Fatalf("line outside rectangle was not truncated:\n%s", stream.Data)
+	}
+}
+
+func TestApplyFormFieldEditRegeneratesChoiceWidgetAppearance(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /FT /Ch /T (payer.plan) /V (Basic) /Opt [(Basic) (Pro)] /Rect [0 0 100 18] >>",
+	)
+
+	output, report, verification, err := ApplyFormFieldEditWithOptions(input, "payer.plan", "Pro", FormFieldEditOptions{RegenerateAppearance: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.AppearanceRegenerated || !verification.AppearanceRegenerated {
+		t.Fatalf("appearance regeneration not reported: report=%+v verification=%+v", report, verification)
+	}
+
+	graph, err := parsePDFGraph(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	field, ok := graph.Objects[pdfObjectID{Number: 3, Generation: 0}].Value.(pdfDict)
+	if !ok {
+		t.Fatal("field object was not a dictionary")
+	}
+	stream := formTestNormalAppearanceStream(t, graph, field)
+	if !bytes.Contains(stream.Data, []byte("(Pro) Tj")) {
+		t.Fatalf("choice appearance stream did not draw selected value:\n%s", stream.Data)
+	}
+}
+
+func TestApplyFormFieldEditRegenerateAppearanceFailsClosedWithoutRect(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /FT /Tx /T (payer.name) /V (Old Name) >>",
+	)
+
+	_, _, _, err := ApplyFormFieldEditWithOptions(input, "payer.name", "New Name", FormFieldEditOptions{RegenerateAppearance: true})
+	if err == nil {
+		t.Fatal("expected missing Rect error")
+	}
+	if !strings.Contains(err.Error(), "unsupported AcroForm appearance regeneration: widget /Rect is missing or not a direct numeric rectangle") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestApplyFormFieldEditRegenerateAppearanceFailsClosedForButton(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /AP << /N << /Off <<>> /Yes <<>> >> >> /AS /Off /FT /Btn /T (payer.opt_in) /V /Off >>",
+	)
+
+	_, _, _, err := ApplyFormFieldEditWithOptions(input, "payer.opt_in", "true", FormFieldEditOptions{RegenerateAppearance: true})
+	if err == nil {
+		t.Fatal("expected unsupported button regeneration error")
+	}
+	if !strings.Contains(err.Error(), "unsupported AcroForm appearance regeneration for button fields") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestApplyFormFieldEditRejectsUnlistedNonEditableChoiceValue(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /FT /Ch /T (payer.plan) /V (Basic) /Opt [(Basic) (Pro)] >>",
+	)
+
+	_, _, _, err := ApplyFormFieldEdit(input, "payer.plan", "Enterprise")
+	if err == nil {
+		t.Fatal("expected unlisted choice value error")
+	}
+	if !strings.Contains(err.Error(), `unsupported AcroForm choice field value "Enterprise"`) {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestApplyFormFieldEditAllowsUnlistedEditableChoiceValue(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		fmt.Sprintf("<< /FT /Ch /T (payer.plan) /V (Basic) /Ff %d /Opt [(Basic) (Pro)] >>", formFieldFlagChEdit),
+	)
+
+	output, _, verification, err := ApplyFormFieldEdit(input, "payer.plan", "Enterprise")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.ReparseOK {
+		t.Fatalf("verification = %+v", verification)
+	}
+
+	graph, err := parsePDFGraph(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	field, ok := graph.Objects[pdfObjectID{Number: 3, Generation: 0}].Value.(pdfDict)
+	if !ok {
+		t.Fatal("field object was not a dictionary")
+	}
+	if got := field["V"]; got != pdfLiteralString("Enterprise") {
+		t.Fatalf("/V = %#v, want editable literal value", got)
+	}
+}
+
 func TestApplyFormFieldEditInheritedButtonFieldTypeUpdatesChildCheckbox(t *testing.T) {
 	input := formTestPDF(
 		"<< /Type /Catalog /AcroForm 2 0 R >>",
@@ -480,6 +724,101 @@ func TestListFormFieldsIncludesFlatFieldMetadata(t *testing.T) {
 	}
 }
 
+func TestListFormFieldsIncludesLiteralFieldStringMetadata(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /FT /Tx /T (payer.name) /TU (Payer Name) /TM (payer_name_export) /V (Old Name) /DV (Default Name) >>",
+	)
+
+	fields, err := ListFormFields(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(fields) != 1 {
+		t.Fatalf("field count = %d, want 1: %+v", len(fields), fields)
+	}
+	field := fields[0]
+	if field.AlternateName == nil || *field.AlternateName != "Payer Name" {
+		t.Fatalf("alternate name = %+v, want Payer Name", field.AlternateName)
+	}
+	if field.MappingName == nil || *field.MappingName != "payer_name_export" {
+		t.Fatalf("mapping name = %+v, want payer_name_export", field.MappingName)
+	}
+	if field.DefaultValue == nil || *field.DefaultValue != "Default Name" {
+		t.Fatalf("default value = %+v, want Default Name", field.DefaultValue)
+	}
+
+	encoded, err := json.Marshal(field)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{`"alternate_name":"Payer Name"`, `"mapping_name":"payer_name_export"`, `"default_value":"Default Name"`} {
+		if !bytes.Contains(encoded, []byte(key)) {
+			t.Fatalf("JSON metadata %s missing from %s", key, encoded)
+		}
+	}
+}
+
+func TestListFormFieldsIncludesHexFieldStringMetadata(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /FT /Tx /T (payer.name) /TU <FEFF0041006C0074> /TM <6D61705F6E616D65> /DV <FEFF004400650066> >>",
+	)
+
+	fields, err := ListFormFields(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(fields) != 1 {
+		t.Fatalf("field count = %d, want 1: %+v", len(fields), fields)
+	}
+	field := fields[0]
+	if field.AlternateName == nil || *field.AlternateName != "Alt" {
+		t.Fatalf("alternate name = %+v, want Alt", field.AlternateName)
+	}
+	if field.MappingName == nil || *field.MappingName != "map_name" {
+		t.Fatalf("mapping name = %+v, want map_name", field.MappingName)
+	}
+	if field.DefaultValue == nil || *field.DefaultValue != "Def" {
+		t.Fatalf("default value = %+v, want Def", field.DefaultValue)
+	}
+}
+
+func TestListFormFieldsOmitsUnsupportedFieldStringMetadata(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /FT /Tx /T (payer.name) /TU /AltName /TM [(map)] /DV << /Unsupported true >> >>",
+	)
+
+	fields, err := ListFormFields(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(fields) != 1 {
+		t.Fatalf("field count = %d, want 1: %+v", len(fields), fields)
+	}
+	field := fields[0]
+	if field.AlternateName != nil || field.MappingName != nil || field.DefaultValue != nil {
+		t.Fatalf("unsupported metadata should be omitted: %+v", field)
+	}
+
+	encoded, err := json.Marshal(field)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{`alternate_name`, `mapping_name`, `default_value`} {
+		if bytes.Contains(encoded, []byte(key)) {
+			t.Fatalf("unsupported JSON metadata %s present in %s", key, encoded)
+		}
+	}
+}
+
 func TestListFormFieldsIncludesDirectFieldFlags(t *testing.T) {
 	input := formTestPDF(
 		"<< /Type /Catalog /AcroForm 2 0 R >>",
@@ -546,6 +885,136 @@ func TestListFormFieldsIncludesInheritedFieldFlags(t *testing.T) {
 	}
 	if !child.ReadOnly || !child.Required || child.NoExport {
 		t.Fatalf("child decoded flags = %+v, want inherited read_only required only", child)
+	}
+}
+
+func TestListFormFieldsIncludesTextTypeFlagNames(t *testing.T) {
+	flags := formFieldFlagReadOnly |
+		formFieldFlagTxMultiline |
+		formFieldFlagTxPassword |
+		formFieldFlagTxFileSelect |
+		formFieldFlagDoNotSpellCheck |
+		formFieldFlagTxDoNotScroll |
+		formFieldFlagTxComb |
+		formFieldFlagTxRichText
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		fmt.Sprintf("<< /FT /Tx /T (payer.notes) /Ff %d >>", flags),
+	)
+
+	fields, err := ListFormFields(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(fields) != 1 {
+		t.Fatalf("field count = %d, want 1: %+v", len(fields), fields)
+	}
+	field := fields[0]
+	if got, want := field.FlagNames, []string{"read_only"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("shared flag names = %+v, want %+v", got, want)
+	}
+	wantTypeFlags := []string{"multiline", "password", "file_select", "do_not_spell_check", "do_not_scroll", "comb", "rich_text"}
+	if got := field.TypeFlagNames; !reflect.DeepEqual(got, wantTypeFlags) {
+		t.Fatalf("text type flag names = %+v, want %+v", got, wantTypeFlags)
+	}
+
+	encoded, err := json.Marshal(field)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantJSON := `"type_flag_names":["multiline","password","file_select","do_not_spell_check","do_not_scroll","comb","rich_text"]`
+	if !bytes.Contains(encoded, []byte(wantJSON)) {
+		t.Fatalf("JSON type flag names missing from %s", encoded)
+	}
+}
+
+func TestListFormFieldsIncludesButtonTypeFlagNames(t *testing.T) {
+	flags := formFieldFlagRequired |
+		formFieldFlagBtnNoToggleToOff |
+		formFieldFlagBtnRadio |
+		formFieldFlagBtnPushbutton |
+		formFieldFlagBtnRadiosInUnison
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		fmt.Sprintf("<< /FT /Btn /T (payer.choice) /Ff %d >>", flags),
+	)
+
+	fields, err := ListFormFields(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(fields) != 1 {
+		t.Fatalf("field count = %d, want 1: %+v", len(fields), fields)
+	}
+	field := fields[0]
+	if got, want := field.FlagNames, []string{"required"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("shared flag names = %+v, want %+v", got, want)
+	}
+	wantTypeFlags := []string{"no_toggle_to_off", "radio", "pushbutton", "radios_in_unison"}
+	if got := field.TypeFlagNames; !reflect.DeepEqual(got, wantTypeFlags) {
+		t.Fatalf("button type flag names = %+v, want %+v", got, wantTypeFlags)
+	}
+}
+
+func TestListFormFieldsIncludesChoiceTypeFlagNames(t *testing.T) {
+	flags := formFieldFlagNoExport |
+		formFieldFlagChCombo |
+		formFieldFlagChEdit |
+		formFieldFlagChSort |
+		formFieldFlagChMultiSelect |
+		formFieldFlagDoNotSpellCheck |
+		formFieldFlagChCommitOnSelChange
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		fmt.Sprintf("<< /FT /Ch /T (payer.plan) /Ff %d >>", flags),
+	)
+
+	fields, err := ListFormFields(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(fields) != 1 {
+		t.Fatalf("field count = %d, want 1: %+v", len(fields), fields)
+	}
+	field := fields[0]
+	if got, want := field.FlagNames, []string{"no_export"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("shared flag names = %+v, want %+v", got, want)
+	}
+	wantTypeFlags := []string{"combo", "edit", "sort", "multi_select", "do_not_spell_check", "commit_on_sel_change"}
+	if got := field.TypeFlagNames; !reflect.DeepEqual(got, wantTypeFlags) {
+		t.Fatalf("choice type flag names = %+v, want %+v", got, wantTypeFlags)
+	}
+}
+
+func TestListFormFieldsIncludesInheritedTypeFlagNames(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R 5 0 R] >>",
+		fmt.Sprintf("<< /FT /Tx /T (payer) /Ff %d /Kids [4 0 R] >>", formFieldFlagTxMultiline|formFieldFlagTxDoNotScroll),
+		"<< /T (notes) /Parent 3 0 R >>",
+		"<< /FT /Ch /T (plan) /Kids [6 0 R] >>",
+		fmt.Sprintf("<< /T (primary) /Ff %d /Parent 5 0 R >>", formFieldFlagChCombo|formFieldFlagChCommitOnSelChange),
+	)
+
+	fields, err := ListFormFields(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(fields) != 4 {
+		t.Fatalf("field count = %d, want 4: %+v", len(fields), fields)
+	}
+	if got, want := fields[1].TypeFlagNames, []string{"multiline", "do_not_scroll"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("child inherited text type flags = %+v, want %+v", got, want)
+	}
+	if got, want := fields[3].TypeFlagNames, []string{"combo", "commit_on_sel_change"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("child direct flags with inherited choice type = %+v, want %+v", got, want)
 	}
 }
 
@@ -695,6 +1164,27 @@ func TestApplyFormFieldEditFailsClosedForXFAForms(t *testing.T) {
 	if err.Error() != "unsupported PDF: XFA forms are not implemented" {
 		t.Fatalf("error = %q", err)
 	}
+}
+
+func formTestNormalAppearanceStream(t *testing.T, graph *pdfGraph, widget pdfDict) pdfStreamObject {
+	t.Helper()
+	ap, ok := widget["AP"].(pdfDict)
+	if !ok {
+		t.Fatalf("widget /AP = %#v, want dictionary", widget["AP"])
+	}
+	normalRef, ok := ap["N"].(pdfRef)
+	if !ok {
+		t.Fatalf("widget /AP /N = %#v, want indirect stream ref", ap["N"])
+	}
+	object, ok := graph.Objects[normalRef.ID]
+	if !ok {
+		t.Fatalf("appearance object %v missing", normalRef.ID)
+	}
+	stream, ok := object.Value.(pdfStreamObject)
+	if !ok {
+		t.Fatalf("appearance object = %#v, want stream", object.Value)
+	}
+	return stream
 }
 
 func formTestPDF(objects ...string) []byte {

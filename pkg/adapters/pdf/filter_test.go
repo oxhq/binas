@@ -107,6 +107,58 @@ func TestFilterRunLengthDecodeRoundTrip(t *testing.T) {
 	}
 }
 
+func TestFilterAbbreviationsRoundTrip(t *testing.T) {
+	input := []byte("BT\n(05-05-2026) Tj\nET\n")
+	cases := []struct {
+		name   string
+		filter string
+	}{
+		{
+			name:   "flate",
+			filter: "/Fl",
+		},
+		{
+			name:   "asciihex",
+			filter: "/AHx",
+		},
+		{
+			name:   "ascii85",
+			filter: "/A85",
+		},
+		{
+			name:   "runlength",
+			filter: "/RL",
+		},
+		{
+			name:   "mixed asciihex flate chain",
+			filter: "[/AHx /FlateDecode]",
+		},
+		{
+			name:   "mixed runlength ascii85 flate chain",
+			filter: "[/RL /ASCII85Decode /Fl]",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			encoded, err := encodeStreamFilter(tc.filter, input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.Equal(encoded, input) {
+				t.Fatal("encoded stream unexpectedly matches input")
+			}
+			decoded, err := decodeStreamFilter(tc.filter, encoded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(decoded, input) {
+				t.Fatalf("decoded stream = %q, want %q", decoded, input)
+			}
+		})
+	}
+}
+
 func TestFilterRunLengthDecodeRejectsMalformedData(t *testing.T) {
 	for _, input := range [][]byte{
 		[]byte{0, 'B'},
@@ -173,6 +225,53 @@ func TestFilterASCIIHexFlateDecodeArrayRoundTrip(t *testing.T) {
 	}
 }
 
+func TestFilterFlateASCIIHexDecodeArrayRoundTrip(t *testing.T) {
+	input := []byte("BT\n(05-05-2026) Tj\nET\n")
+	filter := "[/FlateDecode /ASCIIHexDecode]"
+
+	encoded, err := encodeStreamFilter(filter, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(encoded, input) {
+		t.Fatal("encoded stream unexpectedly matches input")
+	}
+
+	deflatedASCIIHex, err := decodeFlateDecode(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deflatedASCIIHex[len(deflatedASCIIHex)-1] != '>' {
+		t.Fatalf("Flate decoded stream = %q, want ASCIIHex terminator", deflatedASCIIHex)
+	}
+
+	decoded, err := decodeStreamFilter(filter, encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(decoded, input) {
+		t.Fatalf("decoded stream = %q, want %q", decoded, input)
+	}
+}
+
+func TestFilterAllNullDecodeParmsArrayRoundTripForFlateASCIIHex(t *testing.T) {
+	input := []byte("BT\n(05-05-2026) Tj\nET\n")
+	filter := "[/FlateDecode /ASCIIHexDecode]"
+	decodeParms := "[null null]"
+
+	encoded, err := encodeStreamFilterWithDecodeParms(filter, decodeParms, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := decodeStreamFilterWithDecodeParms(filter, decodeParms, encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(decoded, input) {
+		t.Fatalf("decoded stream = %q, want %q", decoded, input)
+	}
+}
+
 func TestFilterASCIIHexFlateDecodeArrayDecodeParmsRoundTrip(t *testing.T) {
 	input := []byte("BT\n(05-05-2026) Tj\nET\n")
 	decodeParms := "[null << /Predictor 12 /Columns 1 /Colors 1 /BitsPerComponent 8 >>]"
@@ -199,6 +298,80 @@ func TestFilterASCIIHexFlateDecodeArrayDecodeParmsRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(decoded, input) {
 		t.Fatalf("decoded stream = %q, want %q", decoded, input)
+	}
+}
+
+func TestFilterTIFFPredictorDecodeParmsSamplePackedRoundTrip(t *testing.T) {
+	cases := []struct {
+		name        string
+		input       []byte
+		filter      string
+		decodeParms string
+	}{
+		{
+			name:        "bpc1 non-byte row preserves padding bit",
+			input:       []byte{0b10110011, 0b01100110, 0b11110001, 0b00001111},
+			filter:      "/FlateDecode",
+			decodeParms: "<< /Predictor 2 /Columns 7 /Colors 1 /BitsPerComponent 1 >>",
+		},
+		{
+			name:        "bpc4 multi-color packed pixels",
+			input:       []byte{0x12, 0x34, 0x56, 0x9a, 0xbc, 0xde},
+			filter:      "/FlateDecode",
+			decodeParms: "<< /Predictor 2 /Columns 2 /Colors 3 /BitsPerComponent 4 >>",
+		},
+		{
+			name:        "bpc16 sample delta with borrow",
+			input:       []byte{0x01, 0x00, 0x00, 0xff, 0x00, 0x01, 0xff, 0xff},
+			filter:      "[/ASCIIHexDecode /FlateDecode]",
+			decodeParms: "[null << /Predictor 2 /Columns 2 /Colors 1 /BitsPerComponent 16 >>]",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			encoded, err := encodeStreamFilterWithDecodeParms(tc.filter, tc.decodeParms, tc.input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoded, err := decodeStreamFilterWithDecodeParms(tc.filter, tc.decodeParms, encoded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(decoded, tc.input) {
+				t.Fatalf("decoded stream = %08b, want %08b", decoded, tc.input)
+			}
+		})
+	}
+}
+
+func TestFilterCryptIdentityDecodeParmsRoundTripWithoutEncryptionContext(t *testing.T) {
+	input := []byte("BT\n(Identity crypt filter) Tj\nET\n")
+	decoded, err := decodeStreamFilterWithDecodeParms("/Crypt", "<< /Name /Identity >>", input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(decoded, input) {
+		t.Fatalf("decoded stream = %q, want %q", decoded, input)
+	}
+	encoded, err := encodeStreamFilterWithDecodeParms("[/Crypt]", "[<< /Name /Identity >>]", decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(encoded, input) {
+		t.Fatalf("encoded stream = %q, want %q", encoded, input)
+	}
+}
+
+func TestFilterCryptStdCFRequiresEncryptionContext(t *testing.T) {
+	input := []byte("encrypted")
+	_, err := decodeStreamFilterWithDecodeParms("/Crypt", "<< /Name /StdCF >>", input)
+	if err == nil || err.Error() != "unsupported PDF stream crypt filter /StdCF requires encryption context" {
+		t.Fatalf("decode error = %v, want context refusal", err)
+	}
+	_, err = encodeStreamFilterWithDecodeParms("/Crypt", "<< /Name /StdCF >>", input)
+	if err == nil || err.Error() != "unsupported PDF stream crypt filter /StdCF requires encryption context" {
+		t.Fatalf("encode error = %v, want context refusal", err)
 	}
 }
 
@@ -294,6 +467,12 @@ func TestFilterDecodeParmsArraysFailClosedForUnsupportedShapes(t *testing.T) {
 			decodeParms: "[null /Predictor]",
 			want:        "unsupported stream: /DecodeParms array entries must be null or direct dictionaries",
 		},
+		{
+			name:        "non-flate params must be null in broader supported chain",
+			filter:      "[/FlateDecode /ASCIIHexDecode]",
+			decodeParms: "[null << /Predictor 1 >>]",
+			want:        "unsupported stream: /DecodeParms for /ASCIIHexDecode must be null",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -343,10 +522,16 @@ func TestFilterPassthroughReturnsCloneForNoOpFilters(t *testing.T) {
 }
 
 func TestFilterDispatchRejectsUnsupportedFilter(t *testing.T) {
-	if _, err := decodeStreamFilter("/LZWDecode", []byte("stream")); err == nil {
+	if _, err := decodeStreamFilter("/DCTDecode", []byte("stream")); err == nil {
 		t.Fatal("expected unsupported arbitrary decode filter error")
 	}
-	if _, err := encodeStreamFilter("/LZWDecode", []byte("stream")); err == nil {
+	if _, err := encodeStreamFilter("/JPXDecode", []byte("stream")); err == nil {
 		t.Fatal("expected unsupported arbitrary encode filter error")
+	}
+	if _, err := decodeStreamFilter("/DCT", []byte("stream")); err == nil {
+		t.Fatal("expected unsupported abbreviation decode filter error")
+	}
+	if _, err := encodeStreamFilter("[/CCF /Fl]", []byte("stream")); err == nil {
+		t.Fatal("expected unsupported abbreviation chain encode filter error")
 	}
 }

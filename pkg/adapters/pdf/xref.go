@@ -11,6 +11,9 @@ type xrefSummary struct {
 	Objects                 []xrefObjectOffset
 	HasTable                bool
 	TableOffset             int
+	HasHybridStream         bool
+	HybridStreamOffset      int
+	HybridStreamObject      xrefObjectOffset
 	HasStream               bool
 	StreamObjects           []xrefObjectOffset
 	UnsupportedXrefStream   bool
@@ -36,6 +39,27 @@ func summarizeXref(input []byte) xrefSummary {
 	objects := findXrefObjectOffsets(input)
 	tableOffset, hasTable := findXrefTableOffset(input)
 	streamObjects := findXrefStreamObjects(input, objects)
+	hybridStreamOffset := -1
+	hybridStreamObject := xrefObjectOffset{}
+	hasHybridStream := false
+	hybridStreamUnsupported := false
+	if trailer := parseLastTrailerDictionary(input); trailer != nil {
+		if _, exists := trailer["XRefStm"]; exists {
+			hasHybridStream = true
+			offset, ok := dictInt(trailer, "XRefStm")
+			if !ok {
+				hybridStreamUnsupported = true
+			} else {
+				hybridStreamOffset = offset
+				object, found := findXrefObjectOffsetAt(objects, offset)
+				if !found || !containsXrefObjectOffset(streamObjects, object) {
+					hybridStreamUnsupported = true
+				} else {
+					hybridStreamObject = object
+				}
+			}
+		}
+	}
 	objectStreamObjects := findObjectStreamObjects(input, objects)
 	unsupportedXrefStream := len(streamObjects) > 0
 	if streamEntries, err := parseXrefStreamEntries(input, objects); err == nil {
@@ -52,9 +76,12 @@ func summarizeXref(input []byte) xrefSummary {
 		Objects:                 objects,
 		HasTable:                hasTable,
 		TableOffset:             tableOffset,
+		HasHybridStream:         hasHybridStream,
+		HybridStreamOffset:      hybridStreamOffset,
+		HybridStreamObject:      hybridStreamObject,
 		HasStream:               len(streamObjects) > 0,
 		StreamObjects:           streamObjects,
-		UnsupportedXrefStream:   unsupportedXrefStream,
+		UnsupportedXrefStream:   unsupportedXrefStream || hybridStreamUnsupported,
 		HasObjectStream:         len(objectStreamObjects) > 0,
 		ObjectStreamObjects:     objectStreamObjects,
 		UnsupportedObjectStream: unsupportedObjectStream,
@@ -104,6 +131,24 @@ func findXrefObjectOffsets(input []byte) []xrefObjectOffset {
 		})
 	}
 	return objects
+}
+
+func findXrefObjectOffsetAt(objects []xrefObjectOffset, offset int) (xrefObjectOffset, bool) {
+	for _, object := range objects {
+		if !object.Compressed && object.Offset == offset {
+			return object, true
+		}
+	}
+	return xrefObjectOffset{}, false
+}
+
+func containsXrefObjectOffset(objects []xrefObjectOffset, object xrefObjectOffset) bool {
+	for _, candidate := range objects {
+		if candidate.Number == object.Number && candidate.Generation == object.Generation && candidate.Offset == object.Offset {
+			return true
+		}
+	}
+	return false
 }
 
 func findXrefTableOffset(input []byte) (int, bool) {

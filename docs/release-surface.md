@@ -25,7 +25,7 @@ JSON mode returns:
 
 For structural PDF failures where the adapter can still build the document root, JSON mode includes `root` metadata alongside `valid: false`. This is used for malformed or unsupported xref streams so callers can see the structural boundary that caused validation to fail.
 
-For non-blocking high-level PDF markers, JSON mode keeps `valid: true` and reports warnings. AcroForm dictionaries, annotations, and font/CMap markers are detected because their support is deliberately narrower than general PDF semantic editing: field discovery uses `form list`, field updates use `form set`, annotation updates only write `/Contents`, and CMap support is limited to page font-scoped `/ToUnicode` maps for simple `Tf` flows plus one unambiguous fallback map for hex text.
+For non-blocking high-level PDF markers, JSON mode keeps `valid: true` and reports warnings. AcroForm dictionaries, annotations, and font/CMap markers are detected because their support is deliberately narrower than general PDF semantic editing: field discovery uses `form list`, field updates use `form set`, simple text/choice widget appearance streams require `--regenerate-appearance`, annotation updates write `/Contents` through `annot set-contents`, simple text-like annotation appearances require `--regenerate-appearance`, and CMap support is limited to page font-scoped `/ToUnicode` maps for simple `Tf` flows, CMap-backed hex `TJ` arrays, and one unambiguous fallback map for hex text.
 
 ## Query
 
@@ -65,11 +65,14 @@ JSON mode returns the adapter format, total parsed node count, and root metadata
       "has_signature": false,
       "has_tounicode_cmap": true,
       "has_xfa": false,
-      "text_decoding_support": "simple literal, ASCII hex operands, page font-scoped ToUnicode CMaps for simple Tf flows, and one unambiguous ToUnicode CMap fallback"
+      "text_decoding_support": "simple literal operands, ASCII hex operands, literal/hex TJ arrays, page font-scoped ToUnicode CMaps for simple Tf flows, CMap-backed TJ hex arrays, and one unambiguous ToUnicode CMap fallback"
     },
     "xref": {
       "has_object_stream": false,
+      "has_hybrid_stream": false,
       "has_stream": false,
+      "hybrid_stream_object": null,
+      "hybrid_stream_offset": -1,
       "has_table": true,
       "object_count": 66,
       "object_stream_count": 0,
@@ -83,6 +86,9 @@ The xref metadata is a summary of the current file shape:
 
 - `has_table`: a literal xref table marker was found.
 - `table_offset`: byte offset for the table marker, or `-1` when no table marker is found.
+- `has_hybrid_stream`: the last trailer contains `/XRefStm`.
+- `hybrid_stream_offset`: the `/XRefStm` byte offset, or `-1` when absent or not an integer.
+- `hybrid_stream_object`: xref stream object metadata when the hybrid offset resolves to a known `/Type /XRef` stream object.
 - `has_stream`: an xref stream object was detected.
 - `has_object_stream`: an object stream was detected.
 - `object_count`: count of indirect object headers found by the adapter's xref summary pass.
@@ -92,34 +98,34 @@ The xref metadata is a summary of the current file shape:
 - `stream_objects`: xref stream object metadata with object number, generation, and byte offset.
 - `object_stream_objects`: object stream object metadata with object number, generation, and byte offset.
 
-Parseable xref-stream PDFs route through the graph path for generic parse, query, and supported text rewrites. Malformed or unsupported xref streams still fail closed with `unsupported PDF: xref streams are not implemented`; `inspect --json` still emits root metadata and includes `parse_error`, while `validate --json` emits `valid: false`, `errors`, and the same root metadata.
+Parseable xref-stream and hybrid `/XRefStm` PDFs route through the graph path for generic parse, query, and supported text rewrites. Malformed or unsupported xref streams still fail closed with a structural xref error; `inspect --json` still emits root metadata and includes `parse_error`, while `validate --json` emits `valid: false`, `errors`, and the same root metadata.
 
 Object streams are detected, inflated into graph objects, and canonical-written back as normal indirect objects for graph rewrites. Surgical mode still refuses object-stream PDFs because it cannot prove byte-local safety inside compressed object containers. Detection is not a broad regex over dictionary bytes: `/ObjStm` in unrelated keys, nested dictionaries, or string literals is ignored to avoid false object-stream reports.
 
-The metadata describes the input shape. `has_object_stream` also implies the graph path parsed object-stream contents when parse succeeds. `has_stream` means xref-stream metadata was detected; parseable xref streams use the graph path, while malformed or unsupported xref streams still report a parse error.
+The metadata describes the input shape. `has_object_stream` also implies the graph path parsed object-stream contents when parse succeeds. `has_stream` means xref-stream metadata was detected; `has_hybrid_stream` means a table trailer pointed at a supplemental xref stream. Parseable xref streams use the graph path, while malformed or unsupported xref streams still report a parse error.
 
 Stream nodes expose parse metadata for callers that need to inspect the byte boundary before planning edits. `encoded_length` is set for every detected stream node, `decoded_length` is set only when decoding succeeds or a raw graph stream is known to be unfiltered, and `filter_chain` lists the normalized direct filter names when a direct `/Filter` name or array is present.
 
 The boundary metadata is detection-only for high-level PDF surfaces:
 
-- `has_encrypt`: `/Encrypt` was detected. Encrypted PDFs fail parse with the explicit password-capable-path error because `Adapter.Parse` does not decrypt.
-- `has_signature`: a true PDF name token for `/Sig`, `/ByteRange`, or `/SigFlags` was detected. The scanner skips literal strings, comments, and hex strings. Digitally signed PDFs fail parse by default because rewriting would invalidate signature semantics.
-- `has_acroform`: `/AcroForm` was detected. Field discovery uses the narrower `form list` command, including inherited field type, inherited/direct `/Ff` flags for `read_only`, `required`, and `no_export`, sorted proven button appearance states, and directly decoded choice-field `/Opt` options. Field value updates require `form set`; text fields write `/V` and set `/NeedAppearances`, while proven checkbox/button fields write `/V` and `/AS` from `/AP /N`, including inherited `/FT /Btn` and a narrow parent-field radio shape. Widget appearance regeneration is not implemented.
-- `has_xfa`: `/XFA` was detected. Generic parser/edit paths fail closed; `xfa list` reports directly represented packet metadata, conservative `packet_kind`, XML prolog/root diagnostics when safely detectable, and stream decode errors when a referenced stream packet cannot be decoded, and `xfa replace` can update exactly one directly represented XFA packet occurrence with `--match-index` required when multiple occurrences match.
-- `has_annotations`: `/Annots` was detected. `annot list` reports page index/object metadata when a candidate can be proven from page `/Annots`, direct four-number `/Rect` metadata when available, and direct numeric `/F` annotation flags decoded into common flag names. `annot set-contents` can update dictionary `/Contents`; by default it preserves `/AP`, and `--remove-appearance` explicitly removes stale annotation `/AP` while reporting appearance invalidation/removal. Annotation/widget appearance regeneration is not implemented.
-- `has_font_markers`, `has_cmap_markers`, `has_tounicode_cmap`, and `has_cid_font_markers`: font/CMap-related markers were detected. Text extraction supports simple literal operands, simple ASCII hex operands, page font-scoped `/ToUnicode` maps for simple `Tf` flows, and one unambiguous fallback map for hex operands; glyph metrics, widths, and layout are not verified.
+- `has_encrypt`: `/Encrypt` was detected. Encrypted PDFs fail parse with the explicit password-capable-path error unless the caller supplies `--password`. The explicit password path supports Standard Security RC4 R2/R3/R4 and R4 AESV2 files with normal encrypted strings and streams, encrypted object streams inflated into graph objects, plus stream-level `/Crypt` filters for `/Identity` and `/StdCF`, for `inspect`, `validate`, `query`, and canonical text edits. It re-encrypts strings and streams on write and still rejects AESV3+, public-key security, unsupported crypt filters outside that supported shape, and encrypted xref streams.
+- `has_signature`: a true PDF name token for `/Sig`, `/ByteRange`, or `/SigFlags` was detected. The scanner skips literal strings, comments, and hex strings; residual boundary scanning skips those same PDF regions for non-signature boundary name markers too. Digitally signed PDFs fail parse by default because rewriting would invalidate signature semantics.
+- `has_acroform`: `/AcroForm` was detected. Field discovery uses the narrower `form list` command, including inherited field type, `type_flag_names`, alternate `/TU` name, mapping `/TM` name, direct default `/DV` value, inherited/direct `/Ff` flags for `read_only`, `required`, and `no_export`, sorted proven button appearance states, and directly decoded choice-field `/Opt` options. Field value updates require `form set`; text fields write `/V` and set `/NeedAppearances`; non-editable choice fields with proven direct `/Opt` options reject unlisted values; editable choice fields and choice fields without proven options accept literal values; proven checkbox/button fields write `/V` and `/AS` from `/AP /N`, including inherited `/FT /Btn` and a narrow parent-field radio shape. `form set --regenerate-appearance` creates simple Helvetica widget `/AP /N` streams for text and choice widgets with proven direct `/Rect`, including explicit newlines, approximate wrapping, clipping, and height truncation; button appearance regeneration still fails closed.
+- `has_xfa`: `/XFA` was detected. Generic parser/edit paths fail closed; `xfa list` reports directly represented packet metadata, conservative `packet_kind`, XML prolog/root diagnostics when safely detectable, decoded byte/text lengths, and stream decode errors when a referenced stream packet cannot be decoded. `xfa list --packet-kind ... --label ...` filters listed packets exactly. `xfa replace` can update exactly one directly represented XFA packet occurrence, skips literal/hex/name packet labels the same way `xfa list` does, accepts the same selector flags before ambiguity checks, and requires `--match-index` when multiple selected occurrences match.
+- `has_annotations`: `/Annots` was detected. `annot list` reports page index/object metadata when a candidate can be proven from page `/Annots`, direct four-number `/Rect` metadata when available, direct `/NM`, `/M`, and `/T` text values when decodable, direct numeric `/F` annotation flags decoded into common flag names, direct numeric color and border metadata, and `quad_points_count`. `annot set-contents` can update dictionary `/Contents`; by default it preserves `/AP`, `--remove-appearance` explicitly removes stale annotation `/AP`, and `--regenerate-appearance` creates simple `/AP /N` Form XObject streams for supported text-like annotations with proven direct `/Rect`, using the same approximate multiline layout as form appearances.
+- `has_font_markers`, `has_cmap_markers`, `has_tounicode_cmap`, and `has_cid_font_markers`: font/CMap-related markers were detected. Text extraction supports simple literal operands, simple ASCII hex operands, literal/hex `TJ` arrays, page font-scoped `/ToUnicode` maps for simple `Tf` flows, CMap-backed hex `TJ` arrays, one unambiguous fallback map for hex operands, and conservative `width_units` metadata when direct simple-font `/FirstChar` and `/Widths` can be proven; glyph metrics beyond raw width units, visual layout, and reflow are not verified.
 
-These fields do not grant broad semantic edit support. They are guardrails for callers: encryption and default signature paths stop parsing, XFA requires the explicit packet command, malformed xref streams stop parsing, and object streams require graph/canonical rewrite for edits. AcroForm, annotations, and font/CMap markers are warning-only because the adapter may still rewrite a supported content-stream text operand without updating every higher-level system.
+These fields do not grant broad semantic edit support. They are guardrails for callers: unsupported encryption and default signature paths stop parsing, XFA requires the explicit packet command, malformed xref streams stop parsing, and object streams require graph/canonical rewrite for edits. AcroForm, annotations, and font/CMap markers are warning-only because the adapter may still rewrite a supported content-stream text operand without updating every higher-level system.
 
 ## Current Failure Modes
 
-The current PDF slice is supported for direct literal-string, simple ASCII hex-string, and simple literal/ASCII-hex `TJ` array edits in raw/uncompressed content streams, direct `/Filter /FlateDecode`, `/Filter /ASCIIHexDecode`, `/Filter /ASCII85Decode`, and `/Filter /RunLengthDecode` streams, single-item `/Filter [/FlateDecode]` streams, and exact `/Filter [/ASCII85Decode /FlateDecode]`, `/Filter [/ASCIIHexDecode /FlateDecode]`, `/Filter [/RunLengthDecode /FlateDecode]`, `/Filter [/ASCII85Decode /RunLengthDecode /FlateDecode]`, `/Filter [/ASCIIHexDecode /RunLengthDecode /FlateDecode]`, `/Filter [/RunLengthDecode /ASCII85Decode /FlateDecode]`, or `/Filter [/RunLengthDecode /ASCIIHexDecode /FlateDecode]` streams with direct or resolved indirect integer `/Length` values. Known failure modes are explicit:
+The current PDF slice is supported for direct literal-string, simple ASCII hex-string, simple literal/ASCII-hex `TJ` array, page font-scoped CMap-backed hex string, and CMap-backed hex `TJ` array edits in raw/uncompressed content streams, direct `/Filter /FlateDecode`, `/Filter /LZWDecode`, `/Filter /ASCIIHexDecode`, `/Filter /ASCII85Decode`, and `/Filter /RunLengthDecode` streams, their standard `/Fl`, `/LZW`, `/AHx`, `/A85`, and `/RL` abbreviations, and filter arrays composed only from those reversible filters after abbreviation normalization with direct or resolved indirect integer `/Length` values. Known failure modes are explicit:
 
 - Non-PDF input fails as `not a PDF file`.
 - Strict PDF parsing fails malformed input without `%%EOF` as `malformed PDF: missing EOF marker`.
-- Malformed or unsupported xref-stream parsing fails as `unsupported PDF: xref streams are not implemented`; parseable xref streams use the graph path.
+- Malformed or unsupported xref-stream parsing fails with a structural xref error; parseable xref streams and valid hybrid `/XRefStm` files use the graph path.
 - Surgical object-stream edits fail as `surgical rewrite does not support PDFs with xref streams or object streams; use --rewrite auto or --rewrite canonical`.
-- Encrypted PDFs fail as `unsupported PDF: encrypted PDFs require an explicit password-capable path; Adapter.Parse does not decrypt`.
+- Encrypted PDFs without `--password` fail as `unsupported PDF: encrypted PDFs require an explicit password-capable path; Adapter.Parse does not decrypt`; encrypted PDFs with unsupported handlers, AESV3+, public-key security, unsupported crypt filters outside supported `/Identity` and `/StdCF`, or encrypted xref streams fail with an unsupported encryption error.
 - Digitally signed PDFs fail as `unsupported PDF: digital signatures require explicit invalidation mode; Adapter.Parse refuses silent signature invalidation`.
 - Generic XFA parser/edit paths fail as `unsupported PDF: XFA forms are not implemented`; `xfa list` and `xfa replace` are the explicit packet-level exceptions.
 - AcroForm dictionaries, annotations, and font/CMap markers do not make validation invalid by themselves, but they produce warnings because support is narrower than the full PDF semantics.
@@ -127,40 +133,45 @@ The current PDF slice is supported for direct literal-string, simple ASCII hex-s
 - Edits fail when the selected node has no editable encoded span or the planned span no longer matches the source bytes.
 - Streams without a direct or supported indirect integer `/Length` fail as `unsupported stream: /Length must be an integer or indirect integer reference`.
 - Indirect `/Length` is supported only for `/Length N G R` references whose target object body is only a nonnegative integer. Missing or non-integer targets fail as `unsupported stream: /Length reference must resolve to an integer object`.
-- Filter arrays outside the supported exact chains fail as `unsupported stream: /Filter arrays are not implemented`.
-- Unsupported `TJ` arrays fail closed when they contain non-string/non-number elements, unsupported hex encodings, or CMap-backed array cases outside the simple literal/ASCII-hex support.
-- Unsupported filters fail closed with explicit errors such as `unsupported PDF stream filter "LZWDecode"`.
-- Unsupported `/DecodeParms` shapes fail closed with explicit errors such as `unsupported stream: /DecodeParms PNG predictors require /Colors 1`, `unsupported stream: /DecodeParms PNG predictor row width must be byte-aligned`, or `unsupported stream: /DecodeParms is not implemented`.
+- Filter arrays containing unsupported filters fail as `unsupported PDF stream filter "..."`.
+- Unsupported `TJ` arrays fail closed when they contain non-string/non-number elements, unsupported hex encodings, or CMap-backed array cases outside the current simple page-font or fallback CMap support.
+- Unsupported filters fail closed with explicit errors such as `unsupported PDF stream filter "DCTDecode"`.
+- Unsupported `/DecodeParms` shapes fail closed with explicit errors such as `unsupported stream: /DecodeParms PNG predictors require /Colors >= 1`, `unsupported stream: /DecodeParms /EarlyChange must be 0 or 1`, `unsupported stream: /DecodeParms TIFF predictor requires /BitsPerComponent <= 32`, or `unsupported stream: /DecodeParms is not implemented`.
 
-Signed PDFs have one explicit invalidation helper for canonical writes: `ApplyCanonicalEditInvalidatingSignatures`. It is not used by the default adapter parse/edit path. CLI callers must opt in with `binas edit --rewrite canonical --allow-signature-invalidation`, or `--rewrite auto --allow-signature-invalidation` when auto selects the canonical path. JSON output includes `signature_invalidation: "digital signatures invalidated; not preserved or re-signed"` on that explicit path. The helper verifies only structural/text invariants under the same invalidation mode and does not verify, preserve, or re-sign cryptographic signatures.
+Signed PDFs have two explicit edit modes outside the default refusal path.
+
+`--signature-mode invalidate` uses the canonical writer only when the caller deliberately accepts invalidation: `binas edit --rewrite canonical --signature-mode invalidate`, or `--rewrite auto --signature-mode invalidate` when auto selects the canonical path. The legacy `--allow-signature-invalidation` flag remains an alias. JSON output includes `signature_invalidation: "digital signatures invalidated; not preserved or re-signed"` on that explicit path.
+
+`--signature-mode preserve-incremental` uses an append-only incremental update and requires `--rewrite auto`. It supports the same narrow selectable text target only when the target content stream is raw/unfiltered, outside object streams and xref streams, and the signed PDF has parseable `/ByteRange` offset/length pairs. The output preserves the original file bytes as a prefix, appends an updated stream object, xref section, trailer, and `/Prev`, reparses the resulting PDF with signatures allowed, verifies old/new selectable text and page count, and compares every signed byte range byte-for-byte. JSON output includes `signature_preservation` with `incremental_update`, `original_bytes_preserved`, `byte_range_proof`, `byte_ranges_checked`, `signed_byte_ranges_unchanged`, `cryptographic_validation: false`, and a note that cryptographic validation and re-signing are not performed. Missing, malformed, negative, or out-of-file `/ByteRange` values fail closed.
 - Xref rebuild fails when a table xref is missing or no indirect objects are found. Existing non-zero generation objects are emitted in generation-aware xref rows.
 - Verification fails the command if the output does not reparse, the old decoded text remains, or the replacement text is not selectable through the adapter.
 
 Current non-goals:
 
 - Indirect `/Length` references outside `/Length N G R` standalone integer objects are not supported.
-- Broader filter arrays, broader `/DecodeParms` shapes, and filters outside standalone ASCIIHex, ASCII85, RunLength, Flate, and the exact two- and three-stage chains listed above are not supported.
-- Encrypted PDFs, default signed-PDF edits, widget/annotation appearance regeneration, broad XFA editing, OCR, raster, overlay, and stamp fallbacks are not supported.
-- Broad font/CMap-aware text decoding, glyph widths, visual layout, and page rendering are not verified beyond the current selectable-text adapter parse.
-- Browser and WASM runtimes are out of scope for the current Go-first CLI surface.
+- Broader `/DecodeParms` shapes and filters outside ASCIIHex, ASCII85, RunLength, Flate, LZW, and their standard abbreviations are not supported.
+- AESV3+/public-key/unsupported-crypt-filter encrypted PDFs, encrypted xref streams, default signed-PDF edits, cryptographic signature validation/re-signing, broad XFA editing, OCR, raster, overlay, and stamp fallbacks are not supported.
+- Appearance generation is intentionally simple: text and choice widgets plus supported text-like annotations only, approximate newlines/wrapping/clipping/truncation, no full layout engine.
+- Broad font/CMap-aware text decoding, font layout, visual layout, and page rendering are not verified beyond the current selectable-text adapter parse and direct simple-font raw width metadata.
+- Browser/WASM support includes the `cmd/binas-wasm` helper surface for inspect, query, and verified text edit over `Uint8Array` bytes. `cmd/binas-wasm/smoke.html` remains a minimal API smoke page. `cmd/binas-wasm/editor.html` is the browser editor surface: it loads Go WASM, loads PDF.js from a pinned CDN or manually selected local files, renders pages to canvas, provides page navigation and zoom, overlays exact text highlights from PDF.js text content, runs the verified WASM edit path, rerenders edited bytes, and downloads the edited PDF. Rendering is still browser/PDF.js rendering, not a second proof of PDF semantic edit correctness.
 
-## Flate Roadmap
+## Filter Support
 
-Direct `/Filter /ASCIIHexDecode`, `/Filter /ASCII85Decode`, `/Filter /RunLengthDecode`, and `/Filter /FlateDecode` streams, single-item `/Filter [/FlateDecode]` arrays, and exact `/Filter [/ASCII85Decode /FlateDecode]`, `/Filter [/ASCIIHexDecode /FlateDecode]`, `/Filter [/RunLengthDecode /FlateDecode]`, `/Filter [/ASCII85Decode /RunLengthDecode /FlateDecode]`, `/Filter [/ASCIIHexDecode /RunLengthDecode /FlateDecode]`, `/Filter [/RunLengthDecode /ASCII85Decode /FlateDecode]`, and `/Filter [/RunLengthDecode /ASCIIHexDecode /FlateDecode]` arrays are wired into the parser and edit path for direct and supported indirect integer `/Length` streams. The adapter can:
+Direct `/Filter /ASCIIHexDecode`, `/Filter /ASCII85Decode`, `/Filter /RunLengthDecode`, `/Filter /FlateDecode`, and `/Filter /LZWDecode` streams, their standard abbreviations `/AHx`, `/A85`, `/RL`, `/Fl`, and `/LZW`, and filter arrays composed only of those reversible filters after abbreviation normalization are wired into the parser and edit path for direct and supported indirect integer `/Length` streams. The adapter can:
 
-- Detect supported direct filters and supported exact filter arrays on the containing stream.
+- Detect supported direct filters and supported reversible filter arrays on the containing stream.
 - Decode the stream, parse the decoded content, rewrite the selected literal string, re-encode the stream, and update `/Length` or its referenced integer object.
 - Preserve fail-closed span checks across decoded and original byte ranges.
 - Rebuild the xref table/trailer after byte-length changes.
 - Verify by reparsing the produced PDF and querying the replacement text, not by trusting the edit path.
 
-Remaining filter work is intentionally narrower: broader filter arrays and broader `/DecodeParms` shapes need separate fixture-backed slices before they are public support. Filters outside standalone ASCIIHex, ASCII85, RunLength, Flate, and the exact two- and three-stage chains listed above remain out of scope.
+Remaining filter work is intentionally narrower: broader `/DecodeParms` shapes need separate fixture-backed slices before they are public support. Filters outside ASCIIHex, ASCII85, RunLength, Flate, LZW, and their standard abbreviations remain out of scope.
 
 ## DecodeParms
 
-`/DecodeParms` support is limited to FlateDecode streams with `/Predictor 1` and either omitted geometry keys or explicit default geometry keys (`/Columns 1`, `/Colors 1`, `/BitsPerComponent 8`), byte-aligned TIFF predictor `2`, or PNG predictors `10` through `15` constrained to direct `/Columns >= 1`, or omitted `/Columns` defaulting to 1 when `/Colors` is also 1/default, and byte-aligned predictor rows. The current fixture-backed PNG predictor lanes are `/BitsPerComponent 8 /Colors 1`, `/BitsPerComponent 8 /Colors 3`, and `/BitsPerComponent 16 /Colors 2`. Omitted `/Colors` defaults to 1 and omitted `/BitsPerComponent` defaults to 8. For filter arrays, `/DecodeParms` entries must align one-for-one with the exact supported filter chain. The supported shapes are `/Filter [/FlateDecode] /DecodeParms [<<...>>]`; `/Filter [/ASCII85Decode /FlateDecode] /DecodeParms [null <<...>>]`, `/Filter [/ASCIIHexDecode /FlateDecode] /DecodeParms [null <<...>>]`, and `/Filter [/RunLengthDecode /FlateDecode] /DecodeParms [null <<...>>]`; and any exact supported three-stage chain with `/DecodeParms [null null <<...>>]`, where `null` entries belong to wrapper filters and the dictionary entry belongs to `/FlateDecode`.
+`/DecodeParms` support is limited to FlateDecode and LZWDecode streams with `/Predictor 1` and either omitted geometry keys or explicit default geometry keys (`/Columns 1`, `/Colors 1`, `/BitsPerComponent 8`), TIFF predictor `2` with packed sample rows and `/BitsPerComponent <= 32`, or PNG predictors `10` through `15` with row width computed from `/Columns`, `/Colors`, and `/BitsPerComponent` using PDF's ceil-to-bytes row sizing. Omitted `/Columns`, `/Colors`, and `/BitsPerComponent` default to `1`, `1`, and `8`. LZWDecode also supports `/EarlyChange 0|1`, defaulting to `1`. For filter arrays, `/DecodeParms` entries must align one-for-one with the filter chain. All-null arrays are accepted for supported reversible chains. Non-null dictionary entries are supported only for Flate and LZW positions; wrapper filters such as ASCIIHex, ASCII85, and RunLength require `null` parameters.
 
-Everything else under `/DecodeParms` remains unsupported unless a later pass adds focused fixtures and proof for that exact shape. This excludes non-default geometry keys with `/Predictor 1`, omitted PNG `/Columns` when `/Colors` is not 1/default, unknown predictor values, non-byte-aligned predictor rows, unfixture-backed bit-depth/color lanes, unsupported filters, and mixed filter chains beyond the currently supported exact chains.
+Everything else under `/DecodeParms` remains unsupported unless a later pass adds focused fixtures and proof for that exact shape. This excludes non-default geometry keys with `/Predictor 1`, unknown predictor values, unsupported LZW predictor combinations, unsupported filters, and non-null DecodeParms dictionaries outside the currently supported Flate/LZW positions.
 
 ## Residual Boundary Fixtures
 
@@ -182,8 +193,8 @@ Synthetic corpus fixtures live under `testdata/pdf`. They are small PDFs for par
 
 ## Next Residual Boundaries
 
-- Broader filter arrays remain unsupported unless explicitly listed above.
+- Filter arrays remain unsupported when their normalized filter chain contains filters outside ASCIIHex, ASCII85, RunLength, Flate, LZW, and their standard abbreviations.
 - Object streams have graph/canonical support for the fixture-backed shapes, but preserving original object-stream layout remains out of scope.
 - Unresolved, non-integer, compressed, shared, or cyclic indirect `/Length` references remain outside the current `/Length N G R` standalone integer support shape.
-- Broader `/DecodeParms` shapes remain unsupported beyond FlateDecode with `/Predictor 1` plus omitted/default geometry keys or PNG predictors `10` through `15` constrained to direct `/Columns >= 1`, or omitted `/Columns` with `/Colors` 1/default, byte-aligned predictor rows, and the fixture-backed bit-depth/color lanes.
-- Filters outside standalone ASCIIHex, ASCII85, RunLength, Flate, and the exact two- and three-stage chains listed above, default signed-PDF edits, encryption, appearance regeneration, broad XFA editing, broad font/CMap/layout support, browser, and WASM surfaces remain out of scope.
+- Broader `/DecodeParms` shapes remain unsupported beyond Flate/LZW `/Predictor 1`, TIFF predictor `2` packed sample rows, PNG predictors `10` through `15`, and LZW `/EarlyChange 0|1`.
+- Filters outside ASCIIHex, ASCII85, RunLength, Flate, LZW, and their standard abbreviations, encrypted AESV3+/public-key/unsupported-crypt-filter/xref-stream shapes, default signed-PDF edits, cryptographic signature validation/re-signing, broad XFA editing, broad appearance/layout support, and broad font/CMap/layout support remain out of scope.

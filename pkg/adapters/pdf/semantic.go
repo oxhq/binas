@@ -26,10 +26,29 @@ type XFAPacketMetadata struct {
 	HasDecodeError   bool   `json:"has_decode_error,omitempty"`
 	DecodeError      string `json:"decode_error,omitempty"`
 	TextLength       int    `json:"text_length"`
+	ByteLength       int    `json:"byte_length"`
 	Preview          string `json:"preview"`
 }
 
+type XFASelector struct {
+	PacketKind string
+	Label      string
+}
+
+type XFAPacketListOptions struct {
+	Selector XFASelector
+}
+
+type XFAReplaceOptions struct {
+	MatchIndex *int
+	Selector   XFASelector
+}
+
 func ListXFAPackets(input []byte) ([]XFAPacketMetadata, error) {
+	return ListXFAPacketsWithOptions(input, XFAPacketListOptions{})
+}
+
+func ListXFAPacketsWithOptions(input []byte, options XFAPacketListOptions) ([]XFAPacketMetadata, error) {
 	graph, err := parsePDFGraphWithOptions(input, pdfGraphParseOptions{AllowXFA: true})
 	if err != nil {
 		return nil, err
@@ -45,6 +64,7 @@ func ListXFAPackets(input []byte) ([]XFAPacketMetadata, error) {
 	for i := range packets {
 		packets[i].Index = i
 	}
+	packets = filterXFAPacketMetadata(packets, options.Selector)
 	return packets, nil
 }
 
@@ -55,21 +75,45 @@ func ApplyXFAReplace(input []byte, oldText, newText string, matchIndexArg ...*in
 	if len(matchIndexArg) > 1 {
 		return nil, core.Report{}, core.Verification{}, errors.New("XFA replace accepts at most one match index")
 	}
+	var matchIndex *int
+	if len(matchIndexArg) == 1 {
+		matchIndex = matchIndexArg[0]
+	}
+	return ApplyXFAReplaceWithOptions(input, oldText, newText, XFAReplaceOptions{MatchIndex: matchIndex})
+}
+
+func ApplyXFAReplaceWithOptions(input []byte, oldText, newText string, options XFAReplaceOptions) ([]byte, core.Report, core.Verification, error) {
+	if oldText == "" {
+		return nil, core.Report{}, core.Verification{}, errors.New("XFA replace requires --text")
+	}
 	graph, err := parsePDFGraphWithOptions(input, pdfGraphParseOptions{AllowXFA: true})
 	if err != nil {
 		return nil, core.Report{}, core.Verification{}, err
 	}
-	matches := xfaPackets(graph, oldText)
+	candidates := xfaPackets(graph, oldText)
+	if !options.Selector.empty() {
+		selectorMatches := filterXFAPackets(xfaPackets(graph, ""), options.Selector)
+		if len(selectorMatches) == 0 {
+			if !graphHasDirectXFA(graph) {
+				return nil, core.Report{}, core.Verification{}, errors.New("unsupported PDF: XFA packet is not directly represented")
+			}
+			return nil, core.Report{}, core.Verification{}, fmt.Errorf("no XFA packet matches selector %s", options.Selector.describe())
+		}
+	}
+	matches := filterXFAPackets(candidates, options.Selector)
 	if len(matches) == 0 {
 		if !graphHasDirectXFA(graph) {
 			return nil, core.Report{}, core.Verification{}, errors.New("unsupported PDF: XFA packet is not directly represented")
 		}
-		return nil, core.Report{}, core.Verification{}, fmt.Errorf("no XFA packet contains %q", oldText)
+		if options.Selector.empty() {
+			return nil, core.Report{}, core.Verification{}, fmt.Errorf("no XFA packet contains %q", oldText)
+		}
+		return nil, core.Report{}, core.Verification{}, fmt.Errorf("no XFA packet matching selector %s contains %q", options.Selector.describe(), oldText)
 	}
 	matchIndex := 0
 	var selected *int
-	if len(matchIndexArg) == 1 && matchIndexArg[0] != nil {
-		matchIndex = *matchIndexArg[0]
+	if options.MatchIndex != nil {
+		matchIndex = *options.MatchIndex
 		if matchIndex < 0 || matchIndex >= len(matches) {
 			return nil, core.Report{}, core.Verification{}, fmt.Errorf("XFA replacement match index %d is out of range: %d matches for %q", matchIndex, len(matches), oldText)
 		}
@@ -107,6 +151,8 @@ type xfaPacket struct {
 	array   pdfArray
 	index   int
 	object  *pdfIndirectObject
+	label   string
+	kind    string
 	text    string
 	stream  bool
 	occurs  int
@@ -119,9 +165,60 @@ func xfaPackets(graph *pdfGraph, contains string) []xfaPacket {
 		if !ok {
 			continue
 		}
-		matches = append(matches, collectXFAPackets(graph, acroForm, "XFA", value, contains)...)
+		matches = append(matches, collectXFAPackets(graph, acroForm, "XFA", value, contains, "")...)
 	}
 	return matches
+}
+
+func filterXFAPacketMetadata(packets []XFAPacketMetadata, selector XFASelector) []XFAPacketMetadata {
+	if selector.empty() {
+		return packets
+	}
+	filtered := make([]XFAPacketMetadata, 0, len(packets))
+	for _, packet := range packets {
+		if selector.matches(packet.Label, packet.PacketKind) {
+			filtered = append(filtered, packet)
+		}
+	}
+	return filtered
+}
+
+func filterXFAPackets(packets []xfaPacket, selector XFASelector) []xfaPacket {
+	if selector.empty() {
+		return packets
+	}
+	filtered := make([]xfaPacket, 0, len(packets))
+	for _, packet := range packets {
+		if selector.matches(packet.label, packet.kind) {
+			filtered = append(filtered, packet)
+		}
+	}
+	return filtered
+}
+
+func (s XFASelector) empty() bool {
+	return s.PacketKind == "" && s.Label == ""
+}
+
+func (s XFASelector) matches(label, kind string) bool {
+	if s.Label != "" && label != s.Label {
+		return false
+	}
+	if s.PacketKind != "" && kind != s.PacketKind {
+		return false
+	}
+	return true
+}
+
+func (s XFASelector) describe() string {
+	parts := make([]string, 0, 2)
+	if s.PacketKind != "" {
+		parts = append(parts, fmt.Sprintf("packet_kind=%q", s.PacketKind))
+	}
+	if s.Label != "" {
+		parts = append(parts, fmt.Sprintf("label=%q", s.Label))
+	}
+	return strings.Join(parts, " ")
 }
 
 func appendXFAPacketMetadata(out []XFAPacketMetadata, graph *pdfGraph, value pdfValue, label string) []XFAPacketMetadata {
@@ -174,6 +271,7 @@ func makeXFAPacketMetadata(label string, object *pdfIndirectObject, isStream boo
 		RootElement:  rootElement,
 		IsStream:     isStream,
 		TextLength:   utf8.RuneCountInString(text),
+		ByteLength:   len(text),
 		Preview:      boundedXFAPreview(text),
 	}
 	if object != nil {
@@ -396,14 +494,14 @@ func acroFormDictionaries(graph *pdfGraph) []pdfDict {
 	return matches
 }
 
-func collectXFAPackets(graph *pdfGraph, owner pdfDict, key string, value pdfValue, contains string) []xfaPacket {
+func collectXFAPackets(graph *pdfGraph, owner pdfDict, key string, value pdfValue, contains string, label string) []xfaPacket {
 	matches := make([]xfaPacket, 0)
 	switch v := value.(type) {
 	case pdfLiteralString, pdfHexString:
 		text, ok := pdfTextValue(v)
 		if ok {
-			for i := 0; i < strings.Count(text, contains); i++ {
-				matches = append(matches, xfaPacket{dict: owner, dictKey: key, text: text, occurs: i + 1})
+			for i := 0; i < countXFAPacketTextMatches(text, contains); i++ {
+				matches = append(matches, makeXFAPacketMatch(xfaPacket{dict: owner, dictKey: key, text: text, occurs: i + 1}, label))
 			}
 		}
 	case pdfRef:
@@ -416,24 +514,26 @@ func collectXFAPackets(graph *pdfGraph, owner pdfDict, key string, value pdfValu
 			decoded, err := decodePDFGraphStream(objectValue)
 			if err == nil {
 				text := string(decoded)
-				for i := 0; i < strings.Count(text, contains); i++ {
-					matches = append(matches, xfaPacket{object: object, text: text, stream: true, occurs: i + 1})
+				for i := 0; i < countXFAPacketTextMatches(text, contains); i++ {
+					matches = append(matches, makeXFAPacketMatch(xfaPacket{object: object, text: text, stream: true, occurs: i + 1}, label))
 				}
 			}
 		case pdfLiteralString, pdfHexString:
 			text, ok := pdfTextValue(objectValue)
 			if ok {
-				for i := 0; i < strings.Count(text, contains); i++ {
-					matches = append(matches, xfaPacket{object: object, text: text, occurs: i + 1})
+				for i := 0; i < countXFAPacketTextMatches(text, contains); i++ {
+					matches = append(matches, makeXFAPacketMatch(xfaPacket{object: object, text: text, occurs: i + 1}, label))
 				}
 			}
 		}
 	case pdfArray:
 		for i := 0; i < len(v); i++ {
 			item := v[i]
-			if _, isPacketName := item.(pdfLiteralString); isPacketName && i+1 < len(v) {
+			packetLabel := ""
+			if labelValue, hasPacketLabel := xfaArrayPacketLabel(item); hasPacketLabel && i+1 < len(v) {
 				i++
 				item = v[i]
+				packetLabel = labelValue
 			}
 			switch itemValue := item.(type) {
 			case pdfLiteralString, pdfHexString:
@@ -441,15 +541,28 @@ func collectXFAPackets(graph *pdfGraph, owner pdfDict, key string, value pdfValu
 				if !ok {
 					continue
 				}
-				for n := 0; n < strings.Count(text, contains); n++ {
-					matches = append(matches, xfaPacket{array: v, index: i, text: text, occurs: n + 1})
+				for n := 0; n < countXFAPacketTextMatches(text, contains); n++ {
+					matches = append(matches, makeXFAPacketMatch(xfaPacket{array: v, index: i, text: text, occurs: n + 1}, packetLabel))
 				}
 			default:
-				matches = append(matches, collectXFAPackets(graph, owner, key, item, contains)...)
+				matches = append(matches, collectXFAPackets(graph, owner, key, item, contains, packetLabel)...)
 			}
 		}
 	}
 	return matches
+}
+
+func countXFAPacketTextMatches(text, contains string) int {
+	if contains == "" {
+		return 1
+	}
+	return strings.Count(text, contains)
+}
+
+func makeXFAPacketMatch(packet xfaPacket, label string) xfaPacket {
+	packet.label = label
+	packet.kind = classifyXFAPacketKind(label, packet.text)
+	return packet
 }
 
 func (p xfaPacket) replace(oldText, newText string) error {

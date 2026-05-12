@@ -455,6 +455,70 @@ func TestRunLengthFlateDecodeFilterArrayRewriteReencodesLengthAndXref(t *testing
 	}
 }
 
+func TestFlateASCIIHexDecodeFilterArrayRewriteReencodesLengthAndXref(t *testing.T) {
+	decoded := []byte("BT\n(08\\05515\\0552024) Tj\nET\n")
+	encoded, err := encodeFlateASCIIHexDecodeForTest(decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := testPDF(
+		"<< /Type /Page >>",
+		fmt.Sprintf("<< /Length %d /Filter [/FlateDecode /ASCIIHexDecode] >>\nstream\n%sendstream", len(encoded), encoded),
+	)
+	adapter := NewAdapter()
+	tree, err := adapter.Parse(input, core.ParseOptions{Strict: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if matches := tree.Query(core.Match{Kind: KindTextShow, Text: "08-15-2024"}); len(matches) != 1 {
+		t.Fatalf("old selectable matches = %d, want 1", len(matches))
+	}
+	plan, err := adapter.PlanEdit(tree, core.Match{Kind: KindTextShow, Text: "08-15-2024"}, core.Mutation{Replace: "May 5, 2026"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, _, err := adapter.Apply(input, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verification, err := adapter.Verify(output, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.ReparseOK || !verification.OldTextRemoved || !verification.NewSelectable || !verification.PageUnchanged {
+		t.Fatalf("verification failed: %+v", verification)
+	}
+	stream, ok, err := findNextStream(output, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("missing stream")
+	}
+	if stream.lengthIndirect {
+		t.Fatal("stream length unexpectedly became indirect")
+	}
+	if stream.lengthValue == len(encoded) {
+		t.Fatal("encoded stream length was not updated")
+	}
+	if stream.lengthValue != stream.dataEnd-stream.dataStart {
+		t.Fatalf("stream length = %d, want %d", stream.lengthValue, stream.dataEnd-stream.dataStart)
+	}
+	updatedDecoded, err := decodeFlateASCIIHexDecodeForTest(output[stream.dataStart:stream.dataEnd])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(updatedDecoded, []byte("08-15-2024")) {
+		t.Fatalf("decoded stream still contains old text: %q", updatedDecoded)
+	}
+	if !bytes.Contains(updatedDecoded, []byte("(May 5, 2026) Tj")) {
+		t.Fatalf("decoded stream = %q", updatedDecoded)
+	}
+	if !bytes.Contains(output, []byte("xref\n0 3\n")) {
+		t.Fatalf("xref table was not rebuilt:\n%s", output)
+	}
+}
+
 func TestASCIIArmoredRunLengthFlateDecodeFilterArrayRoundTrip(t *testing.T) {
 	input := []byte("BT\n(08\\05515\\0552024) Tj\nET\n")
 	cases := []struct {
@@ -1224,6 +1288,110 @@ func TestFlateDecodePNGDecodeParmsRGBRewriteReencodesPredictorRowsAndXref(t *tes
 	}
 }
 
+func TestFlateDecodePNGDecodeParmsOmittedColumnsRGBRewriteReencodesPredictorRowsAndXref(t *testing.T) {
+	decoded := []byte("BT\n(ABCDEF) Tj\nET\n")
+	const (
+		columns  = 1
+		colors   = 3
+		rowBytes = columns * colors
+	)
+	cases := []struct {
+		name        string
+		filter      string
+		decodeParms string
+	}{
+		{
+			name:        "direct dictionary",
+			filter:      "/FlateDecode",
+			decodeParms: "<< /Predictor 12 /Colors 3 >>",
+		},
+		{
+			name:        "single-item filter array",
+			filter:      "[/FlateDecode]",
+			decodeParms: "[<< /Predictor 12 /Colors 3 >>]",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			predicted, err := encodePNGPredictorRowsWithBPPForTest(decoded, rowBytes, colors, []byte{0, 1, 2, 3, 4, 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			encoded, err := encodeFlateDecode(predicted)
+			if err != nil {
+				t.Fatal(err)
+			}
+			input := testPDF(
+				"<< /Type /Page >>",
+				fmt.Sprintf("<< /Length %d /Filter %s /DecodeParms %s >>\nstream\n%sendstream", len(encoded), tc.filter, tc.decodeParms, encoded),
+			)
+			adapter := NewAdapter()
+			tree, err := adapter.Parse(input, core.ParseOptions{Strict: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if matches := tree.Query(core.Match{Kind: KindTextShow, Text: "ABCDEF"}); len(matches) != 1 {
+				t.Fatalf("old selectable matches = %d, want 1", len(matches))
+			}
+			plan, err := adapter.PlanEdit(tree, core.Match{Kind: KindTextShow, Text: "ABCDEF"}, core.Mutation{Replace: "UVWXYZ123"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			output, _, err := adapter.Apply(input, plan)
+			if err != nil {
+				t.Fatal(err)
+			}
+			verification, err := adapter.Verify(output, plan)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !verification.ReparseOK || !verification.OldTextRemoved || !verification.NewSelectable || !verification.PageUnchanged {
+				t.Fatalf("verification failed: %+v", verification)
+			}
+			stream, ok, err := findNextStream(output, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok {
+				t.Fatal("missing stream")
+			}
+			if stream.lengthIndirect {
+				t.Fatal("stream length unexpectedly became indirect")
+			}
+			if stream.lengthValue == len(encoded) {
+				t.Fatal("predicted compressed stream length was not updated")
+			}
+			if stream.lengthValue != stream.dataEnd-stream.dataStart {
+				t.Fatalf("stream length = %d, want %d", stream.lengthValue, stream.dataEnd-stream.dataStart)
+			}
+			updatedPredicted, err := decodeFlateDecode(output[stream.dataStart:stream.dataEnd])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.Equal(updatedPredicted, predicted) {
+				t.Fatal("predicted rows were not rewritten")
+			}
+			updatedDecoded, err := decodePNGPredictorRowsWithBPPForTest(updatedPredicted, rowBytes, colors)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.Contains(updatedDecoded, []byte("ABCDEF")) {
+				t.Fatalf("decoded stream still contains old text: %q", updatedDecoded)
+			}
+			if !bytes.Contains(updatedDecoded, []byte("(UVWXYZ123) Tj")) {
+				t.Fatalf("decoded stream = %q", updatedDecoded)
+			}
+			if !hasOnlyPNGFilterNoneRowsForColumnsForTest(updatedPredicted, rowBytes) {
+				t.Fatalf("encoded predictor rows were not PNG filter 0 omitted-Columns RGB rows: %v", updatedPredicted)
+			}
+			if !bytes.Contains(output, []byte("xref\n0 3\n")) {
+				t.Fatalf("xref table was not rebuilt:\n%s", output)
+			}
+		})
+	}
+}
+
 func TestFlateDecodePNGDecodeParmsRGBRewriteFailsWhenDecodedLengthIsPartialRow(t *testing.T) {
 	decoded := []byte("BT\n(ABCDEF) Tj\nET\n")
 	const (
@@ -1481,21 +1649,21 @@ func TestFilterArrayStreamsFailClosed(t *testing.T) {
 	}{
 		{
 			name:   "unsupported second filter",
-			filter: "[/FlateDecode /ASCIIHexDecode]",
+			filter: "[/FlateDecode /DCTDecode]",
 		},
 		{
 			name:   "unsupported runlength broader chain",
-			filter: "[/RunLengthDecode /FlateDecode /ASCIIHexDecode]",
+			filter: "[/RunLengthDecode /JPXDecode /ASCIIHexDecode]",
 		},
 		{
 			name:   "unsupported three filter order",
-			filter: "[/ASCII85Decode /FlateDecode /RunLengthDecode]",
+			filter: "[/ASCII85Decode /CCITTFaxDecode /RunLengthDecode]",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			dict := fmt.Sprintf("<< /Length %d /Filter %s >>", len(encoded), tc.filter)
-			assertPDFStreamFailsClosed(t, dict, encoded, "unsupported stream: /Filter arrays are not implemented")
+			assertPDFStreamFailsClosed(t, dict, encoded, fmt.Sprintf("unsupported PDF stream filter %q", strings.Join(parsePDFStreamFilterChain(tc.filter), " ")))
 		})
 	}
 }
@@ -1549,6 +1717,22 @@ func decodeRunLengthFlateDecodeForTest(input []byte) ([]byte, error) {
 		return nil, err
 	}
 	return decodeFlateDecode(decodedRunLength)
+}
+
+func encodeFlateASCIIHexDecodeForTest(input []byte) ([]byte, error) {
+	asciiHex, err := encodeASCIIHexDecode(input)
+	if err != nil {
+		return nil, err
+	}
+	return encodeFlateDecode(asciiHex)
+}
+
+func decodeFlateASCIIHexDecodeForTest(input []byte) ([]byte, error) {
+	decodedFlate, err := decodeFlateDecode(input)
+	if err != nil {
+		return nil, err
+	}
+	return decodeASCIIHexDecode(decodedFlate)
 }
 
 func decodeASCII85RunLengthFlateDecodeForTest(input []byte) ([]byte, error) {
@@ -1802,31 +1986,6 @@ func TestDecodeParmsStreamsFailClosed(t *testing.T) {
 		dict            string
 		wantUnsupported string
 	}{
-		{
-			name:            "decode parms dictionary colors without columns",
-			dict:            fmt.Sprintf("<< /Length %d /Filter /FlateDecode /DecodeParms << /Predictor 12 /Colors 3 >> >>", len(encoded)),
-			wantUnsupported: "unsupported stream: /DecodeParms PNG predictors require /Colors 1",
-		},
-		{
-			name:            "decode parms array colors without columns",
-			dict:            fmt.Sprintf("<< /Length %d /Filter /FlateDecode /DecodeParms [<< /Predictor 12 /Colors 3 >>] >>", len(encoded)),
-			wantUnsupported: "unsupported stream: /DecodeParms PNG predictors require /Colors 1",
-		},
-		{
-			name:            "png predictor non byte aligned default color bit rows",
-			dict:            fmt.Sprintf("<< /Length %d /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 7 /BitsPerComponent 1 >> >>", len(encoded)),
-			wantUnsupported: "unsupported stream: /DecodeParms PNG predictor row width must be byte-aligned",
-		},
-		{
-			name:            "png predictor non byte aligned explicit color bit rows",
-			dict:            fmt.Sprintf("<< /Length %d /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 3 /Colors 1 /BitsPerComponent 1 >> >>", len(encoded)),
-			wantUnsupported: "unsupported stream: /DecodeParms PNG predictor row width must be byte-aligned",
-		},
-		{
-			name:            "png predictor non byte aligned rgb bit rows",
-			dict:            fmt.Sprintf("<< /Length %d /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 1 /Colors 3 /BitsPerComponent 1 >> >>", len(encoded)),
-			wantUnsupported: "unsupported stream: /DecodeParms PNG predictor row width must be byte-aligned",
-		},
 		{
 			name:            "asciihex filter decode parms",
 			dict:            fmt.Sprintf("<< /Length %d /Filter [/ASCIIHexDecode /FlateDecode] /DecodeParms [<< /Predictor 1 >> null] >>", len(encoded)),

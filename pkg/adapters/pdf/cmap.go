@@ -14,8 +14,9 @@ type pdfToUnicodeMap map[string]string
 type toUnicodeCMap = pdfToUnicodeMap
 
 type pdfCMapContext struct {
-	fallback        *toUnicodeCMap
-	streamFontCMaps map[int]map[string]*toUnicodeCMap
+	fallback          *toUnicodeCMap
+	streamFontCMaps   map[int]map[string]*toUnicodeCMap
+	streamFontMetrics map[int]map[string]pdfSimpleFontMetrics
 }
 
 func singleToUnicodeCMap(input []byte) *toUnicodeCMap {
@@ -36,7 +37,8 @@ func pdfCMapContextForInput(input []byte, opts pdfGraphParseOptions) pdfCMapCont
 
 func (g *pdfGraph) cmapContext() pdfCMapContext {
 	ctx := pdfCMapContext{
-		streamFontCMaps: g.streamFontToUnicodeCMaps(),
+		streamFontCMaps:   g.streamFontToUnicodeCMaps(),
+		streamFontMetrics: g.streamFontMetrics(),
 	}
 	cmap, ok := g.singleToUnicodeMap()
 	if !ok {
@@ -65,7 +67,7 @@ func (g *pdfGraph) singleToUnicodeMap() (pdfToUnicodeMap, bool) {
 		if !ok {
 			continue
 		}
-		decoded, err := decodePDFGraphStream(stream)
+		decoded, err := g.decodePDFGraphObjectStream(ref.ID, stream)
 		if err != nil {
 			continue
 		}
@@ -235,7 +237,7 @@ func (g *pdfGraph) toUnicodeCMapForFont(fontID pdfObjectID) (pdfToUnicodeMap, bo
 	if !ok {
 		return nil, false
 	}
-	decoded, err := decodePDFGraphStream(stream)
+	decoded, err := g.decodePDFGraphObjectStream(ref.ID, stream)
 	if err != nil {
 		return nil, false
 	}
@@ -247,6 +249,13 @@ func (c pdfCMapContext) fontCMapsForStream(sourceStart int) map[string]*toUnicod
 		return nil
 	}
 	return c.streamFontCMaps[sourceStart]
+}
+
+func (c pdfCMapContext) fontMetricsForStream(sourceStart int) map[string]pdfSimpleFontMetrics {
+	if c.streamFontMetrics == nil {
+		return nil
+	}
+	return c.streamFontMetrics[sourceStart]
 }
 
 func parseToUnicodeCMap(input []byte) (pdfToUnicodeMap, bool) {
@@ -337,19 +346,36 @@ func (m pdfToUnicodeMap) EncodeHex(text string) (string, bool) {
 	sort.Strings(keys)
 
 	reverse := make(map[string]string, len(m))
+	decodedKeys := make([]string, 0, len(m))
 	for _, encoded := range keys {
 		decoded := m[encoded]
 		if _, exists := reverse[decoded]; !exists {
 			reverse[decoded] = encoded
+			decodedKeys = append(decodedKeys, decoded)
 		}
 	}
+	sort.Slice(decodedKeys, func(i, j int) bool {
+		if len(decodedKeys[i]) == len(decodedKeys[j]) {
+			return decodedKeys[i] < decodedKeys[j]
+		}
+		return len(decodedKeys[i]) > len(decodedKeys[j])
+	})
+
 	var out strings.Builder
-	for _, r := range text {
-		encoded, ok := reverse[string(r)]
-		if !ok {
+	for len(text) > 0 {
+		matched := false
+		for _, decoded := range decodedKeys {
+			if decoded == "" || !strings.HasPrefix(text, decoded) {
+				continue
+			}
+			out.WriteString(reverse[decoded])
+			text = text[len(decoded):]
+			matched = true
+			break
+		}
+		if !matched {
 			return "", false
 		}
-		out.WriteString(encoded)
 	}
 	return out.String(), true
 }

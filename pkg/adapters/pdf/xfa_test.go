@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/oxhq/binas/pkg/core"
 )
@@ -109,6 +110,56 @@ func TestApplyXFAReplaceArrayLiteralEntryInPlace(t *testing.T) {
 	}
 }
 
+func TestApplyXFAReplaceArrayHexLabelEntryInPlace(t *testing.T) {
+	input := testPDF("<< /Type /Catalog /AcroForm << /XFA [<74656d706c617465> (<template>old</template>) /datasets (<datasets>keep</datasets>)] >> >>")
+
+	output, _, _, err := ApplyXFAReplace(input, "<template>old</template>", "<template>new</template>")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Contains(output, []byte("<template>new</template>")) {
+		t.Fatalf("XFA array entry after hex label was not replaced:\n%s", output)
+	}
+	if bytes.Contains(output, []byte("<template>old</template>")) {
+		t.Fatalf("old XFA array entry after hex label remains:\n%s", output)
+	}
+	if !bytes.Contains(output, []byte("<datasets>keep</datasets>")) {
+		t.Fatalf("unmatched XFA packet changed:\n%s", output)
+	}
+}
+
+func TestApplyXFAReplaceArrayNameLabelEntryInPlace(t *testing.T) {
+	input := testPDF("<< /Type /Catalog /AcroForm << /XFA [/template (<template>old</template>) /datasets (<datasets>keep</datasets>)] >> >>")
+
+	output, _, _, err := ApplyXFAReplace(input, "<template>old</template>", "<template>new</template>")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Contains(output, []byte("<template>new</template>")) {
+		t.Fatalf("XFA array entry after name label was not replaced:\n%s", output)
+	}
+	if bytes.Contains(output, []byte("<template>old</template>")) {
+		t.Fatalf("old XFA array entry after name label remains:\n%s", output)
+	}
+	if !bytes.Contains(output, []byte("<datasets>keep</datasets>")) {
+		t.Fatalf("unmatched XFA packet changed:\n%s", output)
+	}
+}
+
+func TestApplyXFAReplaceDoesNotMatchHexArrayLabelText(t *testing.T) {
+	input := testPDF("<< /Type /Catalog /AcroForm << /XFA [<74656d706c617465> (<packet>keep</packet>)] >> >>")
+
+	_, _, _, err := ApplyXFAReplace(input, "template", "renamed")
+	if err == nil {
+		t.Fatal("expected XFA replacement to ignore hex array label text")
+	}
+	if err.Error() != `no XFA packet contains "template"` {
+		t.Fatalf("error = %q", err)
+	}
+}
+
 func TestApplyXFAReplaceFailsClosedWhenAmbiguous(t *testing.T) {
 	input := testPDF("<< /Type /Catalog /AcroForm << /XFA [(template) (old) (datasets) (old)] >> >>")
 
@@ -138,6 +189,48 @@ func TestApplyXFAReplaceSelectsIndexedXFAPacket(t *testing.T) {
 	}
 	if bytes.Contains(output, []byte("<datasets>old</datasets>")) {
 		t.Fatalf("selected XFA packet still contains old text:\n%s", output)
+	}
+}
+
+func TestApplyXFAReplaceWithOptionsSelectsPacketKind(t *testing.T) {
+	input := testPDF("<< /Type /Catalog /AcroForm << /XFA [(template) (<template>old</template>) (datasets) (<datasets>old</datasets>)] >> >>")
+
+	output, _, _, err := ApplyXFAReplaceWithOptions(input, "old", "new", XFAReplaceOptions{
+		Selector: XFASelector{PacketKind: "datasets"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Contains(output, []byte("<template>old</template>")) {
+		t.Fatalf("unselected packet kind changed:\n%s", output)
+	}
+	if !bytes.Contains(output, []byte("<datasets>new</datasets>")) {
+		t.Fatalf("selected packet kind was not changed:\n%s", output)
+	}
+	if bytes.Contains(output, []byte("<datasets>old</datasets>")) {
+		t.Fatalf("selected packet kind still contains old text:\n%s", output)
+	}
+}
+
+func TestApplyXFAReplaceWithOptionsSelectsArrayLabel(t *testing.T) {
+	input := testPDF("<< /Type /Catalog /AcroForm << /XFA [(keepTemplate) (<template>old</template>) (targetTemplate) (<template>old</template>)] >> >>")
+
+	output, _, _, err := ApplyXFAReplaceWithOptions(input, "old", "new", XFAReplaceOptions{
+		Selector: XFASelector{Label: "targetTemplate"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Contains(output, []byte("(keepTemplate) (<template>old</template>)")) {
+		t.Fatalf("unselected label changed:\n%s", output)
+	}
+	if !bytes.Contains(output, []byte("(targetTemplate) (<template>new</template>)")) {
+		t.Fatalf("selected label was not changed:\n%s", output)
+	}
+	if bytes.Contains(output, []byte("(targetTemplate) (<template>old</template>)")) {
+		t.Fatalf("selected label still contains old text:\n%s", output)
 	}
 }
 
@@ -181,6 +274,34 @@ func TestApplyXFAReplaceRejectsInvalidMatchIndex(t *testing.T) {
 	}
 }
 
+func TestApplyXFAReplaceWithOptionsFailsClosedWhenSelectorMatchesZero(t *testing.T) {
+	input := testPDF("<< /Type /Catalog /AcroForm << /XFA [(template) (<template>old</template>)] >> >>")
+
+	_, _, _, err := ApplyXFAReplaceWithOptions(input, "old", "new", XFAReplaceOptions{
+		Selector: XFASelector{Label: "datasets"},
+	})
+	if err == nil {
+		t.Fatal("expected unmatched XFA selector to fail closed")
+	}
+	if err.Error() != `no XFA packet matches selector label="datasets"` {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestApplyXFAReplaceWithOptionsFailsClosedWhenSelectorRemainsAmbiguous(t *testing.T) {
+	input := testPDF("<< /Type /Catalog /AcroForm << /XFA [(datasets) (<datasets>old</datasets>) (datasets) (<datasets>old</datasets>)] >> >>")
+
+	_, _, _, err := ApplyXFAReplaceWithOptions(input, "old", "new", XFAReplaceOptions{
+		Selector: XFASelector{Label: "datasets"},
+	})
+	if err == nil {
+		t.Fatal("expected ambiguous XFA selector replacement to fail closed")
+	}
+	if err.Error() != `XFA replacement is ambiguous: 2 matches for "old"` {
+		t.Fatalf("error = %q", err)
+	}
+}
+
 func TestApplyXFAReplaceFailsClosedWithoutDirectXFA(t *testing.T) {
 	input := testPDF("<< /Type /Catalog /AcroForm << /Fields [] >> >>")
 
@@ -216,6 +337,54 @@ func TestListXFAPacketsDirectLiteral(t *testing.T) {
 	}
 	if packet.TextLength != len("<template>alpha</template>") || packet.Preview != "<template>alpha</template>" {
 		t.Fatalf("packet text metadata = %+v", packet)
+	}
+}
+
+func TestListXFAPacketsReportsByteLengthSeparatelyFromTextLength(t *testing.T) {
+	input := testPDF("<< /Type /Catalog /AcroForm << /XFA (<template>caf\xc3\xa9</template>) >> >>")
+
+	packets, err := ListXFAPackets(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(packets) != 1 {
+		t.Fatalf("packets = %+v, want one packet", packets)
+	}
+	packet := packets[0]
+	if packet.TextLength != utf8.RuneCountInString("<template>café</template>") {
+		t.Fatalf("text length = %d, want rune count", packet.TextLength)
+	}
+	if packet.ByteLength != len([]byte("<template>café</template>")) {
+		t.Fatalf("byte length = %d, want UTF-8 byte count", packet.ByteLength)
+	}
+	if packet.ByteLength == packet.TextLength {
+		t.Fatalf("byte length should differ from text length for non-ASCII text: %+v", packet)
+	}
+	encoded, err := json.Marshal(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(encoded, []byte(`"byte_length":26`)) {
+		t.Fatalf("packet JSON %s missing byte_length", encoded)
+	}
+}
+
+func TestListXFAPacketsWithOptionsFiltersBySelector(t *testing.T) {
+	input := testPDF("<< /Type /Catalog /AcroForm << /XFA [(template) (<template>one</template>) /datasets (<datasets>two</datasets>) (target) (<template>three</template>)] >> >>")
+
+	packets, err := ListXFAPacketsWithOptions(input, XFAPacketListOptions{
+		Selector: XFASelector{PacketKind: "datasets", Label: "datasets"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(packets) != 1 {
+		t.Fatalf("packets = %+v, want one packet", packets)
+	}
+	if packets[0].Index != 1 || packets[0].Label != "datasets" || packets[0].PacketKind != "datasets" || packets[0].Preview != "<datasets>two</datasets>" {
+		t.Fatalf("filtered packet = %+v", packets[0])
 	}
 }
 
@@ -268,11 +437,11 @@ func TestListXFAPacketsReferencedStreamDecodeError(t *testing.T) {
 		wantDecodeError string
 	}{
 		{
-			name:            "unsupported filter",
+			name:            "invalid lzw stream",
 			acroForm:        "<< /Type /Catalog /AcroForm << /XFA 2 0 R >> >>",
 			streamDict:      "<< /Length 6 /Filter /LZWDecode >>",
 			wantFilter:      "/LZWDecode",
-			wantDecodeError: `unsupported PDF stream filter "LZWDecode"`,
+			wantDecodeError: "decode LZWDecode stream: invalid code 393",
 		},
 		{
 			name:            "invalid DecodeParms",

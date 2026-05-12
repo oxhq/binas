@@ -13,7 +13,9 @@ import (
 const (
 	pdfFilterASCII85Decode   = "ASCII85Decode"
 	pdfFilterASCIIHexDecode  = "ASCIIHexDecode"
+	pdfFilterCrypt           = "Crypt"
 	pdfFilterFlateDecode     = "FlateDecode"
+	pdfFilterLZWDecode       = "LZWDecode"
 	pdfFilterRunLengthDecode = "RunLengthDecode"
 )
 
@@ -163,6 +165,172 @@ func runLengthRepeat(input []byte, start int) int {
 	return length
 }
 
+func decodeLZWDecode(input []byte, params pdfLZWDecodeParms) ([]byte, error) {
+	reader := lzwBitReader{input: input}
+	dict := initialLZWDecodeDictionary()
+	nextCode := 258
+	codeWidth := 9
+	var previous []byte
+	var output []byte
+
+	for {
+		code, err := reader.read(codeWidth)
+		if err != nil {
+			if err == io.EOF {
+				return nil, fmt.Errorf("decode LZWDecode stream: missing end-of-data marker")
+			}
+			return nil, fmt.Errorf("decode LZWDecode stream: %w", err)
+		}
+		switch code {
+		case 256:
+			dict = initialLZWDecodeDictionary()
+			nextCode = 258
+			codeWidth = 9
+			previous = nil
+			continue
+		case 257:
+			return output, nil
+		}
+
+		var entry []byte
+		switch {
+		case code < 256:
+			entry = []byte{byte(code)}
+		case code < nextCode:
+			value, ok := dict[code]
+			if !ok {
+				return nil, fmt.Errorf("decode LZWDecode stream: invalid code %d", code)
+			}
+			entry = value
+		case code == nextCode && len(previous) > 0:
+			entry = append(bytes.Clone(previous), previous[0])
+		default:
+			return nil, fmt.Errorf("decode LZWDecode stream: invalid code %d", code)
+		}
+
+		output = append(output, entry...)
+		if len(previous) > 0 && nextCode <= 4095 {
+			dict[nextCode] = append(bytes.Clone(previous), entry[0])
+			nextCode++
+			codeWidth = lzwNextCodeWidth(codeWidth, nextCode, params.earlyChange)
+		}
+		previous = entry
+	}
+}
+
+func encodeLZWDecode(input []byte, params pdfLZWDecodeParms) ([]byte, error) {
+	writer := lzwBitWriter{}
+	dict := initialLZWEncodeDictionary()
+	nextCode := 258
+	codeWidth := 9
+	w := ""
+
+	for _, b := range input {
+		k := string([]byte{b})
+		wk := w + k
+		if _, ok := dict[wk]; ok {
+			w = wk
+			continue
+		}
+		if err := writer.write(dict[w], codeWidth); err != nil {
+			return nil, fmt.Errorf("encode LZWDecode stream: %w", err)
+		}
+		if nextCode <= 4095 {
+			dict[wk] = nextCode
+			nextCode++
+			codeWidth = lzwNextCodeWidth(codeWidth, nextCode, params.earlyChange)
+		}
+		w = k
+	}
+	if w != "" {
+		if err := writer.write(dict[w], codeWidth); err != nil {
+			return nil, fmt.Errorf("encode LZWDecode stream: %w", err)
+		}
+	}
+	if err := writer.write(257, codeWidth); err != nil {
+		return nil, fmt.Errorf("encode LZWDecode stream: %w", err)
+	}
+	return writer.bytes(), nil
+}
+
+func initialLZWDecodeDictionary() map[int][]byte {
+	dict := make(map[int][]byte, 256)
+	for i := 0; i < 256; i++ {
+		dict[i] = []byte{byte(i)}
+	}
+	return dict
+}
+
+func initialLZWEncodeDictionary() map[string]int {
+	dict := make(map[string]int, 256)
+	for i := 0; i < 256; i++ {
+		dict[string([]byte{byte(i)})] = i
+	}
+	return dict
+}
+
+func lzwNextCodeWidth(width, nextCode, earlyChange int) int {
+	if width < 12 && nextCode >= (1<<width)-earlyChange {
+		return width + 1
+	}
+	return width
+}
+
+type lzwBitReader struct {
+	input []byte
+	bit   int
+}
+
+func (r *lzwBitReader) read(width int) (int, error) {
+	if width < 1 || width > 12 {
+		return 0, fmt.Errorf("invalid code width %d", width)
+	}
+	if len(r.input)*8-r.bit < width {
+		return 0, io.EOF
+	}
+	code := 0
+	for range width {
+		b := r.input[r.bit/8]
+		shift := 7 - r.bit%8
+		code = code<<1 | int((b>>shift)&1)
+		r.bit++
+	}
+	return code, nil
+}
+
+type lzwBitWriter struct {
+	output []byte
+	bits   uint32
+	count  int
+}
+
+func (w *lzwBitWriter) write(code, width int) error {
+	if width < 1 || width > 12 {
+		return fmt.Errorf("invalid code width %d", width)
+	}
+	if code < 0 || code >= 1<<width {
+		return fmt.Errorf("code %d does not fit in %d bits", code, width)
+	}
+	w.bits = (w.bits << width) | uint32(code)
+	w.count += width
+	for w.count >= 8 {
+		shift := w.count - 8
+		w.output = append(w.output, byte(w.bits>>shift))
+		w.bits &= (1 << shift) - 1
+		w.count -= 8
+	}
+	return nil
+}
+
+func (w *lzwBitWriter) bytes() []byte {
+	if w.count > 0 {
+		w.output = append(w.output, byte(w.bits<<(8-w.count)))
+		w.bits = 0
+		w.count = 0
+	}
+	return w.output
+}
+
 func asciiHexValue(b byte) (int, bool) {
 	switch {
 	case b >= '0' && b <= '9':
@@ -181,6 +349,15 @@ func decodeStreamFilter(filter string, input []byte) ([]byte, error) {
 }
 
 func decodeStreamFilterWithDecodeParms(filter, decodeParms string, input []byte) ([]byte, error) {
+	return decodeStreamFilterWithDecodeParmsAndCrypt(filter, decodeParms, input, nil)
+}
+
+type pdfStreamCryptHandler struct {
+	Decrypt func(name string, input []byte) ([]byte, error)
+	Encrypt func(name string, input []byte) ([]byte, error)
+}
+
+func decodeStreamFilterWithDecodeParmsAndCrypt(filter, decodeParms string, input []byte, crypt *pdfStreamCryptHandler) ([]byte, error) {
 	filters := parsePDFStreamFilterChain(filter)
 	if len(filters) == 0 {
 		if strings.TrimSpace(decodeParms) != "" {
@@ -203,10 +380,25 @@ func decodeStreamFilterWithDecodeParms(filter, decodeParms string, input []byte)
 			output, err = decodeASCII85Decode(output)
 		case pdfFilterASCIIHexDecode:
 			output, err = decodeASCIIHexDecode(output)
+		case pdfFilterCrypt:
+			name := pdfCryptFilterName(params[i].crypt)
+			if name == "" || name == "Identity" {
+				continue
+			}
+			if crypt == nil || crypt.Decrypt == nil {
+				return nil, fmt.Errorf("unsupported PDF stream crypt filter /%s requires encryption context", name)
+			}
+			output, err = crypt.Decrypt(name, output)
 		case pdfFilterFlateDecode:
 			output, err = decodeFlateDecode(output)
 			if err == nil && params[i].flate != nil {
 				output, err = decodeFlateDecodeParms(output, *params[i].flate)
+			}
+		case pdfFilterLZWDecode:
+			lzwParams := lzwDecodeParmsOrDefault(params[i].lzw)
+			output, err = decodeLZWDecode(output, lzwParams)
+			if err == nil && lzwParams.predictor != nil {
+				output, err = decodeFlateDecodeParms(output, *lzwParams.predictor)
 			}
 		case pdfFilterRunLengthDecode:
 			output, err = decodeRunLengthDecode(output)
@@ -225,6 +417,10 @@ func encodeStreamFilter(filter string, input []byte) ([]byte, error) {
 }
 
 func encodeStreamFilterWithDecodeParms(filter, decodeParms string, input []byte) ([]byte, error) {
+	return encodeStreamFilterWithDecodeParmsAndCrypt(filter, decodeParms, input, nil)
+}
+
+func encodeStreamFilterWithDecodeParmsAndCrypt(filter, decodeParms string, input []byte, crypt *pdfStreamCryptHandler) ([]byte, error) {
 	filters := parsePDFStreamFilterChain(filter)
 	if len(filters) == 0 {
 		if strings.TrimSpace(decodeParms) != "" {
@@ -247,6 +443,15 @@ func encodeStreamFilterWithDecodeParms(filter, decodeParms string, input []byte)
 			output, err = encodeASCII85Decode(output)
 		case pdfFilterASCIIHexDecode:
 			output, err = encodeASCIIHexDecode(output)
+		case pdfFilterCrypt:
+			name := pdfCryptFilterName(params[i].crypt)
+			if name == "" || name == "Identity" {
+				continue
+			}
+			if crypt == nil || crypt.Encrypt == nil {
+				return nil, fmt.Errorf("unsupported PDF stream crypt filter /%s requires encryption context", name)
+			}
+			output, err = crypt.Encrypt(name, output)
 		case pdfFilterFlateDecode:
 			if params[i].flate != nil {
 				output, err = encodeFlateDecodeParms(output, *params[i].flate)
@@ -255,6 +460,15 @@ func encodeStreamFilterWithDecodeParms(filter, decodeParms string, input []byte)
 				}
 			}
 			output, err = encodeFlateDecode(output)
+		case pdfFilterLZWDecode:
+			lzwParams := lzwDecodeParmsOrDefault(params[i].lzw)
+			if lzwParams.predictor != nil {
+				output, err = encodeFlateDecodeParms(output, *lzwParams.predictor)
+				if err != nil {
+					return nil, err
+				}
+			}
+			output, err = encodeLZWDecode(output, lzwParams)
 		case pdfFilterRunLengthDecode:
 			output, err = encodeRunLengthDecode(output)
 		default:
@@ -279,7 +493,21 @@ func isPassthroughPDFStreamFilter(filter string) bool {
 func normalizePDFStreamFilter(filter string) string {
 	filter = strings.TrimSpace(filter)
 	filter = strings.TrimPrefix(filter, "/")
-	return strings.TrimSpace(filter)
+	filter = strings.TrimSpace(filter)
+	switch filter {
+	case "A85":
+		return pdfFilterASCII85Decode
+	case "AHx":
+		return pdfFilterASCIIHexDecode
+	case "Fl":
+		return pdfFilterFlateDecode
+	case "LZW":
+		return pdfFilterLZWDecode
+	case "RL":
+		return pdfFilterRunLengthDecode
+	default:
+		return filter
+	}
 }
 
 func parsePDFStreamFilterChain(filter string) []string {
@@ -307,30 +535,34 @@ func parsePDFStreamFilterChain(filter string) []string {
 }
 
 func isSupportedPDFStreamFilterChain(filters []string) bool {
-	if len(filters) == 1 {
-		return filters[0] == pdfFilterFlateDecode ||
-			filters[0] == pdfFilterASCII85Decode ||
-			filters[0] == pdfFilterASCIIHexDecode ||
-			filters[0] == pdfFilterRunLengthDecode
+	if len(filters) == 0 {
+		return false
 	}
-	if len(filters) == 2 {
-		return (filters[0] == pdfFilterASCII85Decode ||
-			filters[0] == pdfFilterASCIIHexDecode ||
-			filters[0] == pdfFilterRunLengthDecode) &&
-			filters[1] == pdfFilterFlateDecode
+	for _, filter := range filters {
+		if !isSupportedReversiblePDFStreamFilter(filter) {
+			return false
+		}
 	}
-	return len(filters) == 3 &&
-		(((filters[0] == pdfFilterASCII85Decode ||
-			filters[0] == pdfFilterASCIIHexDecode) &&
-			filters[1] == pdfFilterRunLengthDecode) ||
-			(filters[0] == pdfFilterRunLengthDecode &&
-				(filters[1] == pdfFilterASCII85Decode ||
-					filters[1] == pdfFilterASCIIHexDecode))) &&
-		filters[2] == pdfFilterFlateDecode
+	return true
+}
+
+func isSupportedReversiblePDFStreamFilter(filter string) bool {
+	switch filter {
+	case pdfFilterFlateDecode, pdfFilterASCII85Decode, pdfFilterASCIIHexDecode, pdfFilterLZWDecode, pdfFilterRunLengthDecode, pdfFilterCrypt:
+		return true
+	default:
+		return false
+	}
 }
 
 type pdfStreamDecodeParms struct {
+	crypt *pdfCryptDecodeParms
 	flate *pdfFlateDecodeParms
+	lzw   *pdfLZWDecodeParms
+}
+
+type pdfCryptDecodeParms struct {
+	name string
 }
 
 type pdfFlateDecodeParms struct {
@@ -338,6 +570,11 @@ type pdfFlateDecodeParms struct {
 	columns          int
 	colors           int
 	bitsPerComponent int
+}
+
+type pdfLZWDecodeParms struct {
+	earlyChange int
+	predictor   *pdfFlateDecodeParms
 }
 
 func parsePDFStreamDecodeParms(filters []string, decodeParms string) ([]pdfStreamDecodeParms, error) {
@@ -350,14 +587,31 @@ func parsePDFStreamDecodeParms(filters []string, decodeParms string) ([]pdfStrea
 		return params, nil
 	}
 	if strings.HasPrefix(decodeParms, "<<") {
-		if len(filters) != 1 || filters[0] != pdfFilterFlateDecode {
-			return nil, fmt.Errorf("unsupported stream: direct /DecodeParms dictionary only supports /FlateDecode")
+		if len(filters) != 1 {
+			return nil, fmt.Errorf("unsupported stream: direct /DecodeParms dictionary requires a single /Filter")
 		}
-		flate, err := parseFlateDecodeParmsDictionary(decodeParms)
-		if err != nil {
-			return nil, err
+		switch filters[0] {
+		case pdfFilterCrypt:
+			crypt, err := parseCryptDecodeParmsDictionary(decodeParms)
+			if err != nil {
+				return nil, err
+			}
+			params[0].crypt = &crypt
+		case pdfFilterFlateDecode:
+			flate, err := parseFlateDecodeParmsDictionary(decodeParms)
+			if err != nil {
+				return nil, err
+			}
+			params[0].flate = &flate
+		case pdfFilterLZWDecode:
+			lzw, err := parseLZWDecodeParmsDictionary(decodeParms)
+			if err != nil {
+				return nil, err
+			}
+			params[0].lzw = &lzw
+		default:
+			return nil, fmt.Errorf("unsupported stream: /DecodeParms for /%s must be null", filters[0])
 		}
-		params[0].flate = &flate
 		return params, nil
 	}
 	if strings.HasPrefix(decodeParms, "[") {
@@ -368,53 +622,82 @@ func parsePDFStreamDecodeParms(filters []string, decodeParms string) ([]pdfStrea
 		if len(values) != len(filters) {
 			return nil, fmt.Errorf("unsupported stream: /DecodeParms array length must match /Filter array length")
 		}
-		if len(filters) == 1 && filters[0] == pdfFilterFlateDecode && values[0] != "null" {
-			flate, err := parseFlateDecodeParmsDictionary(values[0])
-			if err != nil {
-				return nil, err
-			}
-			params[0].flate = &flate
+		if pdfDecodeParmsArrayIsAllNull(values) {
 			return params, nil
 		}
-		if len(filters) == 2 &&
-			(filters[0] == pdfFilterASCII85Decode || filters[0] == pdfFilterASCIIHexDecode || filters[0] == pdfFilterRunLengthDecode) &&
-			filters[1] == pdfFilterFlateDecode {
-			if values[0] != "null" {
-				return nil, fmt.Errorf("unsupported stream: /DecodeParms for /%s must be null", filters[0])
+		for i, value := range values {
+			if value == "null" {
+				continue
 			}
-			if values[1] != "null" {
-				flate, err := parseFlateDecodeParmsDictionary(values[1])
+			switch filters[i] {
+			case pdfFilterCrypt:
+				crypt, err := parseCryptDecodeParmsDictionary(value)
 				if err != nil {
 					return nil, err
 				}
-				params[1].flate = &flate
-			}
-			return params, nil
-		}
-		if len(filters) == 3 &&
-			(((filters[0] == pdfFilterASCII85Decode || filters[0] == pdfFilterASCIIHexDecode) &&
-				filters[1] == pdfFilterRunLengthDecode) ||
-				(filters[0] == pdfFilterRunLengthDecode &&
-					(filters[1] == pdfFilterASCII85Decode || filters[1] == pdfFilterASCIIHexDecode))) &&
-			filters[2] == pdfFilterFlateDecode {
-			if values[0] != "null" {
-				return nil, fmt.Errorf("unsupported stream: /DecodeParms for /%s must be null", filters[0])
-			}
-			if values[1] != "null" {
-				return nil, fmt.Errorf("unsupported stream: /DecodeParms for /%s must be null", filters[1])
-			}
-			if values[2] != "null" {
-				flate, err := parseFlateDecodeParmsDictionary(values[2])
+				params[i].crypt = &crypt
+			case pdfFilterFlateDecode:
+				flate, err := parseFlateDecodeParmsDictionary(value)
 				if err != nil {
 					return nil, err
 				}
-				params[2].flate = &flate
+				params[i].flate = &flate
+			case pdfFilterLZWDecode:
+				lzw, err := parseLZWDecodeParmsDictionary(value)
+				if err != nil {
+					return nil, err
+				}
+				params[i].lzw = &lzw
+			default:
+				return nil, fmt.Errorf("unsupported stream: /DecodeParms for /%s must be null", filters[i])
 			}
-			return params, nil
 		}
-		return nil, fmt.Errorf("unsupported stream: /DecodeParms array shape is not supported")
+		return params, nil
 	}
 	return nil, fmt.Errorf("unsupported stream: /DecodeParms must be a dictionary, array, or null")
+}
+
+func pdfCryptFilterName(params *pdfCryptDecodeParms) string {
+	if params == nil {
+		return "Identity"
+	}
+	return params.name
+}
+
+func parseCryptDecodeParmsDictionary(value string) (pdfCryptDecodeParms, error) {
+	input := []byte(strings.TrimSpace(value))
+	parser := pdfValueParser{input: input}
+	parsed, err := parser.parseValue()
+	if err != nil {
+		return pdfCryptDecodeParms{}, fmt.Errorf("unsupported stream: /DecodeParms /Crypt dictionary is malformed: %w", err)
+	}
+	parser.skipSpaceAndComments()
+	if parser.i != len(input) {
+		return pdfCryptDecodeParms{}, fmt.Errorf("unsupported stream: /DecodeParms /Crypt dictionary has trailing data")
+	}
+	dict, ok := parsed.(pdfDict)
+	if !ok {
+		return pdfCryptDecodeParms{}, fmt.Errorf("unsupported stream: /DecodeParms /Crypt must be a direct dictionary")
+	}
+	for name := range dict {
+		if name != "Name" {
+			return pdfCryptDecodeParms{}, fmt.Errorf("unsupported stream: /DecodeParms /Crypt key /%s is not supported", name)
+		}
+	}
+	name, ok := dictPDFName(dict, "Name")
+	if !ok || name == "" {
+		name = "Identity"
+	}
+	return pdfCryptDecodeParms{name: name}, nil
+}
+
+func pdfDecodeParmsArrayIsAllNull(values []string) bool {
+	for _, value := range values {
+		if value != "null" {
+			return false
+		}
+	}
+	return true
 }
 
 func parsePDFDecodeParmsArray(value string) ([]string, error) {
@@ -462,33 +745,96 @@ func parseFlateDecodeParmsDictionary(value string) (pdfFlateDecodeParms, error) 
 			return pdfFlateDecodeParms{}, fmt.Errorf("unsupported stream: /DecodeParms key /%s is not supported", name)
 		}
 	}
-	predictor, ok, err := decodeParmsInteger(dict, "Predictor")
+	params, ok, err := parsePredictorDecodeParmsDictionary(dict)
 	if err != nil {
 		return pdfFlateDecodeParms{}, err
 	}
 	if !ok {
 		return pdfFlateDecodeParms{}, fmt.Errorf("unsupported stream: /DecodeParms /Predictor is missing")
 	}
+	return params, nil
+}
+
+func parsePredictorDecodeParmsDictionary(dict []byte) (pdfFlateDecodeParms, bool, error) {
+	predictor, ok, err := decodeParmsInteger(dict, "Predictor")
+	if err != nil {
+		return pdfFlateDecodeParms{}, false, err
+	}
+	if !ok {
+		return pdfFlateDecodeParms{}, false, nil
+	}
 	if predictor == 1 {
 		if err := validateFlateDecodeParmsPredictor1Defaults(dict); err != nil {
-			return pdfFlateDecodeParms{}, err
+			return pdfFlateDecodeParms{}, true, err
 		}
-		return pdfFlateDecodeParms{predictor: predictor}, nil
+		return pdfFlateDecodeParms{predictor: predictor}, true, nil
 	}
 	if predictor == 2 {
 		params, err := parseFlateDecodeParmsPredictorGeometry(dict, predictor, "TIFF", true)
 		if err != nil {
-			return pdfFlateDecodeParms{}, err
+			return pdfFlateDecodeParms{}, true, err
 		}
-		if _, err := tiffPredictorRowBytes(params); err != nil {
-			return pdfFlateDecodeParms{}, err
+		if _, _, err := tiffPredictorGeometry(params); err != nil {
+			return pdfFlateDecodeParms{}, true, err
 		}
-		return params, nil
+		return params, true, nil
 	}
 	if predictor < 10 || predictor > 15 {
-		return pdfFlateDecodeParms{}, fmt.Errorf("unsupported stream: /DecodeParms is not implemented")
+		return pdfFlateDecodeParms{}, true, fmt.Errorf("unsupported stream: /DecodeParms is not implemented")
 	}
-	return parseFlateDecodeParmsPredictorGeometry(dict, predictor, "PNG", true)
+	params, err := parseFlateDecodeParmsPredictorGeometry(dict, predictor, "PNG", true)
+	if err != nil {
+		return pdfFlateDecodeParms{}, true, err
+	}
+	return params, true, nil
+}
+
+func parseLZWDecodeParmsDictionary(value string) (pdfLZWDecodeParms, error) {
+	dict := []byte(strings.TrimSpace(value))
+	if len(dict) < 4 || dict[0] != '<' || dict[1] != '<' || dict[len(dict)-2] != '>' || dict[len(dict)-1] != '>' {
+		return pdfLZWDecodeParms{}, fmt.Errorf("unsupported stream: /DecodeParms must be a direct dictionary")
+	}
+	names := decodeParmsDictionaryNames(dict)
+	hasPredictorDecodeParms := false
+	for _, name := range names {
+		switch name {
+		case "EarlyChange":
+		case "Predictor", "Columns", "Colors", "BitsPerComponent":
+			hasPredictorDecodeParms = true
+		default:
+			return pdfLZWDecodeParms{}, fmt.Errorf("unsupported stream: /DecodeParms key /%s is not supported", name)
+		}
+	}
+	earlyChange, ok, err := decodeParmsInteger(dict, "EarlyChange")
+	if err != nil {
+		return pdfLZWDecodeParms{}, err
+	}
+	if !ok {
+		earlyChange = 1
+	}
+	if earlyChange != 0 && earlyChange != 1 {
+		return pdfLZWDecodeParms{}, fmt.Errorf("unsupported stream: /DecodeParms /EarlyChange must be 0 or 1")
+	}
+	params := pdfLZWDecodeParms{earlyChange: earlyChange}
+	if !hasPredictorDecodeParms {
+		return params, nil
+	}
+	predictor, ok, err := parsePredictorDecodeParmsDictionary(dict)
+	if err != nil {
+		return pdfLZWDecodeParms{}, err
+	}
+	if !ok {
+		return pdfLZWDecodeParms{}, fmt.Errorf("unsupported stream: /DecodeParms /Predictor is missing")
+	}
+	params.predictor = &predictor
+	return params, nil
+}
+
+func lzwDecodeParmsOrDefault(params *pdfLZWDecodeParms) pdfLZWDecodeParms {
+	if params == nil {
+		return pdfLZWDecodeParms{earlyChange: 1}
+	}
+	return *params
 }
 
 func validateFlateDecodeParmsPredictor1Defaults(dict []byte) error {
@@ -522,9 +868,6 @@ func parseFlateDecodeParmsPredictorGeometry(dict []byte, predictor int, label st
 			return pdfFlateDecodeParms{}, fmt.Errorf("unsupported stream: /DecodeParms PNG predictors require /Colors >= 1")
 		}
 		return pdfFlateDecodeParms{}, fmt.Errorf("unsupported stream: /DecodeParms %s predictor requires /Colors >= 1", label)
-	}
-	if label == "PNG" && !decodeParmsHasInteger(dict, "Columns") && colors != 1 {
-		return pdfFlateDecodeParms{}, fmt.Errorf("unsupported stream: /DecodeParms PNG predictors require /Colors 1")
 	}
 	bitsPerComponent, ok, err := decodeParmsInteger(dict, "BitsPerComponent")
 	if err != nil {
@@ -613,25 +956,16 @@ func decodeParmsInteger(dict []byte, name string) (int, bool, error) {
 	}
 }
 
-func decodeParmsHasInteger(dict []byte, name string) bool {
-	_, ok, err := decodeParmsInteger(dict, name)
-	return ok && err == nil
-}
-
 func decodeFlateDecodeParms(input []byte, params pdfFlateDecodeParms) ([]byte, error) {
 	if params.predictor == 1 {
 		return input, nil
 	}
 	if params.predictor == 2 {
-		rowBytes, err := tiffPredictorRowBytes(params)
+		rowBytes, sampleCount, err := tiffPredictorGeometry(params)
 		if err != nil {
 			return nil, err
 		}
-		bytesPerPixel, err := tiffPredictorBytesPerPixel(params)
-		if err != nil {
-			return nil, err
-		}
-		return decodeTIFFRows(input, rowBytes, bytesPerPixel)
+		return decodeTIFFRows(input, rowBytes, sampleCount, params.colors, params.bitsPerComponent)
 	}
 	rowBytes, err := pngPredictorRowBytes(params)
 	if err != nil {
@@ -649,15 +983,11 @@ func encodeFlateDecodeParms(input []byte, params pdfFlateDecodeParms) ([]byte, e
 		return input, nil
 	}
 	if params.predictor == 2 {
-		rowBytes, err := tiffPredictorRowBytes(params)
+		rowBytes, sampleCount, err := tiffPredictorGeometry(params)
 		if err != nil {
 			return nil, err
 		}
-		bytesPerPixel, err := tiffPredictorBytesPerPixel(params)
-		if err != nil {
-			return nil, err
-		}
-		return encodeTIFFRows(input, rowBytes, bytesPerPixel)
+		return encodeTIFFRows(input, rowBytes, sampleCount, params.colors, params.bitsPerComponent)
 	}
 	rowBytes, err := pngPredictorRowBytes(params)
 	if err != nil {
@@ -667,14 +997,36 @@ func encodeFlateDecodeParms(input []byte, params pdfFlateDecodeParms) ([]byte, e
 }
 
 func pngPredictorRowBytes(params pdfFlateDecodeParms) (int, error) {
-	return predictorRowBytes(params, "PNG")
+	rowBits, err := predictorRowBits(params, "PNG")
+	if err != nil {
+		return 0, err
+	}
+	return (rowBits + 7) / 8, nil
 }
 
 func tiffPredictorRowBytes(params pdfFlateDecodeParms) (int, error) {
-	return predictorRowBytes(params, "TIFF")
+	rowBits, err := predictorRowBits(params, "TIFF")
+	if err != nil {
+		return 0, err
+	}
+	return (rowBits + 7) / 8, nil
 }
 
-func predictorRowBytes(params pdfFlateDecodeParms, label string) (int, error) {
+func tiffPredictorGeometry(params pdfFlateDecodeParms) (int, int, error) {
+	rowBytes, err := tiffPredictorRowBytes(params)
+	if err != nil {
+		return 0, 0, err
+	}
+	if params.bitsPerComponent > 32 {
+		return 0, 0, fmt.Errorf("unsupported stream: /DecodeParms TIFF predictor requires /BitsPerComponent <= 32")
+	}
+	if params.columns > int(^uint(0)>>1)/params.colors {
+		return 0, 0, fmt.Errorf("TIFF predictor stream: sample count overflows")
+	}
+	return rowBytes, params.columns * params.colors, nil
+}
+
+func predictorRowBits(params pdfFlateDecodeParms, label string) (int, error) {
 	if params.columns < 1 {
 		return 0, fmt.Errorf("%s predictor stream: invalid columns", label)
 	}
@@ -691,19 +1043,11 @@ func predictorRowBytes(params pdfFlateDecodeParms, label string) (int, error) {
 	if params.columns > int(^uint(0)>>1)/bitsPerColumn {
 		return 0, fmt.Errorf("%s predictor stream: row width overflows", label)
 	}
-	rowBits := params.columns * bitsPerColumn
-	if rowBits%8 != 0 {
-		return 0, fmt.Errorf("unsupported stream: /DecodeParms %s predictor row width must be byte-aligned", label)
-	}
-	return rowBits / 8, nil
+	return params.columns * bitsPerColumn, nil
 }
 
 func pngPredictorBytesPerPixel(params pdfFlateDecodeParms) (int, error) {
 	return predictorBytesPerPixel(params, "PNG")
-}
-
-func tiffPredictorBytesPerPixel(params pdfFlateDecodeParms) (int, error) {
-	return predictorBytesPerPixel(params, "TIFF")
 }
 
 func predictorBytesPerPixel(params pdfFlateDecodeParms, label string) (int, error) {
@@ -776,49 +1120,101 @@ func encodePNGOneByteRows(input []byte, columns int) ([]byte, error) {
 	return encodePNGRows(input, columns)
 }
 
-func decodeTIFFRows(input []byte, rowBytes, bytesPerPixel int) ([]byte, error) {
+func decodeTIFFRows(input []byte, rowBytes, sampleCount, colors, bitsPerComponent int) ([]byte, error) {
 	if rowBytes < 1 {
 		return nil, fmt.Errorf("decode TIFF predictor stream: invalid row width")
 	}
-	if bytesPerPixel < 1 {
-		return nil, fmt.Errorf("decode TIFF predictor stream: invalid bytes per pixel")
+	if sampleCount < 1 {
+		return nil, fmt.Errorf("decode TIFF predictor stream: invalid sample count")
+	}
+	if colors < 1 {
+		return nil, fmt.Errorf("decode TIFF predictor stream: invalid colors")
+	}
+	if bitsPerComponent < 1 || bitsPerComponent > 32 {
+		return nil, fmt.Errorf("decode TIFF predictor stream: invalid bits per component")
 	}
 	if len(input)%rowBytes != 0 {
 		return nil, fmt.Errorf("decode TIFF predictor stream: partial row")
 	}
 	output := make([]byte, 0, len(input))
+	mask := tiffPredictorSampleMask(bitsPerComponent)
 	for rowStart := 0; rowStart < len(input); rowStart += rowBytes {
 		row := bytes.Clone(input[rowStart : rowStart+rowBytes])
-		for col := bytesPerPixel; col < rowBytes; col++ {
-			row[col] += row[col-bytesPerPixel]
+		for sample := 0; sample < sampleCount; sample++ {
+			value := readPackedTIFFSample(row, sample, bitsPerComponent)
+			if sample >= colors {
+				left := readPackedTIFFSample(row, sample-colors, bitsPerComponent)
+				value = (value + left) & mask
+			}
+			writePackedTIFFSample(row, sample, bitsPerComponent, value)
 		}
 		output = append(output, row...)
 	}
 	return output, nil
 }
 
-func encodeTIFFRows(input []byte, rowBytes, bytesPerPixel int) ([]byte, error) {
+func encodeTIFFRows(input []byte, rowBytes, sampleCount, colors, bitsPerComponent int) ([]byte, error) {
 	if rowBytes < 1 {
 		return nil, fmt.Errorf("encode TIFF predictor stream: invalid row width")
 	}
-	if bytesPerPixel < 1 {
-		return nil, fmt.Errorf("encode TIFF predictor stream: invalid bytes per pixel")
+	if sampleCount < 1 {
+		return nil, fmt.Errorf("encode TIFF predictor stream: invalid sample count")
+	}
+	if colors < 1 {
+		return nil, fmt.Errorf("encode TIFF predictor stream: invalid colors")
+	}
+	if bitsPerComponent < 1 || bitsPerComponent > 32 {
+		return nil, fmt.Errorf("encode TIFF predictor stream: invalid bits per component")
 	}
 	if len(input)%rowBytes != 0 {
 		return nil, fmt.Errorf("encode TIFF predictor stream: partial row")
 	}
 	output := make([]byte, 0, len(input))
+	mask := tiffPredictorSampleMask(bitsPerComponent)
 	for rowStart := 0; rowStart < len(input); rowStart += rowBytes {
-		row := input[rowStart : rowStart+rowBytes]
-		for col, decoded := range row {
-			if col < bytesPerPixel {
-				output = append(output, decoded)
-				continue
+		decodedRow := input[rowStart : rowStart+rowBytes]
+		encodedRow := bytes.Clone(decodedRow)
+		for sample := 0; sample < sampleCount; sample++ {
+			value := readPackedTIFFSample(decodedRow, sample, bitsPerComponent)
+			if sample >= colors {
+				left := readPackedTIFFSample(decodedRow, sample-colors, bitsPerComponent)
+				value = (value - left) & mask
 			}
-			output = append(output, decoded-row[col-bytesPerPixel])
+			writePackedTIFFSample(encodedRow, sample, bitsPerComponent, value)
 		}
+		output = append(output, encodedRow...)
 	}
 	return output, nil
+}
+
+func tiffPredictorSampleMask(bitsPerComponent int) uint64 {
+	return (uint64(1) << bitsPerComponent) - 1
+}
+
+func readPackedTIFFSample(row []byte, sample, bitsPerComponent int) uint64 {
+	bitOffset := sample * bitsPerComponent
+	var value uint64
+	for bit := 0; bit < bitsPerComponent; bit++ {
+		position := bitOffset + bit
+		b := row[position/8]
+		shift := 7 - position%8
+		value = value<<1 | uint64((b>>shift)&1)
+	}
+	return value
+}
+
+func writePackedTIFFSample(row []byte, sample, bitsPerComponent int, value uint64) {
+	bitOffset := sample * bitsPerComponent
+	for bit := 0; bit < bitsPerComponent; bit++ {
+		position := bitOffset + bit
+		shift := 7 - position%8
+		mask := byte(1 << shift)
+		if (value>>(bitsPerComponent-1-bit))&1 == 1 {
+			row[position/8] |= mask
+			continue
+		}
+		row[position/8] &^= mask
+	}
 }
 
 func encodePNGRows(input []byte, rowBytes int) ([]byte, error) {

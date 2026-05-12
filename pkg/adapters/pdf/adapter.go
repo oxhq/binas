@@ -23,6 +23,36 @@ func NewAdapter() Adapter {
 	return Adapter{}
 }
 
+func ParseWithPassword(input []byte, opts core.ParseOptions, password string) (*core.Tree, error) {
+	return ParseWithSecurityOptions(input, opts, SecurityOptions{Password: password})
+}
+
+func ParseWithSecurityOptions(input []byte, opts core.ParseOptions, security SecurityOptions) (*core.Tree, error) {
+	if strings.TrimSpace(security.Password) == "" &&
+		security.SignatureInvalidation != SignatureInvalidationInvalidate &&
+		security.SignatureInvalidation != SignatureInvalidationPreserveIncremental {
+		return NewAdapter().Parse(input, opts)
+	}
+	if !bytes.HasPrefix(input, []byte("%PDF-")) {
+		return nil, errors.New("not a PDF file")
+	}
+	if opts.Strict && !bytes.Contains(input, []byte("%%EOF")) {
+		return nil, errors.New("malformed PDF: missing EOF marker")
+	}
+	parseOpts := pdfGraphParseOptions{
+		AllowEncryption: strings.TrimSpace(security.Password) != "",
+		AllowSignature:  security.SignatureInvalidation == SignatureInvalidationInvalidate || security.SignatureInvalidation == SignatureInvalidationPreserveIncremental,
+		Password:        security.Password,
+	}
+	graph, err := parsePDFGraphWithOptions(input, parseOpts)
+	if err != nil {
+		return nil, err
+	}
+	tree := graph.toTree(input)
+	enrichPDFStreamNodeMetadata(tree)
+	return tree, nil
+}
+
 func (Adapter) Detect(input []byte) (core.Confidence, error) {
 	if bytes.HasPrefix(input, []byte("%PDF-")) {
 		return 1, nil
@@ -37,7 +67,7 @@ func (Adapter) Parse(input []byte, opts core.ParseOptions) (*core.Tree, error) {
 	if opts.Strict && !bytes.Contains(input, []byte("%%EOF")) {
 		return nil, errors.New("malformed PDF: missing EOF marker")
 	}
-	boundaries := summarizeResidualBoundaries(input)
+	boundaries := summarizeResidualBoundariesForInput(input)
 	if err := rejectUnsupportedSecurityBoundaries(boundaries); err != nil {
 		return nil, err
 	}
@@ -80,6 +110,10 @@ func (Adapter) Parse(input []byte, opts core.ParseOptions) (*core.Tree, error) {
 
 func documentTree(input []byte, boundaries residualBoundarySummary, xref xrefSummary) *core.Tree {
 	tree := &core.Tree{Format: "pdf"}
+	hybridStreamObject := any(nil)
+	if xref.HasHybridStream && xref.HybridStreamObject.Number > 0 {
+		hybridStreamObject = xref.HybridStreamObject
+	}
 	tree.Root = tree.AddNode(core.Node{
 		Kind: KindDocument,
 		Span: core.Span{Start: 0, End: int64(len(input))},
@@ -97,11 +131,14 @@ func documentTree(input []byte, boundaries residualBoundarySummary, xref xrefSum
 				"has_cmap_markers":      boundaries.HasCMapMarkers,
 				"has_tounicode_cmap":    boundaries.HasToUnicodeCMap,
 				"has_cid_font_markers":  boundaries.HasCIDFontMarkers,
-				"text_decoding_support": "simple literal, ASCII hex operands, page font-scoped ToUnicode CMaps for simple Tf flows, and one unambiguous ToUnicode CMap fallback",
+				"text_decoding_support": "simple literal operands, ASCII hex operands, literal/hex TJ arrays, page font-scoped ToUnicode CMaps for simple Tf flows, CMap-backed TJ hex arrays, and one unambiguous ToUnicode CMap fallback",
 			},
 			"xref": map[string]any{
 				"has_table":             xref.HasTable,
 				"table_offset":          xref.TableOffset,
+				"has_hybrid_stream":     xref.HasHybridStream,
+				"hybrid_stream_offset":  xref.HybridStreamOffset,
+				"hybrid_stream_object":  hybridStreamObject,
 				"has_stream":            xref.HasStream,
 				"stream_count":          len(xref.StreamObjects),
 				"has_object_stream":     xref.HasObjectStream,
@@ -327,23 +364,31 @@ type residualBoundarySummary struct {
 }
 
 func summarizeResidualBoundaries(input []byte) residualBoundarySummary {
-	hasToUnicode := hasPDFName(input, "ToUnicode")
+	hasToUnicode := hasPDFNameOutsideStringOrComment(input, "ToUnicode")
 	hasCMap := hasToUnicode ||
-		hasPDFName(input, "CMap") ||
-		bytes.Contains(input, []byte("begincmap")) ||
-		bytes.Contains(input, []byte("beginbfchar")) ||
-		bytes.Contains(input, []byte("beginbfrange"))
+		hasPDFNameOutsideStringOrComment(input, "CMap") ||
+		hasRawCMapMarkerOutsideStringCommentOrHex(input)
 	return residualBoundarySummary{
-		HasEncryption:     hasPDFName(input, "Encrypt"),
+		HasEncryption:     hasPDFNameOutsideStringOrComment(input, "Encrypt"),
 		HasSignature:      hasPDFSignatureBoundary(input),
-		HasAcroForm:       hasPDFName(input, "AcroForm"),
-		HasXFA:            hasPDFName(input, "XFA"),
-		HasAnnotations:    hasPDFName(input, "Annots"),
-		HasFontMarkers:    hasPDFName(input, "Font"),
+		HasAcroForm:       hasPDFNameOutsideStringOrComment(input, "AcroForm"),
+		HasXFA:            hasPDFNameOutsideStringOrComment(input, "XFA"),
+		HasAnnotations:    hasPDFNameOutsideStringOrComment(input, "Annots"),
+		HasFontMarkers:    hasPDFNameOutsideStringOrComment(input, "Font"),
 		HasCMapMarkers:    hasCMap,
 		HasToUnicodeCMap:  hasToUnicode,
-		HasCIDFontMarkers: hasPDFName(input, "CIDFontType0") || hasPDFName(input, "CIDFontType2") || hasPDFName(input, "CIDToGIDMap"),
+		HasCIDFontMarkers: hasPDFNameOutsideStringOrComment(input, "CIDFontType0") || hasPDFNameOutsideStringOrComment(input, "CIDFontType2") || hasPDFNameOutsideStringOrComment(input, "CIDToGIDMap"),
 	}
+}
+
+func summarizeResidualBoundariesForInput(input []byte) residualBoundarySummary {
+	boundaries := summarizeResidualBoundaries(input)
+	if trailer := parseLastTrailerDictionary(input); trailer != nil {
+		if _, ok := trailer["Encrypt"]; ok {
+			boundaries.HasEncryption = true
+		}
+	}
+	return boundaries
 }
 
 func hasPDFSignatureBoundary(input []byte) bool {
@@ -353,6 +398,71 @@ func hasPDFSignatureBoundary(input []byte) bool {
 		}
 	}
 	return false
+}
+
+func hasRawCMapMarkerOutsideStringCommentOrHex(input []byte) bool {
+	markers := [][]byte{
+		[]byte("begincmap"),
+		[]byte("beginbfchar"),
+		[]byte("beginbfrange"),
+	}
+	literalDepth := 0
+	escaped := false
+	for i := 0; i < len(input); i++ {
+		if literalDepth > 0 {
+			if escaped {
+				escaped = false
+				continue
+			}
+			switch input[i] {
+			case '\\':
+				escaped = true
+			case '(':
+				literalDepth++
+			case ')':
+				literalDepth--
+			}
+			continue
+		}
+		switch input[i] {
+		case '(':
+			literalDepth = 1
+			continue
+		case '%':
+			for i < len(input) && input[i] != '\r' && input[i] != '\n' {
+				i++
+			}
+			continue
+		case '<':
+			if i+1 < len(input) && input[i+1] == '<' {
+				i++
+				continue
+			}
+			for i++; i < len(input) && input[i] != '>'; i++ {
+			}
+			continue
+		}
+		for _, marker := range markers {
+			if !bytes.HasPrefix(input[i:], marker) {
+				continue
+			}
+			end := i + len(marker)
+			if isBarePDFKeywordStart(input, i) && isPDFTokenEnd(input, end) {
+				return true
+			}
+			i = end - 1
+			break
+		}
+	}
+	return false
+}
+
+func isBarePDFKeywordStart(input []byte, pos int) bool {
+	if pos == 0 {
+		return true
+	}
+	prev := input[pos-1]
+	return prev != '/' && (isPDFSpace(prev) || isPDFDelimiter(prev))
 }
 
 func hasPDFNameOutsideStringOrComment(input []byte, name string) bool {
@@ -464,9 +574,6 @@ func parseStreams(input []byte, tree *core.Tree, root core.NodeID, cmapContext p
 		decodedBytes, err := decodeStreamFilterWithDecodeParms(stream.filter, stream.decodeParms, streamBytes)
 		if err != nil {
 			streamMeta["unsupported"] = err.Error()
-			if isPDFStreamFilterArray(stream.filter) && strings.HasPrefix(err.Error(), "unsupported PDF stream filter ") {
-				streamMeta["unsupported"] = "unsupported stream: /Filter arrays are not implemented"
-			}
 			streamID := tree.AddNode(core.Node{
 				Kind: KindStream,
 				Span: core.Span{Start: int64(stream.dataStart), End: int64(stream.dataEnd)},
@@ -492,6 +599,7 @@ func parseStreams(input []byte, tree *core.Tree, root core.NodeID, cmapContext p
 			decodedContent:    bytes.Clone(decodedBytes),
 			toUnicode:         cmapContext.fallback,
 			fontToUnicode:     cmapContext.fontCMapsForStream(stream.dataStart),
+			fontMetrics:       cmapContext.fontMetricsForStream(stream.dataStart),
 		})
 		pos = stream.endstreamAt + len("endstream")
 	}
@@ -1009,6 +1117,7 @@ type textShowContext struct {
 	decodedContent    []byte
 	toUnicode         *toUnicodeCMap
 	fontToUnicode     map[string]*toUnicodeCMap
+	fontMetrics       map[string]pdfSimpleFontMetrics
 }
 
 func parseTextShow(input []byte, start, end int, tree *core.Tree, streamID core.NodeID, ctx textShowContext) {
@@ -1030,7 +1139,7 @@ func parseTextShow(input []byte, start, end int, tree *core.Tree, streamID core.
 		)
 		switch input[i] {
 		case '[':
-			arrayDecoded, arrayEncoded, arrayEnd, arrayOK := parseSimpleTJArrayText(input, i, end, ctx.cmapForFont(activeFont))
+			arrayDecoded, arrayEncoded, arrayEnd, arrayUsedCMap, arrayOK := parseSimpleTJArrayText(input, i, end, ctx.cmapForFont(activeFont))
 			if !arrayOK {
 				continue
 			}
@@ -1045,6 +1154,9 @@ func parseTextShow(input []byte, start, end int, tree *core.Tree, streamID core.
 			encoded = arrayEncoded
 			decoded = arrayDecoded
 			encoding = "tj-array"
+			if arrayUsedCMap {
+				encoding = "tj-array-cmap"
+			}
 		case '(':
 			closeAt, ok = findLiteralEnd(input, i+1, end)
 			if !ok {
@@ -1091,12 +1203,13 @@ func parseTextShow(input []byte, start, end int, tree *core.Tree, streamID core.
 			"encoded":  encoded,
 			"encoding": encoding,
 		}
-		if encoding == "hex-cmap" {
+		if encoding == "hex-cmap" || encoding == "tj-array-cmap" {
 			meta["cmap"] = ctx.cmapForFont(activeFont)
 			if activeFont != "" {
 				meta["font"] = activeFont
 			}
 		}
+		enrichTextShowFontWidthMetadata(meta, activeFont, encoded, encoding, ctx.fontMetrics)
 		if !isPassthroughPDFStreamFilter(ctx.streamFilter) {
 			span = ctx.streamSpan
 			meta["stream_filter"] = ctx.streamFilter
@@ -1133,6 +1246,13 @@ func encodeTextShowReplacement(target core.Node, replacement string) (string, er
 		return encodeLiteralString(replacement), nil
 	case "tj-array":
 		return "[(" + encodeLiteralString(replacement) + ")]", nil
+	case "tj-array-cmap":
+		cmap, _ := target.Meta["cmap"].(*toUnicodeCMap)
+		encoded, ok := cmap.EncodeHex(replacement)
+		if !ok {
+			return "", errors.New("replacement for ToUnicode TJ array text is not representable by the CMap")
+		}
+		return "[<" + encoded + ">]", nil
 	case "hex":
 		return encodeHexTextString(replacement)
 	case "hex-cmap":
@@ -1147,48 +1267,50 @@ func encodeTextShowReplacement(target core.Node, replacement string) (string, er
 	}
 }
 
-func parseSimpleTJArrayText(input []byte, start, end int, cmap *toUnicodeCMap) (string, string, int, bool) {
+func parseSimpleTJArrayText(input []byte, start, end int, cmap *toUnicodeCMap) (string, string, int, bool, bool) {
 	if start >= end || input[start] != '[' {
-		return "", "", start, false
+		return "", "", start, false, false
 	}
 	var decoded strings.Builder
+	usedCMap := false
 	i := start + 1
 	for {
 		i = skipPDFSpaceAndComments(input, i)
 		if i >= end {
-			return "", "", start, false
+			return "", "", start, false, false
 		}
 		switch input[i] {
 		case ']':
-			return decoded.String(), string(input[start : i+1]), i + 1, true
+			return decoded.String(), string(input[start : i+1]), i + 1, usedCMap, true
 		case '(':
 			closeAt, ok := findLiteralEnd(input, i+1, end)
 			if !ok {
-				return "", "", start, false
+				return "", "", start, false, false
+			}
+			if cmap != nil {
+				return "", "", start, false, false
 			}
 			decoded.WriteString(decodeLiteralString(string(input[i+1 : closeAt])))
 			i = closeAt + 1
 		case '<':
 			if i+1 < end && input[i+1] == '<' {
-				return "", "", start, false
-			}
-			if cmap != nil {
-				return "", "", start, false
+				return "", "", start, false, false
 			}
 			closeAt, ok := findHexStringEnd(input, i+1, end)
 			if !ok {
-				return "", "", start, false
+				return "", "", start, false, false
 			}
-			text, ok := decodeHexTextString(input[i+1 : closeAt])
-			if !ok || !isASCIIText(text) {
-				return "", "", start, false
+			text, used, ok := decodeHexTextStringWithCMap(input[i+1:closeAt], cmap)
+			if !ok || (!used && !isASCIIText(text)) {
+				return "", "", start, false, false
 			}
+			usedCMap = usedCMap || used
 			decoded.WriteString(text)
 			i = closeAt + 1
 		default:
 			numberEnd, ok := scanPDFNumber(input, i, end)
 			if !ok || !isPDFTokenEnd(input, numberEnd) {
-				return "", "", start, false
+				return "", "", start, false, false
 			}
 			i = numberEnd
 		}

@@ -3,6 +3,7 @@ package pdf
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/oxhq/binas/pkg/core"
 )
@@ -32,7 +33,8 @@ type AnnotationContentsEditVerification struct {
 }
 
 type AnnotationContentsEditOptions struct {
-	RemoveAppearance bool
+	RemoveAppearance     bool
+	RegenerateAppearance bool
 }
 
 type AnnotationCandidateMetadata struct {
@@ -44,8 +46,14 @@ type AnnotationCandidateMetadata struct {
 	PageObjectGeneration *int      `json:"page_object_generation,omitempty"`
 	Subtype              string    `json:"subtype,omitempty"`
 	Contents             string    `json:"contents"`
+	Name                 string    `json:"name,omitempty"`
+	Modified             string    `json:"modified,omitempty"`
+	Title                string    `json:"title,omitempty"`
 	HasAppearance        bool      `json:"has_appearance"`
 	Rect                 []float64 `json:"rect,omitempty"`
+	Color                []float64 `json:"color,omitempty"`
+	Border               []float64 `json:"border,omitempty"`
+	QuadPointsCount      int       `json:"quad_points_count,omitempty"`
 	Flags                int       `json:"flags"`
 	FlagNames            []string  `json:"flag_names,omitempty"`
 	Invisible            bool      `json:"invisible"`
@@ -109,6 +117,9 @@ func ApplyAnnotationContentsEdit(input []byte, index int, contents string, optio
 		return nil, AnnotationContentsEditReport{}, AnnotationContentsEditVerification{}, errors.New("annotation index cannot be negative")
 	}
 	opts := annotationContentsEditOptions(options)
+	if opts.RemoveAppearance && opts.RegenerateAppearance {
+		return nil, AnnotationContentsEditReport{}, AnnotationContentsEditVerification{}, errors.New("use only one of --remove-appearance or --regenerate-appearance")
+	}
 	graph, err := parsePDFGraph(input)
 	if err != nil {
 		return nil, AnnotationContentsEditReport{}, AnnotationContentsEditVerification{}, err
@@ -127,6 +138,20 @@ func ApplyAnnotationContentsEdit(input []byte, index int, contents string, optio
 	_, hadAppearance := updated["AP"]
 	if opts.RemoveAppearance {
 		delete(updated, "AP")
+	}
+	appearanceRegenerated := false
+	if opts.RegenerateAppearance {
+		appearance, err := buildBasicAnnotationAppearance(candidate, contents)
+		if err != nil {
+			return nil, AnnotationContentsEditReport{}, AnnotationContentsEditVerification{}, err
+		}
+		appearanceID := nextAnnotationAppearanceObjectID(graph)
+		graph.Objects[appearanceID] = &pdfIndirectObject{
+			ID:    appearanceID,
+			Value: appearance,
+		}
+		updated["AP"] = pdfDict{"N": pdfRef{ID: appearanceID}}
+		appearanceRegenerated = true
 	}
 	if candidate.Object != nil {
 		if stream, ok := candidate.Object.Value.(pdfStreamObject); ok {
@@ -149,7 +174,7 @@ func ApplyAnnotationContentsEdit(input []byte, index int, contents string, optio
 		return nil, AnnotationContentsEditReport{}, AnnotationContentsEditVerification{}, err
 	}
 	appearanceRemoved := opts.RemoveAppearance && hadAppearance
-	verification, err := verifyAnnotationContentsEdit(output, index, contents, graph.pageCount(), appearanceRemoved)
+	verification, err := verifyAnnotationContentsEdit(output, index, contents, graph.pageCount(), appearanceRemoved, appearanceRegenerated)
 	if err != nil {
 		return nil, AnnotationContentsEditReport{}, AnnotationContentsEditVerification{}, err
 	}
@@ -171,10 +196,10 @@ func ApplyAnnotationContentsEdit(input []byte, index int, contents string, optio
 		AnnotationIndex:       index,
 		OldContents:           candidate.OldContent,
 		NewContents:           contents,
-		AppearanceRegenerated: false,
+		AppearanceRegenerated: verification.AppearanceRegenerated,
 		AppearanceInvalidated: appearanceRemoved,
 		AppearanceRemoved:     appearanceRemoved,
-		AppearanceNote:        annotationContentsEditAppearanceNote(appearanceRemoved),
+		AppearanceNote:        annotationContentsEditAppearanceNote(verification.AppearanceRegenerated, appearanceRemoved),
 	}
 	if candidate.Object != nil {
 		report.ObjectNumber = candidate.Object.ID.Number
@@ -191,11 +216,68 @@ func annotationContentsEditOptions(options []AnnotationContentsEditOptions) Anno
 	return out
 }
 
-func annotationContentsEditAppearanceNote(appearanceRemoved bool) string {
-	if appearanceRemoved {
-		return "appearance regeneration is not implemented; stale annotation /AP was removed after updating /Contents"
+func annotationContentsEditAppearanceNote(appearanceRegenerated, appearanceRemoved bool) string {
+	if appearanceRegenerated {
+		return "basic annotation /AP /N appearance stream was regenerated from /Contents and /Rect"
 	}
-	return "appearance regeneration is not implemented; only the annotation dictionary /Contents value was updated"
+	if appearanceRemoved {
+		return "stale annotation /AP was removed after updating /Contents"
+	}
+	return "annotation /Contents was updated; appearance stream was left unchanged"
+}
+
+func buildBasicAnnotationAppearance(candidate annotationCandidate, contents string) (pdfStreamObject, error) {
+	subtype := annotationSubtype(candidate.Dict)
+	switch subtype {
+	case "Text", "FreeText":
+	default:
+		return pdfStreamObject{}, fmt.Errorf("cannot regenerate annotation appearance: unsupported annotation subtype %q", subtype)
+	}
+	rect := annotationRect(candidate.Dict)
+	if len(rect) != 4 || rect[2] <= rect[0] || rect[3] <= rect[1] {
+		return pdfStreamObject{}, fmt.Errorf("cannot regenerate annotation appearance: annotation %d has no usable /Rect", candidate.Index)
+	}
+	width := rect[2] - rect[0]
+	height := rect[3] - rect[1]
+	return basicAnnotationAppearanceStream(width, height, contents)
+}
+
+func basicAnnotationAppearanceStream(width, height float64, contents string) (pdfStreamObject, error) {
+	lines, err := simpleAppearanceTextLines(width, height, contents)
+	if err != nil {
+		return pdfStreamObject{}, fmt.Errorf("cannot regenerate annotation appearance: %w", err)
+	}
+	var data strings.Builder
+	writeSimpleAppearanceText(&data, width, height, lines, true)
+
+	return pdfStreamObject{
+		Dict: pdfDict{
+			"Type":     pdfName("XObject"),
+			"Subtype":  pdfName("Form"),
+			"FormType": 1,
+			"BBox":     pdfArray{0, 0, width, height},
+			"Resources": pdfDict{
+				"Font": pdfDict{
+					"Helv": pdfDict{
+						"Type":     pdfName("Font"),
+						"Subtype":  pdfName("Type1"),
+						"BaseFont": pdfName("Helvetica"),
+					},
+				},
+			},
+		},
+		Data: []byte(data.String()),
+	}, nil
+}
+
+func nextAnnotationAppearanceObjectID(graph *pdfGraph) pdfObjectID {
+	maxObjectNumber := 0
+	for id := range graph.Objects {
+		if id.Number > maxObjectNumber {
+			maxObjectNumber = id.Number
+		}
+	}
+	return pdfObjectID{Number: maxObjectNumber + 1, Generation: 0}
 }
 
 func (g *pdfGraph) annotationCandidates() []annotationCandidate {
@@ -379,13 +461,19 @@ func (p annotationPageReference) dict() pdfDict {
 func (c annotationCandidate) metadata() AnnotationCandidateMetadata {
 	flags := annotationFlags(c.Dict)
 	metadata := AnnotationCandidateMetadata{
-		Index:         c.Index,
-		Subtype:       annotationSubtype(c.Dict),
-		Contents:      c.OldContent,
-		HasAppearance: annotationHasAppearance(c.Dict),
-		Rect:          annotationRect(c.Dict),
-		Flags:         flags,
-		FlagNames:     annotationFlagNames(flags),
+		Index:           c.Index,
+		Subtype:         annotationSubtype(c.Dict),
+		Contents:        c.OldContent,
+		Name:            annotationTextField(c.Dict, "NM"),
+		Modified:        annotationTextField(c.Dict, "M"),
+		Title:           annotationTextField(c.Dict, "T"),
+		HasAppearance:   annotationHasAppearance(c.Dict),
+		Rect:            annotationRect(c.Dict),
+		Color:           annotationNumericArray(c.Dict, "C"),
+		Border:          annotationNumericArray(c.Dict, "Border"),
+		QuadPointsCount: annotationQuadPointsCount(c.Dict),
+		Flags:           flags,
+		FlagNames:       annotationFlagNames(flags),
 	}
 	metadata.Invisible = annotationFlagSet(flags, "invisible")
 	metadata.Hidden = annotationFlagSet(flags, "hidden")
@@ -416,7 +504,7 @@ func (c annotationCandidate) metadata() AnnotationCandidateMetadata {
 	return metadata
 }
 
-func verifyAnnotationContentsEdit(output []byte, index int, contents string, pageCount int, expectAppearanceRemoved bool) (AnnotationContentsEditVerification, error) {
+func verifyAnnotationContentsEdit(output []byte, index int, contents string, pageCount int, expectAppearanceRemoved bool, expectAppearanceRegenerated bool) (AnnotationContentsEditVerification, error) {
 	graph, err := parsePDFGraph(output)
 	if err != nil {
 		return AnnotationContentsEditVerification{}, err
@@ -428,14 +516,52 @@ func verifyAnnotationContentsEdit(output []byte, index int, contents string, pag
 		_, hasAppearance := candidates[index].Dict["AP"]
 		appearanceRemoved = !hasAppearance
 	}
+	appearanceRegenerated := false
+	if expectAppearanceRegenerated && index >= 0 && index < len(candidates) {
+		appearanceRegenerated = annotationHasNormalAppearanceStream(graph, candidates[index].Dict)
+	}
+	if expectAppearanceRegenerated && !appearanceRegenerated {
+		return AnnotationContentsEditVerification{
+			ReparseOK:             true,
+			ContentsUpdated:       updated,
+			PageUnchanged:         pageCount == 0 || graph.pageCount() == pageCount,
+			AppearanceRegenerated: false,
+			AppearanceInvalidated: appearanceRemoved,
+			AppearanceRemoved:     appearanceRemoved,
+		}, errors.New("verification failed: annotation /AP /N appearance stream was not regenerated")
+	}
 	return AnnotationContentsEditVerification{
 		ReparseOK:             true,
 		ContentsUpdated:       updated,
 		PageUnchanged:         pageCount == 0 || graph.pageCount() == pageCount,
-		AppearanceRegenerated: false,
+		AppearanceRegenerated: appearanceRegenerated,
 		AppearanceInvalidated: appearanceRemoved,
 		AppearanceRemoved:     appearanceRemoved,
 	}, nil
+}
+
+func annotationHasNormalAppearanceStream(graph *pdfGraph, dict pdfDict) bool {
+	ap, ok := dict["AP"].(pdfDict)
+	if !ok {
+		return false
+	}
+	switch normal := ap["N"].(type) {
+	case pdfStreamObject:
+		return annotationAppearanceStreamIsFormXObject(normal)
+	case pdfRef:
+		object := graph.Objects[normal.ID]
+		if object == nil {
+			return false
+		}
+		stream, ok := object.Value.(pdfStreamObject)
+		return ok && annotationAppearanceStreamIsFormXObject(stream)
+	default:
+		return false
+	}
+}
+
+func annotationAppearanceStreamIsFormXObject(stream pdfStreamObject) bool {
+	return dictHasType(stream.Dict, "XObject") && annotationSubtype(stream.Dict) == "Form"
 }
 
 func isAnnotationDict(dict pdfDict) bool {
@@ -507,6 +633,30 @@ func annotationRect(dict pdfDict) []float64 {
 	return rect
 }
 
+func annotationNumericArray(dict pdfDict, key string) []float64 {
+	value, ok := dict[key].(pdfArray)
+	if !ok || len(value) == 0 {
+		return nil
+	}
+	numbers := make([]float64, 0, len(value))
+	for _, item := range value {
+		number, ok := pdfNumericValue(item)
+		if !ok {
+			return nil
+		}
+		numbers = append(numbers, number)
+	}
+	return numbers
+}
+
+func annotationQuadPointsCount(dict pdfDict) int {
+	points := annotationNumericArray(dict, "QuadPoints")
+	if len(points) == 0 || len(points)%8 != 0 {
+		return 0
+	}
+	return len(points) / 8
+}
+
 func pdfNumericValue(value pdfValue) (float64, bool) {
 	switch v := value.(type) {
 	case int:
@@ -536,6 +686,25 @@ func annotationContents(dict pdfDict) string {
 		return string(v)
 	default:
 		return fmt.Sprint(v)
+	}
+}
+
+func annotationTextField(dict pdfDict, key string) string {
+	value, ok := dict[key]
+	if !ok {
+		return ""
+	}
+	switch v := value.(type) {
+	case pdfLiteralString:
+		return decodeLiteralString(string(v))
+	case pdfHexString:
+		decoded, ok := decodeAnnotationHexTextString([]byte(v))
+		if ok {
+			return decoded
+		}
+		return ""
+	default:
+		return ""
 	}
 }
 
