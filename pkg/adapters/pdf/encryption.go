@@ -127,7 +127,12 @@ func (g *pdfGraph) decryptStandardSecurityObjects() error {
 		}
 		if stream, ok := object.Value.(pdfStreamObject); ok {
 			if dictHasType(stream.Dict, "XRef") {
-				return unsupportedPDFEncryption("encrypted xref streams are not parser-wired")
+				decrypted, err := decryptPDFXrefStreamValue(g.Encryption.security, g.Encryption.fileKey, object.ID, stream)
+				if err != nil {
+					return fmt.Errorf("decrypt object %d %d: %w", object.ID.Number, object.ID.Generation, err)
+				}
+				object.Value = decrypted
+				continue
 			}
 		}
 		value, err := decryptPDFObjectValue(g.Encryption.security, g.Encryption.fileKey, object.ID, object.Value)
@@ -137,6 +142,25 @@ func (g *pdfGraph) decryptStandardSecurityObjects() error {
 		object.Value = value
 	}
 	return nil
+}
+
+func decryptPDFXrefStreamValue(security *pdfStandardSecurity, fileKey []byte, id pdfObjectID, stream pdfStreamObject) (pdfStreamObject, error) {
+	decrypted := stream
+	if pdfStreamUsesCryptFilter(stream.Dict) || !security.encryptsStreamData(stream.Dict) {
+		return decrypted, nil
+	}
+	decryptedData, err := security.decryptObject(fileKey, id, stream.Data)
+	if err != nil {
+		return pdfStreamObject{}, err
+	}
+	decrypted.Data = decryptedData
+	if _, err := parsePDFXrefStream(decrypted.Dict, decrypted.Data); err == nil {
+		return decrypted, nil
+	}
+	if _, err := parsePDFXrefStream(stream.Dict, stream.Data); err == nil {
+		return stream, nil
+	}
+	return decrypted, nil
 }
 
 func encryptPDFObjectValue(security *pdfStandardSecurity, fileKey []byte, id pdfObjectID, value pdfValue) (pdfValue, error) {

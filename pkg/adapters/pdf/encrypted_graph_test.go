@@ -328,6 +328,98 @@ func TestEncryptedGraphObjectStreamCanonicalEditWithPasswordInflatesAndReencrypt
 	}
 }
 
+func TestEncryptedGraphXrefStreamCanonicalEditWithPasswordInflatesAndReencrypts(t *testing.T) {
+	input := standardEncryptedXrefStreamTextFixture(t, "08-15-2024")
+
+	graph, err := parsePDFGraphWithOptions(input, pdfGraphParseOptions{
+		AllowEncryption: true,
+		Password:        "user",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if graph.Trailer == nil || graph.Root == nil {
+		t.Fatalf("xref-stream encrypted graph trailer/root = %+v/%+v, want parsed trailer root", graph.Trailer, graph.Root)
+	}
+	if len(graph.XrefStream) != 9 {
+		t.Fatalf("xref stream entries = %d, want 9", len(graph.XrefStream))
+	}
+	tree := graph.toTree(input)
+	if len(tree.Query(core.Match{Kind: KindTextShow, Text: "08-15-2024"})) != 1 {
+		t.Fatal("xref-stream encrypted graph text was not selectable before edit")
+	}
+
+	output, report, verification, err := ApplyCanonicalEditWithPassword(
+		input,
+		"user",
+		core.Match{Kind: KindTextShow, Text: "08-15-2024"},
+		core.Mutation{Replace: "05-05-2026"},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Edit != "pdf.canonical_content_stream_text_rewrite" || report.NodesModified != 1 || report.FallbackUsed {
+		t.Fatalf("report = %+v, want one canonical edit without fallback", report)
+	}
+	if !verification.ReparseOK || !verification.OldTextRemoved || !verification.NewSelectable || !verification.PageUnchanged {
+		t.Fatalf("verification = %+v, want all text invariants true", verification)
+	}
+	if bytes.Contains(output, []byte("/Type /XRef")) {
+		t.Fatal("canonical encrypted output preserved xref stream container")
+	}
+	if bytes.Contains(output, []byte("05-05-2026")) {
+		t.Fatal("canonical encrypted xref-stream output contains plaintext replacement")
+	}
+	tree, err = ParseWithPassword(output, core.ParseOptions{Strict: true}, "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tree.Query(core.Match{Kind: KindTextShow, Text: "08-15-2024"})) != 0 {
+		t.Fatal("old xref-stream text still selectable after edit")
+	}
+	if len(tree.Query(core.Match{Kind: KindTextShow, Text: "05-05-2026"})) != 1 {
+		t.Fatal("new xref-stream text not selectable after edit")
+	}
+}
+
+func TestEncryptedGraphAESV2XrefStreamCanonicalEditWithPasswordInflatesAndReencrypts(t *testing.T) {
+	input := standardEncryptedAESV2XrefStreamTextFixture(t, "08-15-2024")
+
+	output, report, verification, err := ApplyCanonicalEditWithPassword(
+		input,
+		"user",
+		core.Match{Kind: KindTextShow, Text: "08-15-2024"},
+		core.Mutation{Replace: "05-05-2026"},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Edit != "pdf.canonical_content_stream_text_rewrite" || report.NodesModified != 1 || report.FallbackUsed {
+		t.Fatalf("report = %+v, want one canonical AESV2 xref-stream edit without fallback", report)
+	}
+	if !verification.ReparseOK || !verification.OldTextRemoved || !verification.NewSelectable || !verification.PageUnchanged {
+		t.Fatalf("verification = %+v, want all text invariants true", verification)
+	}
+	if bytes.Contains(output, []byte("/Type /XRef")) {
+		t.Fatal("canonical AESV2 encrypted output preserved xref stream container")
+	}
+	if bytes.Contains(output, []byte("05-05-2026")) {
+		t.Fatal("canonical AESV2 encrypted xref-stream output contains plaintext replacement")
+	}
+	tree, err := ParseWithPassword(output, core.ParseOptions{Strict: true}, "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tree.Query(core.Match{Kind: KindTextShow, Text: "08-15-2024"})) != 0 {
+		t.Fatal("old AESV2 xref-stream text still selectable after edit")
+	}
+	if len(tree.Query(core.Match{Kind: KindTextShow, Text: "05-05-2026"})) != 1 {
+		t.Fatal("new AESV2 xref-stream text not selectable after edit")
+	}
+}
+
 func standardEncryptedAESV2TextFixture(t *testing.T, text string) []byte {
 	t.Helper()
 	fileID := []byte("revision4-aes-id")
@@ -383,6 +475,53 @@ func standardEncryptedObjectStreamTextFixture(t *testing.T, text string) []byte 
 		t.Fatal(err)
 	}
 	return encryptedGraphFixturePDFWithEncryptedObjectStream(t, fileID, standardSecurityR2FixtureObject(), encryptedContent, encryptedTitle, encryptedObjectStream, first)
+}
+
+func standardEncryptedXrefStreamTextFixture(t *testing.T, text string) []byte {
+	t.Helper()
+	fileID := []byte("fixture-file-id1")
+	security := mustPDFStandardSecurity(t, standardSecurityR2FixtureDict(), fileID)
+	fileKey, ok, err := security.authenticateUserPassword([]byte("user"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("fixture password did not authenticate")
+	}
+	plaintextStream := []byte(fmt.Sprintf("BT\n(%s) Tj\nET\n", encodeLiteralString(text)))
+	encryptedContent, err := security.decryptRC4Object(fileKey, pdfObjectID{Number: 4, Generation: 0}, plaintextStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encryptedTitle, err := security.decryptRC4Object(fileKey, pdfObjectID{Number: 5, Generation: 0}, []byte("Sensitive Title"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encryptedGraphFixturePDFWithEncryptedXrefStream(t, fileID, security, fileKey, standardSecurityR2FixtureObject(), encryptedContent, encryptedTitle)
+}
+
+func standardEncryptedAESV2XrefStreamTextFixture(t *testing.T, text string) []byte {
+	t.Helper()
+	fileID := []byte("revision4-aes-id")
+	dict := standardSecurityAESV2FixtureDict(t, fileID)
+	security := mustPDFStandardSecurity(t, dict, fileID)
+	fileKey, ok, err := security.authenticateUserPassword([]byte("user"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("fixture password did not authenticate")
+	}
+	plaintextStream := []byte(fmt.Sprintf("BT\n(%s) Tj\nET\n", encodeLiteralString(text)))
+	encryptedContent, err := security.encryptObject(fileKey, pdfObjectID{Number: 4, Generation: 0}, plaintextStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encryptedTitle, err := security.encryptObject(fileKey, pdfObjectID{Number: 5, Generation: 0}, []byte("Sensitive Title"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encryptedGraphFixturePDFWithEncryptedXrefStream(t, fileID, security, fileKey, pdfValueString(t, dict), encryptedContent, encryptedTitle)
 }
 
 func standardEncryptedAESV2CryptFilteredTextFixture(t *testing.T, text, filter, decodeParms string) []byte {
@@ -503,6 +642,58 @@ func encryptedGraphFixturePDFWithObjects(t *testing.T, fileID []byte, encryptObj
 		hex.EncodeToString(fileID),
 		xrefOffset,
 	)
+	return input.Bytes()
+}
+
+func encryptedGraphFixturePDFWithEncryptedXrefStream(t *testing.T, fileID []byte, security *pdfStandardSecurity, fileKey []byte, encryptObject string, contentStream, titleData []byte) []byte {
+	t.Helper()
+
+	var input bytes.Buffer
+	input.WriteString("%PDF-1.5\n")
+	offsets := map[int]int{}
+	writeObject := func(number int, body []byte) {
+		t.Helper()
+		offsets[number] = input.Len()
+		fmt.Fprintf(&input, "%d 0 obj\n", number)
+		input.Write(body)
+		input.WriteString("\nendobj\n")
+	}
+
+	writeObject(1, []byte("<< /Type /Catalog /Pages 2 0 R >>"))
+	writeObject(2, []byte("<< /Type /Pages /Kids [3 0 R] /Count 1 >>"))
+	writeObject(3, []byte("<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>"))
+	offsets[4] = input.Len()
+	input.WriteString("4 0 obj\n")
+	fmt.Fprintf(&input, "<< /Length %d >>\nstream\n", len(contentStream))
+	input.Write(contentStream)
+	input.WriteString("\nendstream\nendobj\n")
+	writeObject(5, []byte(fmt.Sprintf("<< /Title <%s> >>", hex.EncodeToString(titleData))))
+	writeObject(6, []byte(encryptObject))
+
+	xrefOffset := input.Len()
+	offsets[8] = xrefOffset
+	var xrefData bytes.Buffer
+	for number := 0; number <= 8; number++ {
+		offset, ok := offsets[number]
+		if !ok {
+			writeXrefStreamEntry(&xrefData, 0, 0, 0)
+			continue
+		}
+		writeXrefStreamEntry(&xrefData, 1, offset, 0)
+	}
+	encryptedXrefStream, err := security.encryptObject(fileKey, pdfObjectID{Number: 8, Generation: 0}, xrefData.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	input.WriteString("8 0 obj\n")
+	fmt.Fprintf(&input, "<< /Type /XRef /Size 9 /Root 1 0 R /Info 5 0 R /Encrypt 6 0 R /ID [<%s> <%s>] /W [1 4 1] /Length %d >>\nstream\n",
+		hex.EncodeToString(fileID),
+		hex.EncodeToString(fileID),
+		len(encryptedXrefStream),
+	)
+	input.Write(encryptedXrefStream)
+	input.WriteString("\nendstream\nendobj\n")
+	fmt.Fprintf(&input, "startxref\n%d\n%%%%EOF\n", xrefOffset)
 	return input.Bytes()
 }
 

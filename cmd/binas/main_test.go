@@ -779,6 +779,73 @@ func TestCLIEditEncryptedObjectStreamPDFWithPasswordCanonicalInflatesReencryptsA
 	assertCLIQueryCount(t, newQueryOut, 1)
 }
 
+func TestCLIEditEncryptedXrefStreamPDFWithPasswordCanonicalInflatesReencryptsAndVerifies(t *testing.T) {
+	path := writeSupportedEncryptedXrefStreamFixture(t, "08-15-2024")
+	out := filepath.Join(t.TempDir(), "encrypted-xref-stream-out.pdf")
+
+	initialQueryOut := captureStdout(t, func() error {
+		return run([]string{"query", path, "--format", "pdf", "--password", "user", "--kind", "pdf.content.text_show", "--text", "08-15-2024", "--json"})
+	})
+	assertCLIQueryCount(t, initialQueryOut, 1)
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{
+			"edit", path,
+			"--format", "pdf",
+			"--password", "user",
+			"--rewrite", "auto",
+			"--kind", "pdf.content.text_show",
+			"--text", "08-15-2024",
+			"--replace", "05-05-2026",
+			"-o", out,
+			"--json",
+		})
+	})
+	var result struct {
+		Report struct {
+			Edit          string `json:"edit"`
+			NodesModified int    `json:"nodes_modified"`
+			FallbackUsed  bool   `json:"fallback_used"`
+			OutputPath    string `json:"output_path"`
+		} `json:"report"`
+		Verification struct {
+			ReparseOK      bool `json:"reparse_ok"`
+			OldTextRemoved bool `json:"old_text_removed"`
+			NewSelectable  bool `json:"new_text_selectable"`
+			PageUnchanged  bool `json:"page_count_unchanged"`
+		} `json:"verification"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Report.Edit != "pdf.canonical_content_stream_text_rewrite" || result.Report.NodesModified != 1 || result.Report.FallbackUsed || result.Report.OutputPath != out {
+		t.Fatalf("report = %+v, want canonical encrypted xref-stream edit", result.Report)
+	}
+	if !result.Verification.ReparseOK || !result.Verification.OldTextRemoved || !result.Verification.NewSelectable || !result.Verification.PageUnchanged {
+		t.Fatalf("verification = %+v, want all text invariants true", result.Verification)
+	}
+	output, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(output, []byte("/Type /XRef")) {
+		t.Fatal("canonical encrypted output preserved xref stream container")
+	}
+	if bytes.Contains(output, []byte("05-05-2026")) {
+		t.Fatal("encrypted xref-stream output contains plaintext replacement")
+	}
+
+	oldQueryOut := captureStdout(t, func() error {
+		return run([]string{"query", out, "--format", "pdf", "--password", "user", "--kind", "pdf.content.text_show", "--text", "08-15-2024", "--json"})
+	})
+	assertCLIQueryCount(t, oldQueryOut, 0)
+
+	newQueryOut := captureStdout(t, func() error {
+		return run([]string{"query", out, "--format", "pdf", "--password", "user", "--kind", "pdf.content.text_show", "--text", "05-05-2026", "--json"})
+	})
+	assertCLIQueryCount(t, newQueryOut, 1)
+}
+
 func TestCLIEditEncryptedPDFSurgicalPasswordFailsClosed(t *testing.T) {
 	path := writeSupportedEncryptedFixture(t, "08-15-2024")
 	out := filepath.Join(t.TempDir(), "encrypted-out.pdf")
@@ -2646,6 +2713,71 @@ func writeSupportedEncryptedObjectStreamFixture(t *testing.T, text string) strin
 		xrefOffset,
 	)
 	path := filepath.Join(t.TempDir(), "supported-encrypted-object-stream.pdf")
+	if err := os.WriteFile(path, input.Bytes(), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func writeSupportedEncryptedXrefStreamFixture(t *testing.T, text string) string {
+	t.Helper()
+	fileID := []byte("fixture-file-id1")
+	fileKey := cliStandardR2FileKey(t, "user", fileID)
+	content := []byte(fmt.Sprintf("BT\n(%s) Tj\nET\n", strings.ReplaceAll(text, "-", `\055`)))
+	encryptedContent := cliRC4Object(t, fileKey, 4, 0, content)
+	encryptedTitle := cliRC4Object(t, fileKey, 5, 0, []byte("Sensitive Title"))
+
+	var input bytes.Buffer
+	input.WriteString("%PDF-1.5\n")
+	offsets := map[int]int{}
+	writeObject := func(number int, body []byte) {
+		t.Helper()
+		offsets[number] = input.Len()
+		fmt.Fprintf(&input, "%d 0 obj\n", number)
+		input.Write(body)
+		input.WriteString("\nendobj\n")
+	}
+	writeObject(1, []byte("<< /Type /Catalog /Pages 2 0 R >>"))
+	writeObject(2, []byte("<< /Type /Pages /Kids [3 0 R] /Count 1 >>"))
+	writeObject(3, []byte("<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>"))
+	offsets[4] = input.Len()
+	input.WriteString("4 0 obj\n")
+	fmt.Fprintf(&input, "<< /Length %d >>\nstream\n", len(encryptedContent))
+	input.Write(encryptedContent)
+	input.WriteString("\nendstream\nendobj\n")
+	writeObject(5, []byte(fmt.Sprintf("<< /Title <%s> >>", hex.EncodeToString(encryptedTitle))))
+	writeObject(6, []byte(`<<
+/Filter /Standard
+/V 1
+/R 2
+/O <000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f>
+/U <f2e39758794025127846c07006961602075fb11d4b5c227e0b27c9a2abb73e61>
+/P -44
+>>`))
+
+	xrefOffset := input.Len()
+	offsets[8] = xrefOffset
+	xrefData := make([]byte, 0, 9*6)
+	for number := 0; number <= 8; number++ {
+		offset, ok := offsets[number]
+		if !ok {
+			xrefData = appendXrefStreamEntry(xrefData, 0, 0, 0)
+			continue
+		}
+		xrefData = appendXrefStreamEntry(xrefData, 1, offset, 0)
+	}
+	encryptedXrefData := cliRC4Object(t, fileKey, 8, 0, xrefData)
+	input.WriteString("8 0 obj\n")
+	fmt.Fprintf(&input, "<< /Type /XRef /Size 9 /Root 1 0 R /Info 5 0 R /Encrypt 6 0 R /ID [<%s> <%s>] /W [1 4 1] /Length %d >>\nstream\n",
+		hex.EncodeToString(fileID),
+		hex.EncodeToString(fileID),
+		len(encryptedXrefData),
+	)
+	input.Write(encryptedXrefData)
+	input.WriteString("\nendstream\nendobj\n")
+	fmt.Fprintf(&input, "startxref\n%d\n%%%%EOF\n", xrefOffset)
+
+	path := filepath.Join(t.TempDir(), "supported-encrypted-xref-stream.pdf")
 	if err := os.WriteFile(path, input.Bytes(), 0644); err != nil {
 		t.Fatal(err)
 	}

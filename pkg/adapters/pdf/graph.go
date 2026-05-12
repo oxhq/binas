@@ -107,6 +107,9 @@ func parsePDFGraphWithOptions(input []byte, opts pdfGraphParseOptions) (*pdfGrap
 		return nil, err
 	}
 	graph.Trailer = parseLastTrailerDictionary(input)
+	if graph.Trailer == nil {
+		graph.Trailer = graph.xrefStreamTrailer(input)
+	}
 	if boundaries.HasEncryption {
 		encryption, err := graph.prepareStandardSecurityEncryption([]byte(opts.Password))
 		if err != nil {
@@ -139,6 +142,7 @@ func parsePDFGraphWithOptions(input []byte, opts pdfGraphParseOptions) (*pdfGrap
 			return nil, err
 		}
 		graph.XrefStream = append(graph.XrefStream, entries...)
+		graph.Xref.UnsupportedXrefStream = false
 		if graph.Trailer == nil {
 			graph.Trailer = clonePDFDict(stream.Dict)
 		}
@@ -149,6 +153,33 @@ func parsePDFGraphWithOptions(input []byte, opts pdfGraphParseOptions) (*pdfGrap
 		graph.Root = &root
 	}
 	return graph, nil
+}
+
+func (g *pdfGraph) xrefStreamTrailer(input []byte) pdfDict {
+	if g == nil {
+		return nil
+	}
+	if offset, err := lastStartXrefOffset(input); err == nil {
+		for _, object := range sortedPDFObjects(g.Objects) {
+			if object.Offset != offset {
+				continue
+			}
+			if stream, ok := object.Value.(pdfStreamObject); ok && dictHasType(stream.Dict, "XRef") {
+				return clonePDFDict(stream.Dict)
+			}
+		}
+	}
+	var latest pdfDict
+	latestOffset := -1
+	for _, object := range sortedPDFObjects(g.Objects) {
+		stream, ok := object.Value.(pdfStreamObject)
+		if !ok || !dictHasType(stream.Dict, "XRef") || object.Offset < latestOffset {
+			continue
+		}
+		latest = clonePDFDict(stream.Dict)
+		latestOffset = object.Offset
+	}
+	return latest
 }
 
 func (g *pdfGraph) validateHybridXrefStream() error {
