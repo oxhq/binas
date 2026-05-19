@@ -621,6 +621,7 @@ func enrichPDFStreamNodeMetadata(tree *core.Tree) {
 			meta["encoded_length"] = int(tree.Nodes[i].Span.Len())
 		}
 		filter, _ := meta["filter"].(string)
+		addPDFStreamFilterCapabilityMetadata(meta, filter)
 		if filterChain := parsePDFStreamFilterChain(filter); len(filterChain) > 0 {
 			if _, ok := meta["filter_chain"]; !ok {
 				meta["filter_chain"] = filterChain
@@ -726,7 +727,7 @@ func findDirectStreamFilter(input []byte, start, end int) (string, string) {
 
 func findDirectStreamFilterAndDecodeParms(input []byte, start, end int) (string, string, string) {
 	dict := input[start:end]
-	decodeParms, decodeParmsUnsupported := findDirectStreamDecodeParms(dict)
+	decodeParms, decodeParmsUnsupported := findDirectStreamDecodeParms(input, start, dict)
 	if decodeParmsUnsupported != "" {
 		return "", "", decodeParmsUnsupported
 	}
@@ -758,7 +759,7 @@ func findDirectStreamFilterAndDecodeParms(input []byte, start, end int) (string,
 	return string(dict[i:j]), decodeParms, ""
 }
 
-func findDirectStreamDecodeParms(dict []byte) (string, string) {
+func findDirectStreamDecodeParms(input []byte, dictStart int, dict []byte) (string, string) {
 	decodeParmsAt := bytes.Index(dict, []byte("/DecodeParms"))
 	if decodeParmsAt == -1 {
 		return "", ""
@@ -785,12 +786,174 @@ func findDirectStreamDecodeParms(dict []byte) (string, string) {
 		if !ok {
 			return "", "unsupported stream: /DecodeParms array is not closed"
 		}
-		return string(dict[i:end]), ""
+		value, ok, unsupported := normalizeDecodeParmsArrayObject(input, dict[i:end], nil)
+		if unsupported != "" {
+			return "", unsupported
+		}
+		if !ok {
+			return "", "unsupported stream: /DecodeParms array is not closed"
+		}
+		return value, ""
 	}
 	if bytes.HasPrefix(dict[i:], []byte("null")) && isPDFTokenEnd(dict, i+len("null")) {
 		return "null", ""
 	}
+	if ref, ok := parseDirectPDFRef(dict, i); ok {
+		value, ok, unsupported := findDecodeParmsObject(input, ref.ID.Number, ref.ID.Generation, nil)
+		if unsupported != "" {
+			return "", unsupported
+		}
+		if !ok {
+			return "", "unsupported stream: /DecodeParms reference must resolve to a dictionary, array, or null object"
+		}
+		return value, ""
+	}
 	return "", "unsupported stream: /DecodeParms must be a dictionary, array, or null"
+}
+
+func parseDirectPDFRef(input []byte, start int) (pdfRef, bool) {
+	ref, _, ok := parseDirectPDFRefEnd(input, start)
+	return ref, ok
+}
+
+func parseDirectPDFRefEnd(input []byte, start int) (pdfRef, int, bool) {
+	i := start
+	numberStart := i
+	for i < len(input) && isPDFDigit(input[i]) {
+		i++
+	}
+	if numberStart == i {
+		return pdfRef{}, start, false
+	}
+	number, err := strconv.Atoi(string(input[numberStart:i]))
+	if err != nil {
+		return pdfRef{}, start, false
+	}
+	for i < len(input) && isPDFSpace(input[i]) {
+		i++
+	}
+	generationStart := i
+	for i < len(input) && isPDFDigit(input[i]) {
+		i++
+	}
+	if generationStart == i {
+		return pdfRef{}, start, false
+	}
+	generation, err := strconv.Atoi(string(input[generationStart:i]))
+	if err != nil {
+		return pdfRef{}, start, false
+	}
+	for i < len(input) && isPDFSpace(input[i]) {
+		i++
+	}
+	if i >= len(input) || input[i] != 'R' || !isPDFTokenEnd(input, i+1) {
+		return pdfRef{}, start, false
+	}
+	return pdfRef{ID: pdfObjectID{Number: number, Generation: generation}}, i + 1, true
+}
+
+func findDecodeParmsObject(input []byte, number, generation int, seen map[pdfObjectID]bool) (string, bool, string) {
+	id := pdfObjectID{Number: number, Generation: generation}
+	if seen == nil {
+		seen = make(map[pdfObjectID]bool)
+	}
+	if seen[id] {
+		return "", false, "unsupported stream: /DecodeParms reference cycle"
+	}
+	seen[id] = true
+	body, ok := findIndirectObjectBody(input, number, generation)
+	if !ok {
+		return "", false, ""
+	}
+	return normalizeDecodeParmsObject(input, bytes.TrimSpace(body), seen)
+}
+
+func normalizeDecodeParmsObject(input []byte, value []byte, seen map[pdfObjectID]bool) (string, bool, string) {
+	if bytes.Equal(value, []byte("null")) {
+		return "null", true, ""
+	}
+	if ref, end, ok := parseDirectPDFRefEnd(value, 0); ok && len(bytes.TrimSpace(value[end:])) == 0 {
+		return findDecodeParmsObject(input, ref.ID.Number, ref.ID.Generation, seen)
+	}
+	if len(value) >= 2 && value[0] == '<' && value[1] == '<' {
+		end, ok := findDictionaryEnd(value, 0)
+		if !ok {
+			return "", false, "unsupported stream: /DecodeParms dictionary is not closed"
+		}
+		if len(bytes.TrimSpace(value[end:])) != 0 {
+			return "", false, "unsupported stream: /DecodeParms reference object has trailing data"
+		}
+		return string(value[:end]), true, ""
+	}
+	if len(value) > 0 && value[0] == '[' {
+		out, ok, unsupported := normalizeDecodeParmsArrayObject(input, value, seen)
+		if unsupported != "" || !ok {
+			return "", ok, unsupported
+		}
+		return out, true, ""
+	}
+	return "", false, ""
+}
+
+func normalizeDecodeParmsArrayObject(input []byte, value []byte, seen map[pdfObjectID]bool) (string, bool, string) {
+	if len(value) == 0 || value[0] != '[' {
+		return "", false, ""
+	}
+	i := 1
+	var values []string
+	for {
+		for i < len(value) && isPDFSpace(value[i]) {
+			i++
+		}
+		if i >= len(value) {
+			return "", false, "unsupported stream: /DecodeParms array is not closed"
+		}
+		if value[i] == ']' {
+			i++
+			if len(bytes.TrimSpace(value[i:])) != 0 {
+				return "", false, "unsupported stream: /DecodeParms reference object has trailing data"
+			}
+			return "[" + strings.Join(values, " ") + "]", true, ""
+		}
+		if bytes.HasPrefix(value[i:], []byte("null")) && isPDFTokenEnd(value, i+len("null")) {
+			values = append(values, "null")
+			i += len("null")
+			continue
+		}
+		if i+1 < len(value) && value[i] == '<' && value[i+1] == '<' {
+			end, ok := findDictionaryEnd(value, i)
+			if !ok {
+				return "", false, "unsupported stream: /DecodeParms dictionary is not closed"
+			}
+			values = append(values, string(value[i:end]))
+			i = end
+			continue
+		}
+		if ref, end, ok := parseDirectPDFRefEnd(value, i); ok {
+			resolved, ok, unsupported := findDecodeParmsObject(input, ref.ID.Number, ref.ID.Generation, clonePDFObjectIDSet(seen))
+			if unsupported != "" {
+				return "", false, unsupported
+			}
+			if !ok || !(resolved == "null" || strings.HasPrefix(strings.TrimSpace(resolved), "<<")) {
+				return "", false, "unsupported stream: /DecodeParms array entries must resolve to null or direct dictionaries"
+			}
+			values = append(values, resolved)
+			i = end
+			continue
+		}
+		return "", false, "unsupported stream: /DecodeParms array entries must be null, direct dictionaries, or indirect dictionary references"
+	}
+}
+
+func clonePDFObjectIDSet(in map[pdfObjectID]bool) map[pdfObjectID]bool {
+	if in == nil {
+		return nil
+	}
+	out := make(map[pdfObjectID]bool, len(in))
+	for id, value := range in {
+		out[id] = value
+	}
+	return out
 }
 
 func findDirectStreamFilterArray(dict []byte, start int) (string, string) {
@@ -922,6 +1085,51 @@ func findStreamLength(input []byte, start, end int) (core.Span, int, bool, strin
 }
 
 func findIntegerObject(input []byte, number, generation int) (core.Span, int, bool, error) {
+	body, ok := findIndirectObjectBody(input, number, generation)
+	if !ok {
+		return core.Span{}, 0, false, nil
+	}
+	valueStart := 0
+	for valueStart < len(body) && isPDFSpace(body[valueStart]) {
+		valueStart++
+	}
+	valueEnd := valueStart
+	for valueEnd < len(body) && isPDFDigit(body[valueEnd]) {
+		valueEnd++
+	}
+	if valueStart == valueEnd {
+		return core.Span{}, 0, false, nil
+	}
+	for i := valueEnd; i < len(body); i++ {
+		if !isPDFSpace(body[i]) {
+			return core.Span{}, 0, false, nil
+		}
+	}
+	value, err := strconv.Atoi(string(body[valueStart:valueEnd]))
+	if err != nil {
+		return core.Span{}, 0, false, err
+	}
+	bodyStart, ok := findIndirectObjectBodyStart(input, number, generation)
+	if !ok {
+		return core.Span{}, 0, false, nil
+	}
+	return core.Span{Start: int64(bodyStart + valueStart), End: int64(bodyStart + valueEnd)}, value, true, nil
+}
+
+func findIndirectObjectBody(input []byte, number, generation int) ([]byte, bool) {
+	bodyStart, bodyEnd, ok := findIndirectObjectBodyRange(input, number, generation)
+	if !ok {
+		return nil, false
+	}
+	return input[bodyStart:bodyEnd], true
+}
+
+func findIndirectObjectBodyStart(input []byte, number, generation int) (int, bool) {
+	bodyStart, _, ok := findIndirectObjectBodyRange(input, number, generation)
+	return bodyStart, ok
+}
+
+func findIndirectObjectBodyRange(input []byte, number, generation int) (int, int, bool) {
 	objects := findXrefObjectOffsets(input)
 	for _, object := range objects {
 		if object.Number != number || object.Generation != generation {
@@ -929,37 +1137,16 @@ func findIntegerObject(input []byte, number, generation int) (core.Span, int, bo
 		}
 		headerEndRel := bytes.Index(input[object.Offset:], []byte("obj"))
 		if headerEndRel == -1 {
-			return core.Span{}, 0, false, nil
+			return 0, 0, false
 		}
 		bodyStart := object.Offset + headerEndRel + len("obj")
 		endObjRel := bytes.Index(input[bodyStart:], []byte("endobj"))
 		if endObjRel == -1 {
-			return core.Span{}, 0, false, nil
+			return 0, 0, false
 		}
-		bodyEnd := bodyStart + endObjRel
-		valueStart := bodyStart
-		for valueStart < bodyEnd && isPDFSpace(input[valueStart]) {
-			valueStart++
-		}
-		valueEnd := valueStart
-		for valueEnd < bodyEnd && isPDFDigit(input[valueEnd]) {
-			valueEnd++
-		}
-		if valueStart == valueEnd {
-			return core.Span{}, 0, false, nil
-		}
-		for i := valueEnd; i < bodyEnd; i++ {
-			if !isPDFSpace(input[i]) {
-				return core.Span{}, 0, false, nil
-			}
-		}
-		value, err := strconv.Atoi(string(input[valueStart:valueEnd]))
-		if err != nil {
-			return core.Span{}, 0, false, err
-		}
-		return core.Span{Start: int64(valueStart), End: int64(valueEnd)}, value, true, nil
+		return bodyStart, bodyStart + endObjRel, true
 	}
-	return core.Span{}, 0, false, nil
+	return 0, 0, false
 }
 
 func replaceSpan(input []byte, span core.Span, replacement []byte) []byte {

@@ -761,7 +761,10 @@ func parsePredictorDecodeParmsDictionary(dict []byte) (pdfFlateDecodeParms, bool
 		return pdfFlateDecodeParms{}, false, err
 	}
 	if !ok {
-		return pdfFlateDecodeParms{}, false, nil
+		if err := validateFlateDecodeParmsPredictor1Defaults(dict); err != nil {
+			return pdfFlateDecodeParms{}, true, err
+		}
+		return pdfFlateDecodeParms{predictor: 1}, true, nil
 	}
 	if predictor == 1 {
 		if err := validateFlateDecodeParmsPredictor1Defaults(dict); err != nil {
@@ -838,18 +841,10 @@ func lzwDecodeParmsOrDefault(params *pdfLZWDecodeParms) pdfLZWDecodeParms {
 }
 
 func validateFlateDecodeParmsPredictor1Defaults(dict []byte) error {
-	defaults := map[string]int{
-		"Columns":          1,
-		"Colors":           1,
-		"BitsPerComponent": 8,
-	}
-	for name, want := range defaults {
-		value, ok, err := decodeParmsInteger(dict, name)
+	for _, name := range []string{"Columns", "Colors", "BitsPerComponent"} {
+		_, _, err := decodeParmsInteger(dict, name)
 		if err != nil {
 			return err
-		}
-		if ok && value != want {
-			return fmt.Errorf("unsupported stream: /DecodeParms is not implemented")
 		}
 	}
 	return nil
@@ -941,10 +936,16 @@ func decodeParmsInteger(dict []byte, name string) (int, bool, error) {
 		for i < len(dict) && isPDFSpace(dict[i]) {
 			i++
 		}
-		if i >= len(dict) || !isPDFDigit(dict[i]) {
+		if i >= len(dict) || (!isPDFDigit(dict[i]) && dict[i] != '-' && dict[i] != '+') {
 			return 0, true, fmt.Errorf("unsupported stream: /DecodeParms /%s must be a direct integer", name)
 		}
 		start := i
+		if dict[i] == '-' || dict[i] == '+' {
+			i++
+		}
+		if i >= len(dict) || !isPDFDigit(dict[i]) {
+			return 0, true, fmt.Errorf("unsupported stream: /DecodeParms /%s must be a direct integer", name)
+		}
 		for i < len(dict) && isPDFDigit(dict[i]) {
 			i++
 		}

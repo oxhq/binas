@@ -309,7 +309,7 @@ func parsePDFIndirectObjectValue(input []byte, bodyStart, bodyEnd int) (pdfValue
 }
 
 func (g *pdfGraph) resolveObjectStream(container *pdfIndirectObject, stream pdfStreamObject) error {
-	decoded, err := decodePDFGraphStream(stream)
+	decoded, err := g.decodePDFGraphObjectStream(container.ID, stream)
 	if err != nil {
 		return fmt.Errorf("decode object stream %d %d: %w", container.ID.Number, container.ID.Generation, err)
 	}
@@ -704,7 +704,7 @@ func (g *pdfGraph) toTree(input []byte) *core.Tree {
 			"object_generation": object.ID.Generation,
 			"raw":               isPassthroughPDFStreamFilter(pdfGraphStreamFilterString(stream.Dict)),
 			"filter":            normalizePDFStreamFilter(pdfGraphStreamFilterString(stream.Dict)),
-			"decode_parms":      pdfGraphDecodeParmsString(stream.Dict),
+			"decode_parms":      g.pdfGraphDecodeParmsString(stream.Dict),
 			"canonical_graph":   true,
 		}
 		if object.InObjectStream {
@@ -727,7 +727,7 @@ func (g *pdfGraph) toTree(input []byte) *core.Tree {
 			sourceOffset:      stream.SourceStart,
 			streamSpan:        streamSpan,
 			streamFilter:      pdfGraphStreamFilterString(stream.Dict),
-			streamDecodeParms: pdfGraphDecodeParmsString(stream.Dict),
+			streamDecodeParms: g.pdfGraphDecodeParmsString(stream.Dict),
 			streamEncoded:     bytes.Clone(stream.Data),
 			decodedContent:    bytes.Clone(decoded),
 			toUnicode:         cmapContext.fallback,
@@ -1320,10 +1320,14 @@ func decodePDFGraphStream(stream pdfStreamObject) ([]byte, error) {
 func (g *pdfGraph) decodePDFGraphObjectStream(id pdfObjectID, stream pdfStreamObject) ([]byte, error) {
 	return decodeStreamFilterWithDecodeParmsAndCrypt(
 		pdfGraphStreamFilterString(stream.Dict),
-		pdfGraphDecodeParmsString(stream.Dict),
+		g.pdfGraphDecodeParmsString(stream.Dict),
 		stream.Data,
 		g.streamCryptHandler(id),
 	)
+}
+
+func (g *pdfGraph) pdfGraphDecodeParmsString(dict pdfDict) string {
+	return pdfGraphDecodeParmsStringWithResolver(dict, g.resolveDecodeParmsValue)
 }
 
 func pdfGraphStreamFilterString(dict pdfDict) string {
@@ -1350,15 +1354,71 @@ func pdfGraphStreamFilterString(dict pdfDict) string {
 }
 
 func pdfGraphDecodeParmsString(dict pdfDict) string {
+	return pdfGraphDecodeParmsStringWithResolver(dict, nil)
+}
+
+func pdfGraphDecodeParmsStringWithResolver(dict pdfDict, resolve func(pdfValue, map[pdfObjectID]bool) (pdfValue, bool)) string {
 	value, ok := dict["DecodeParms"]
 	if !ok {
 		return ""
+	}
+	if resolve != nil {
+		if resolved, ok := resolve(value, nil); ok {
+			value = resolved
+		}
 	}
 	var out bytes.Buffer
 	if err := writePDFValue(&out, value); err != nil {
 		return ""
 	}
 	return out.String()
+}
+
+func (g *pdfGraph) resolveDecodeParmsValue(value pdfValue, seen map[pdfObjectID]bool) (pdfValue, bool) {
+	switch v := value.(type) {
+	case nil, pdfDict:
+		return v, true
+	case pdfRef:
+		if g == nil {
+			return nil, false
+		}
+		if seen == nil {
+			seen = make(map[pdfObjectID]bool)
+		}
+		if seen[v.ID] {
+			return nil, false
+		}
+		seen[v.ID] = true
+		object, ok := g.Objects[v.ID]
+		if !ok {
+			return nil, false
+		}
+		return g.resolveDecodeParmsValue(object.Value, seen)
+	case pdfArray:
+		out := make(pdfArray, len(v))
+		for i, item := range v {
+			switch item.(type) {
+			case nil, pdfDict:
+				out[i] = item
+			case pdfRef:
+				resolved, ok := g.resolveDecodeParmsValue(item, clonePDFObjectIDSet(seen))
+				if !ok {
+					return nil, false
+				}
+				if resolved != nil {
+					if _, ok := resolved.(pdfDict); !ok {
+						return nil, false
+					}
+				}
+				out[i] = resolved
+			default:
+				return nil, false
+			}
+		}
+		return out, true
+	default:
+		return nil, false
+	}
 }
 
 func dictHasType(dict pdfDict, name string) bool {

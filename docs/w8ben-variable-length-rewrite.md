@@ -12,9 +12,9 @@ Supported today:
 - PDF files with direct `/Filter /FlateDecode`, `/Filter /LZWDecode`, `/Filter /ASCIIHexDecode`, `/Filter /ASCII85Decode`, or `/Filter /RunLengthDecode` content streams and direct or resolved indirect integer `/Length`.
 - PDF files using the standard filter abbreviations `/Fl`, `/LZW`, `/AHx`, `/A85`, and `/RL` where the normalized filter or filter chain is otherwise listed here.
 - Supported filter arrays composed only of FlateDecode, LZWDecode, ASCIIHexDecode, ASCII85Decode, RunLengthDecode, and their standard abbreviations.
-- PDF files with FlateDecode or LZWDecode `/DecodeParms` limited to `/Predictor 1` plus omitted/default geometry keys, TIFF predictor `2` packed sample rows, or PNG predictors `10` through `15` with row width computed from `/Columns`, `/Colors`, and `/BitsPerComponent`.
+- PDF files with FlateDecode or LZWDecode `/DecodeParms` limited to direct or resolved indirect dictionaries/arrays, omitted `/Predictor` defaulting to `1`, `/Predictor 1` with any direct signed integer geometry keys treated as no-op metadata, TIFF predictor `2` packed sample rows, or PNG predictors `10` through `15` with row width computed from `/Columns`, `/Colors`, and `/BitsPerComponent`.
 - PDF files with LZWDecode `/DecodeParms` `/EarlyChange 0|1`, defaulting to `1`.
-- `/DecodeParms` arrays that align one-for-one with the filter array; all-null arrays are accepted for supported reversible chains, while non-null dictionaries are accepted only for Flate and LZW positions.
+- `/DecodeParms` arrays that align one-for-one with the filter array; all-null arrays are accepted for supported reversible chains, while direct or resolved indirect non-null dictionaries are accepted only for Flate and LZW positions.
 - A text-show node parsed from a direct PDF literal string, for example `(08\05515\0552024) Tj`.
 - A text-show node parsed from a simple ASCII hex string, page font-scoped `/ToUnicode` CMap-backed hex string for simple `Tf` flows, or one unambiguous fallback `/ToUnicode` CMap.
 - A text-show node parsed from a simple `TJ` array made of literal strings, simple ASCII hex strings, CMap-backed hex strings, and numeric spacing entries.
@@ -34,7 +34,7 @@ Supported today:
 
 Not supported yet:
 
-- Broader `/DecodeParms` shapes or filters outside ASCIIHex, ASCII85, RunLength, Flate, LZW, and their standard abbreviations.
+- Broader `/DecodeParms` shapes, including scalar references, reference cycles, unsupported keys, and unknown predictors, or filters outside ASCIIHex, ASCII85, RunLength, Flate, LZW, and their standard abbreviations.
 - Indirect `/Length` references with missing targets, non-integer object bodies, compressed targets, or shared/cyclic semantics beyond the resolved standalone integer object shape.
 - Preserving original object-stream/xref-stream layout after canonical rewrite.
 - Broad AcroForm field tree surgery beyond `form list` and supported `form set`, XFA packet-family semantics beyond `xfa list` diagnostics/kind/root classification and exact packet replacement, annotations beyond discovery/page/flags/rect/color/border/quad metadata, `/Contents`, and explicit stale `/AP` removal or regeneration, or full widget/annotation layout fidelity.
@@ -118,7 +118,7 @@ If `BINAS_W8BEN_PDF` is not set, `TestW8BENDateRewriteIsSelectableText` skips th
 
 ## Next Residual Boundaries
 
-- Broader `/DecodeParms` shapes remain unsupported beyond Flate/LZW `/Predictor 1`, TIFF predictor `2` packed sample rows, PNG predictors `10` through `15`, and LZW `/EarlyChange 0|1`.
+- Broader `/DecodeParms` shapes remain unsupported beyond direct or resolved indirect Flate/LZW parameter dictionaries/arrays for `/Predictor 1`, TIFF predictor `2` packed sample rows, PNG predictors `10` through `15`, and LZW `/EarlyChange 0|1`.
 - Filter chains remain unsupported when they contain filters outside ASCIIHex, ASCII85, RunLength, Flate, LZW, and their standard abbreviations.
 - Object-stream/xref-stream/hybrid-xref original layout preservation remains out of scope; canonical rewrite is the supported path.
-- Other `/DecodeParms` shapes, filters outside ASCIIHex, ASCII85, RunLength, Flate, LZW, and their standard abbreviations, encrypted AESV3+/public-key/unsupported-crypt-filter shapes, default signed-PDF edits, cryptographic signature validation/re-signing, broad XFA editing beyond exact packet selectors, broad appearance/layout fidelity, and broad font/CMap/layout support remain out of scope.
+- Other `/DecodeParms` shapes, including scalar references, reference cycles, unsupported keys, and unknown predictors, filters outside ASCIIHex, ASCII85, RunLength, Flate, LZW, and their standard abbreviations, encrypted AESV3+/public-key/unsupported-crypt-filter shapes, default signed-PDF edits, cryptographic signature validation/re-signing, broad XFA editing beyond exact packet selectors, broad appearance/layout fidelity, and broad font/CMap/layout support remain out of scope.

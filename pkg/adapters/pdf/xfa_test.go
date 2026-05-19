@@ -600,6 +600,55 @@ func TestListXFAPacketsXMLDiagnostics(t *testing.T) {
 	}
 }
 
+func TestListXFAPacketsXMLSafetyDiagnostics(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		xfa            string
+		wantUnsafe     bool
+		wantParseError string
+		wantRoot       string
+	}{
+		{
+			name:           "doctype is unsafe",
+			xfa:            "(<!DOCTYPE xdp [<!ENTITY secret SYSTEM \"file:///etc/passwd\">]><template>&secret;</template>)",
+			wantUnsafe:     true,
+			wantParseError: "unsafe XML declaration: DOCTYPE is not supported",
+		},
+		{
+			name:           "entity declaration is unsafe",
+			xfa:            "(<!ENTITY secret \"value\"><template>text</template>)",
+			wantUnsafe:     true,
+			wantParseError: "unsafe XML declaration: ENTITY is not supported",
+		},
+		{
+			name:           "unterminated processing instruction reports parse error",
+			xfa:            "(<?xfa generator=\"binas\"<template>text</template>)",
+			wantParseError: "unterminated XML processing instruction",
+		},
+		{
+			name:     "safe template root has no safety error",
+			xfa:      "(<template>text</template>)",
+			wantRoot: "template",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input := testPDF("<< /Type /Catalog /AcroForm << /XFA " + tc.xfa + " >> >>")
+
+			packets, err := ListXFAPackets(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(packets) != 1 {
+				t.Fatalf("packets = %+v, want one packet", packets)
+			}
+			packet := packets[0]
+			if packet.UnsafeXML != tc.wantUnsafe || packet.XMLParseError != tc.wantParseError || packet.RootElement != tc.wantRoot {
+				t.Fatalf("packet XML safety metadata = %+v, want unsafe=%v parse_error=%q root=%q", packet, tc.wantUnsafe, tc.wantParseError, tc.wantRoot)
+			}
+		})
+	}
+}
+
 func TestListXFAPacketsOmitsUnknownPacketKind(t *testing.T) {
 	for _, tc := range []struct {
 		name string

@@ -18,6 +18,8 @@ type XFAPacketMetadata struct {
 	PacketKind       string `json:"packet_kind,omitempty"`
 	HasXMLProlog     bool   `json:"has_xml_prolog"`
 	RootElement      string `json:"root_element,omitempty"`
+	UnsafeXML        bool   `json:"unsafe_xml,omitempty"`
+	XMLParseError    string `json:"xml_parse_error,omitempty"`
 	ObjectNumber     *int   `json:"object_number"`
 	ObjectGeneration *int   `json:"object_generation"`
 	IsStream         bool   `json:"is_stream"`
@@ -235,11 +237,11 @@ func appendXFAPacketMetadata(out []XFAPacketMetadata, graph *pdfGraph, value pdf
 		}
 		switch objectValue := object.Value.(type) {
 		case pdfStreamObject:
-			decoded, err := decodePDFGraphStream(objectValue)
+			decoded, err := graph.decodePDFGraphObjectStream(object.ID, objectValue)
 			if err == nil {
-				out = append(out, makeXFAStreamPacketMetadata(label, object, objectValue, string(decoded), nil))
+				out = append(out, makeXFAStreamPacketMetadata(graph, label, object, objectValue, string(decoded), nil))
 			} else {
-				out = append(out, makeXFAStreamPacketMetadata(label, object, objectValue, "", err))
+				out = append(out, makeXFAStreamPacketMetadata(graph, label, object, objectValue, "", err))
 			}
 		case pdfLiteralString, pdfHexString:
 			text, ok := pdfTextValue(objectValue)
@@ -263,16 +265,18 @@ func appendXFAPacketMetadata(out []XFAPacketMetadata, graph *pdfGraph, value pdf
 }
 
 func makeXFAPacketMetadata(label string, object *pdfIndirectObject, isStream bool, text string) XFAPacketMetadata {
-	hasXMLProlog, rootElement := xfaPacketXMLDiagnostics(text)
+	xmlDiagnostics := xfaPacketXMLDiagnostics(text)
 	packet := XFAPacketMetadata{
-		Label:        label,
-		PacketKind:   classifyXFAPacketKind(label, text),
-		HasXMLProlog: hasXMLProlog,
-		RootElement:  rootElement,
-		IsStream:     isStream,
-		TextLength:   utf8.RuneCountInString(text),
-		ByteLength:   len(text),
-		Preview:      boundedXFAPreview(text),
+		Label:         label,
+		PacketKind:    classifyXFAPacketKind(label, text),
+		HasXMLProlog:  xmlDiagnostics.hasProlog,
+		RootElement:   xmlDiagnostics.rootElement,
+		UnsafeXML:     xmlDiagnostics.unsafe,
+		XMLParseError: xmlDiagnostics.parseError,
+		IsStream:      isStream,
+		TextLength:    utf8.RuneCountInString(text),
+		ByteLength:    len(text),
+		Preview:       boundedXFAPreview(text),
 	}
 	if object != nil {
 		number := object.ID.Number
@@ -283,18 +287,27 @@ func makeXFAPacketMetadata(label string, object *pdfIndirectObject, isStream boo
 	return packet
 }
 
-func xfaPacketXMLDiagnostics(text string) (bool, string) {
+type xfaXMLDiagnostics struct {
+	hasProlog   bool
+	rootElement string
+	unsafe      bool
+	parseError  string
+}
+
+func xfaPacketXMLDiagnostics(text string) xfaXMLDiagnostics {
 	text = strings.TrimSpace(text)
 	if strings.HasPrefix(text, "\ufeff") {
 		text = strings.TrimSpace(strings.TrimPrefix(text, "\ufeff"))
 	}
-	hasXMLProlog := false
+	out := xfaXMLDiagnostics{}
 	if strings.HasPrefix(text, "<?xml") {
 		end := strings.Index(text, "?>")
 		if end < 0 {
-			return true, ""
+			out.hasProlog = true
+			out.parseError = "unterminated XML declaration"
+			return out
 		}
-		hasXMLProlog = true
+		out.hasProlog = true
 		text = strings.TrimSpace(text[end+2:])
 	}
 	for {
@@ -302,21 +315,35 @@ func xfaPacketXMLDiagnostics(text string) (bool, string) {
 		case strings.HasPrefix(text, "<!--"):
 			end := strings.Index(text, "-->")
 			if end < 0 {
-				return hasXMLProlog, ""
+				out.parseError = "unterminated XML comment"
+				return out
 			}
 			text = strings.TrimSpace(text[end+3:])
 		case strings.HasPrefix(text, "<?"):
 			end := strings.Index(text, "?>")
 			if end < 0 {
-				return hasXMLProlog, ""
+				out.parseError = "unterminated XML processing instruction"
+				return out
 			}
 			text = strings.TrimSpace(text[end+2:])
+		case strings.HasPrefix(strings.ToUpper(text), "<!DOCTYPE"):
+			out.unsafe = true
+			out.parseError = "unsafe XML declaration: DOCTYPE is not supported"
+			return out
+		case strings.HasPrefix(strings.ToUpper(text), "<!ENTITY"):
+			out.unsafe = true
+			out.parseError = "unsafe XML declaration: ENTITY is not supported"
+			return out
 		default:
 			root, ok := xfaPacketXMLRootElement(text)
 			if !ok {
-				return hasXMLProlog, ""
+				if strings.HasPrefix(text, "<") {
+					out.parseError = "malformed XML root element"
+				}
+				return out
 			}
-			return hasXMLProlog, root
+			out.rootElement = root
+			return out
 		}
 	}
 }
@@ -362,10 +389,10 @@ func isConservativeXMLName(name string) bool {
 	return true
 }
 
-func makeXFAStreamPacketMetadata(label string, object *pdfIndirectObject, stream pdfStreamObject, text string, decodeErr error) XFAPacketMetadata {
+func makeXFAStreamPacketMetadata(graph *pdfGraph, label string, object *pdfIndirectObject, stream pdfStreamObject, text string, decodeErr error) XFAPacketMetadata {
 	packet := makeXFAPacketMetadata(label, object, true, text)
 	packet.Filter = pdfGraphStreamFilterString(stream.Dict)
-	packet.DecodeParms = pdfGraphDecodeParmsString(stream.Dict)
+	packet.DecodeParms = graph.pdfGraphDecodeParmsString(stream.Dict)
 	if decodeErr != nil {
 		packet.HasDecodeError = true
 		packet.DecodeError = decodeErr.Error()
@@ -511,7 +538,7 @@ func collectXFAPackets(graph *pdfGraph, owner pdfDict, key string, value pdfValu
 		}
 		switch objectValue := object.Value.(type) {
 		case pdfStreamObject:
-			decoded, err := decodePDFGraphStream(objectValue)
+			decoded, err := graph.decodePDFGraphObjectStream(object.ID, objectValue)
 			if err == nil {
 				text := string(decoded)
 				for i := 0; i < countXFAPacketTextMatches(text, contains); i++ {

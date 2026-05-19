@@ -34,7 +34,6 @@ func TestFilterLZWDecodeRoundTrip(t *testing.T) {
 func TestFilterLZWDecodeParmsRejectUnsupportedKeys(t *testing.T) {
 	input := []byte("BT\n(stream) Tj\nET\n")
 	for _, decodeParms := range []string{
-		"<< /Columns 1 >>",
 		"<< /EarlyChange 2 >>",
 		"<< /EarlyChange /One >>",
 	} {
@@ -190,14 +189,14 @@ func TestFilterLZWDecodePredictorDecodeParmsFailClosed(t *testing.T) {
 			want:        "unsupported stream: /DecodeParms key /BlackIs1 is not supported",
 		},
 		{
-			name:        "missing predictor for geometry",
-			decodeParms: "<< /Columns 1 >>",
-			want:        "unsupported stream: /DecodeParms /Predictor is missing",
-		},
-		{
 			name:        "unsupported predictor",
 			decodeParms: "<< /Predictor 9 /Columns 1 >>",
 			want:        "unsupported stream: /DecodeParms is not implemented",
+		},
+		{
+			name:        "negative early change",
+			decodeParms: "<< /EarlyChange -1 >>",
+			want:        "unsupported stream: /DecodeParms /EarlyChange must be 0 or 1",
 		},
 	}
 

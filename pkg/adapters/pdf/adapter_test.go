@@ -896,11 +896,6 @@ func TestDecodeParmsUnsupportedParametersFailClosed(t *testing.T) {
 			want: "unsupported stream: /DecodeParms PNG predictors require /Columns >= 1",
 		},
 		{
-			name: "missing predictor",
-			dict: fmt.Sprintf("<< /Length %d /Filter /FlateDecode /DecodeParms << /Columns 1 >> >>", len(encoded)),
-			want: "unsupported stream: /DecodeParms /Predictor is missing",
-		},
-		{
 			name: "malformed scalar decode parms",
 			dict: fmt.Sprintf("<< /Length %d /Filter /FlateDecode /DecodeParms 12 >>", len(encoded)),
 			want: "unsupported stream: /DecodeParms must be a dictionary, array, or null",
@@ -908,7 +903,7 @@ func TestDecodeParmsUnsupportedParametersFailClosed(t *testing.T) {
 		{
 			name: "malformed decode parms array entry",
 			dict: fmt.Sprintf("<< /Length %d /Filter /FlateDecode /DecodeParms [12] >>", len(encoded)),
-			want: "unsupported stream: /DecodeParms array entries must be null or direct dictionaries",
+			want: "unsupported stream: /DecodeParms array entries must be null, direct dictionaries, or indirect dictionary references",
 		},
 		{
 			name: "single filter decode parms array has too many entries",
