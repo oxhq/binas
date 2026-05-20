@@ -149,6 +149,9 @@ func decryptPDFXrefStreamValue(security *pdfStandardSecurity, fileKey []byte, id
 	if pdfStreamUsesCryptFilter(stream.Dict) || !security.encryptsStreamData(stream.Dict) {
 		return decrypted, nil
 	}
+	if _, err := parsePDFXrefStream(stream.Dict, stream.Data); err == nil {
+		return stream, nil
+	}
 	decryptedData, err := security.decryptObject(fileKey, id, stream.Data)
 	if err != nil {
 		return pdfStreamObject{}, err
@@ -156,9 +159,6 @@ func decryptPDFXrefStreamValue(security *pdfStandardSecurity, fileKey []byte, id
 	decrypted.Data = decryptedData
 	if _, err := parsePDFXrefStream(decrypted.Dict, decrypted.Data); err == nil {
 		return decrypted, nil
-	}
-	if _, err := parsePDFXrefStream(stream.Dict, stream.Data); err == nil {
-		return stream, nil
 	}
 	return decrypted, nil
 }

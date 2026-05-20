@@ -3,6 +3,7 @@ package pdf
 import (
 	"bytes"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/oxhq/binas/pkg/core"
@@ -238,6 +239,15 @@ func TestIndirectDecodeParmsReferencesFailClosed(t *testing.T) {
 			want: "unsupported stream: /DecodeParms reference must resolve to a dictionary, array, or null object",
 		},
 		{
+			name: "referenced dictionary has trailing data",
+			objects: []string{
+				"<< /Type /Page >>",
+				fmt.Sprintf("<< /Length %d /Filter /FlateDecode /DecodeParms 3 0 R >>\nstream\n%sendstream", len(encoded), encoded),
+				"<< /Predictor 1 >> true",
+			},
+			want: "unsupported stream: /DecodeParms reference object has trailing data",
+		},
+		{
 			name: "array scalar entry reference",
 			objects: []string{
 				"<< /Type /Page >>",
@@ -255,6 +265,15 @@ func TestIndirectDecodeParmsReferencesFailClosed(t *testing.T) {
 				"3 0 R",
 			},
 			want: "unsupported stream: /DecodeParms reference cycle",
+		},
+		{
+			name: "array entry resolves to nested array",
+			objects: []string{
+				"<< /Type /Page >>",
+				fmt.Sprintf("<< /Length %d /Filter [/FlateDecode /FlateDecode] /DecodeParms [3 0 R << /Predictor 1 >>] >>\nstream\n%sendstream", len(encoded), encoded),
+				"[null]",
+			},
+			want: "unsupported stream: /DecodeParms array entries must resolve to null or direct dictionaries",
 		},
 	}
 	for _, tc := range cases {
@@ -275,6 +294,171 @@ func TestIndirectDecodeParmsReferencesFailClosed(t *testing.T) {
 			}
 			if _, err := NewAdapter().PlanEdit(tree, core.Match{Kind: KindTextShow, Text: "08-15-2024"}, core.Mutation{Replace: "May 5, 2026"}); err == nil {
 				t.Fatal("expected edit planning to fail closed")
+			}
+		})
+	}
+}
+
+func TestDecodeParmsMalformedShapesFailClosed(t *testing.T) {
+	input, err := encodeFlateDecode([]byte("stream"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name        string
+		filter      string
+		decodeParms string
+		want        string
+	}{
+		{
+			name:        "nested predictor reference",
+			filter:      "/FlateDecode",
+			decodeParms: "<< /Predictor 3 0 R /Columns 1 >>",
+			want:        "unsupported stream: /DecodeParms /Predictor must be a direct integer",
+		},
+		{
+			name:        "nested columns reference",
+			filter:      "/FlateDecode",
+			decodeParms: "<< /Predictor 12 /Columns 3 0 R >>",
+			want:        "unsupported stream: /DecodeParms /Columns must be a direct integer",
+		},
+		{
+			name:        "oversized PNG geometry",
+			filter:      "/FlateDecode",
+			decodeParms: "<< /Predictor 12 /Columns 9223372036854775807 /Colors 2 /BitsPerComponent 8 >>",
+			want:        "PNG predictor stream: row width overflows",
+		},
+		{
+			name:        "out of range columns identifies key",
+			filter:      "/FlateDecode",
+			decodeParms: "<< /Predictor 12 /Columns 999999999999999999999999999999999999999 /Colors 1 /BitsPerComponent 8 >>",
+			want:        "unsupported stream: /DecodeParms /Columns must be a direct integer",
+		},
+		{
+			name:        "unsupported predictor identifies key",
+			filter:      "/FlateDecode",
+			decodeParms: "<< /Predictor 9 /Columns 1 >>",
+			want:        "unsupported stream: /DecodeParms /Predictor 9 is not supported",
+		},
+		{
+			name:        "png predictor negative colors identifies key",
+			filter:      "/FlateDecode",
+			decodeParms: "<< /Predictor 12 /Columns 1 /Colors -1 >>",
+			want:        "unsupported stream: /DecodeParms PNG predictors require /Colors >= 1",
+		},
+		{
+			name:        "png predictor negative bits per component identifies key",
+			filter:      "/FlateDecode",
+			decodeParms: "<< /Predictor 12 /Columns 1 /BitsPerComponent -1 >>",
+			want:        "unsupported stream: /DecodeParms PNG predictors require /BitsPerComponent >= 1",
+		},
+		{
+			name:        "lzw png predictor negative columns identifies key",
+			filter:      "/LZWDecode",
+			decodeParms: "<< /Predictor 12 /Columns -1 /Colors 1 /BitsPerComponent 8 >>",
+			want:        "unsupported stream: /DecodeParms PNG predictors require /Columns >= 1",
+		},
+		{
+			name:        "direct dictionary for filter array",
+			filter:      "[/FlateDecode /FlateDecode]",
+			decodeParms: "<< /Predictor 1 >>",
+			want:        "unsupported stream: direct /DecodeParms dictionary requires a single /Filter",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := decodeStreamFilterWithDecodeParms(tc.filter, tc.decodeParms, input)
+			if err == nil {
+				t.Fatal("expected DecodeParms error")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("DecodeParms error = %q, want containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestDecodeParmsRejectsUnsupportedKeysByFilter(t *testing.T) {
+	input, err := encodeFlateDecode([]byte("stream"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name        string
+		filter      string
+		decodeParms string
+		want        string
+	}{
+		{
+			name:        "flate rejects lzw early change",
+			filter:      "/FlateDecode",
+			decodeParms: "<< /Predictor 1 /EarlyChange 0 >>",
+			want:        "unsupported stream: /DecodeParms for /FlateDecode key /EarlyChange is not supported",
+		},
+		{
+			name:        "lzw rejects unrelated strategy key",
+			filter:      "/LZWDecode",
+			decodeParms: "<< /Predictor 1 /Columns 1 /Strategy 0 >>",
+			want:        "unsupported stream: /DecodeParms for /LZWDecode key /Strategy is not supported",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := decodeStreamFilterWithDecodeParms(tc.filter, tc.decodeParms, input)
+			if err == nil {
+				t.Fatal("expected DecodeParms key error")
+			}
+			if err.Error() != tc.want {
+				t.Fatalf("DecodeParms error = %q, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestDecodeParmsImagePassThroughFiltersRequireNullWhenPresent(t *testing.T) {
+	cases := []struct {
+		name        string
+		filter      string
+		decodeParms string
+		want        string
+	}{
+		{
+			name:        "dct direct dictionary rejected",
+			filter:      "/DCTDecode",
+			decodeParms: "<< /ColorTransform 1 >>",
+			want:        "unsupported stream: /DecodeParms for /DCTDecode must be null",
+		},
+		{
+			name:        "jpx direct dictionary rejected",
+			filter:      "/JPXDecode",
+			decodeParms: "<< /AnyKey 1 >>",
+			want:        "unsupported stream: /DecodeParms for /JPXDecode must be null",
+		},
+		{
+			name:        "ccitt array dictionary rejected",
+			filter:      "[/CCITTFaxDecode]",
+			decodeParms: "[<< /K -1 >>]",
+			want:        "unsupported stream: /DecodeParms for /CCITTFaxDecode must be null",
+		},
+		{
+			name:        "jbig2 mixed array dictionary rejected",
+			filter:      "[/JBIG2Decode /FlateDecode]",
+			decodeParms: "[<< /JBIG2Globals 3 0 R >> null]",
+			want:        "unsupported stream: /DecodeParms for /JBIG2Decode must be null",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := decodeStreamFilterWithDecodeParms(tc.filter, tc.decodeParms, []byte("image bytes"))
+			if err == nil {
+				t.Fatal("expected DecodeParms null requirement error")
+			}
+			if err.Error() != tc.want {
+				t.Fatalf("DecodeParms error = %q, want %q", err, tc.want)
 			}
 		})
 	}

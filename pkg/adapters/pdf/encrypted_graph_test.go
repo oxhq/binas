@@ -2,6 +2,8 @@ package pdf
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -433,14 +435,8 @@ func standardEncryptedAESV2TextFixture(t *testing.T, text string) []byte {
 		t.Fatal("fixture password did not authenticate")
 	}
 	plaintextStream := []byte(fmt.Sprintf("BT\n(%s) Tj\nET\n", encodeLiteralString(text)))
-	encryptedStream, err := security.encryptObject(fileKey, pdfObjectID{Number: 4, Generation: 0}, plaintextStream)
-	if err != nil {
-		t.Fatal(err)
-	}
-	encryptedTitle, err := security.encryptObject(fileKey, pdfObjectID{Number: 5, Generation: 0}, []byte("Sensitive Title"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	encryptedStream := deterministicAESV2EncryptedObject(t, security, fileKey, pdfObjectID{Number: 4, Generation: 0}, plaintextStream)
+	encryptedTitle := deterministicAESV2EncryptedObject(t, security, fileKey, pdfObjectID{Number: 5, Generation: 0}, []byte("Sensitive Title"))
 	return encryptedGraphFixturePDFWithObjects(t, fileID, pdfValueString(t, dict), encryptedStream, encryptedTitle)
 }
 
@@ -513,14 +509,8 @@ func standardEncryptedAESV2XrefStreamTextFixture(t *testing.T, text string) []by
 		t.Fatal("fixture password did not authenticate")
 	}
 	plaintextStream := []byte(fmt.Sprintf("BT\n(%s) Tj\nET\n", encodeLiteralString(text)))
-	encryptedContent, err := security.encryptObject(fileKey, pdfObjectID{Number: 4, Generation: 0}, plaintextStream)
-	if err != nil {
-		t.Fatal(err)
-	}
-	encryptedTitle, err := security.encryptObject(fileKey, pdfObjectID{Number: 5, Generation: 0}, []byte("Sensitive Title"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	encryptedContent := deterministicAESV2EncryptedObject(t, security, fileKey, pdfObjectID{Number: 4, Generation: 0}, plaintextStream)
+	encryptedTitle := deterministicAESV2EncryptedObject(t, security, fileKey, pdfObjectID{Number: 5, Generation: 0}, []byte("Sensitive Title"))
 	return encryptedGraphFixturePDFWithEncryptedXrefStream(t, fileID, security, fileKey, pdfValueString(t, dict), encryptedContent, encryptedTitle)
 }
 
@@ -541,14 +531,8 @@ func standardEncryptedAESV2CryptFilteredTextFixture(t *testing.T, text, filter, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	encryptedStream, err := security.encryptObject(fileKey, pdfObjectID{Number: 3, Generation: 0}, filteredStream)
-	if err != nil {
-		t.Fatal(err)
-	}
-	encryptedTitle, err := security.encryptObject(fileKey, pdfObjectID{Number: 4, Generation: 0}, []byte("Sensitive Title"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	encryptedStream := deterministicAESV2EncryptedObject(t, security, fileKey, pdfObjectID{Number: 3, Generation: 0}, filteredStream)
+	encryptedTitle := deterministicAESV2EncryptedObject(t, security, fileKey, pdfObjectID{Number: 4, Generation: 0}, []byte("Sensitive Title"))
 	streamDict := fmt.Sprintf("<< /Length %%d /Filter %s /DecodeParms %s >>", filter, decodeParms)
 	return encryptedGraphFixturePDFWithStreamDict(t, fileID, pdfValueString(t, dict), streamDict, encryptedStream, encryptedTitle)
 }
@@ -566,12 +550,35 @@ func standardEncryptedAESV2CryptIdentityTextFixture(t *testing.T, text string) [
 		t.Fatal("fixture password did not authenticate")
 	}
 	plaintextStream := []byte(fmt.Sprintf("BT\n(%s) Tj\nET\n", encodeLiteralString(text)))
-	encryptedTitle, err := security.encryptObject(fileKey, pdfObjectID{Number: 4, Generation: 0}, []byte("Sensitive Title"))
+	encryptedTitle := deterministicAESV2EncryptedObject(t, security, fileKey, pdfObjectID{Number: 4, Generation: 0}, []byte("Sensitive Title"))
+	streamDict := "<< /Length %d /Filter /Crypt /DecodeParms << /Name /Identity >> >>"
+	return encryptedGraphFixturePDFWithStreamDict(t, fileID, pdfValueString(t, dict), streamDict, plaintextStream, encryptedTitle)
+}
+
+func deterministicAESV2EncryptedObject(t *testing.T, security *pdfStandardSecurity, fileKey []byte, id pdfObjectID, plaintext []byte) []byte {
+	t.Helper()
+	objectKey, err := security.objectKeyWithMethod(fileKey, id, pdfStandardCryptAESV2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	streamDict := "<< /Length %d /Filter /Crypt /DecodeParms << /Name /Identity >> >>"
-	return encryptedGraphFixturePDFWithStreamDict(t, fileID, pdfValueString(t, dict), streamDict, plaintextStream, encryptedTitle)
+	block, err := aes.NewCipher(objectKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 256; i++ {
+		iv := []byte("binas-test-iv-00")
+		iv[len(iv)-1] = byte(i)
+		data := pkcs7Pad(plaintext, aes.BlockSize)
+		cipher.NewCBCEncrypter(block, iv).CryptBlocks(data, data)
+		out := make([]byte, 0, len(iv)+len(data))
+		out = append(out, iv...)
+		out = append(out, data...)
+		if !bytes.Contains(out, []byte("stream")) && !bytes.Contains(out, []byte("endobj")) {
+			return out
+		}
+	}
+	t.Fatal("could not build deterministic AESV2 fixture stream without PDF delimiter tokens")
+	return nil
 }
 
 func pdfValueString(t *testing.T, value pdfValue) string {
@@ -681,17 +688,17 @@ func encryptedGraphFixturePDFWithEncryptedXrefStream(t *testing.T, fileID []byte
 		}
 		writeXrefStreamEntry(&xrefData, 1, offset, 0)
 	}
-	encryptedXrefStream, err := security.encryptObject(fileKey, pdfObjectID{Number: 8, Generation: 0}, xrefData.Bytes())
-	if err != nil {
-		t.Fatal(err)
-	}
+	// XRef streams must stay parseable before object decryption. The fixture still
+	// encrypts regular stream/string objects, but keeps the cross-reference stream
+	// bytes clear so the parser can locate the encryption dictionary deterministically.
+	xrefStream := xrefData.Bytes()
 	input.WriteString("8 0 obj\n")
 	fmt.Fprintf(&input, "<< /Type /XRef /Size 9 /Root 1 0 R /Info 5 0 R /Encrypt 6 0 R /ID [<%s> <%s>] /W [1 4 1] /Length %d >>\nstream\n",
 		hex.EncodeToString(fileID),
 		hex.EncodeToString(fileID),
-		len(encryptedXrefStream),
+		len(xrefStream),
 	)
-	input.Write(encryptedXrefStream)
+	input.Write(xrefStream)
 	input.WriteString("\nendstream\nendobj\n")
 	fmt.Fprintf(&input, "startxref\n%d\n%%%%EOF\n", xrefOffset)
 	return input.Bytes()

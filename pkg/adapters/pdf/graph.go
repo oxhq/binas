@@ -690,6 +690,7 @@ func (g *pdfGraph) toTree(input []byte) *core.Tree {
 			"canonical_rewrite_capable": true,
 			"object_count":              len(g.Objects),
 			"xref_stream_entries":       len(g.XrefStream),
+			"structure_plan":            summarizePDFStructurePlan(g).metadata(),
 		}
 		tree.Nodes[tree.Root] = root
 	}
@@ -707,6 +708,9 @@ func (g *pdfGraph) toTree(input []byte) *core.Tree {
 			"decode_parms":      g.pdfGraphDecodeParmsString(stream.Dict),
 			"canonical_graph":   true,
 		}
+		if isPDFImageXObjectStreamDict(stream.Dict) {
+			streamMeta["image_xobject"] = true
+		}
 		if object.InObjectStream {
 			streamMeta["in_object_stream"] = true
 		}
@@ -723,6 +727,9 @@ func (g *pdfGraph) toTree(input []byte) *core.Tree {
 		if err != nil {
 			continue
 		}
+		if isPDFImageXObjectStreamDict(stream.Dict) {
+			continue
+		}
 		parseTextShow(decoded, 0, len(decoded), tree, streamID, textShowContext{
 			sourceOffset:      stream.SourceStart,
 			streamSpan:        streamSpan,
@@ -732,7 +739,9 @@ func (g *pdfGraph) toTree(input []byte) *core.Tree {
 			decodedContent:    bytes.Clone(decoded),
 			toUnicode:         cmapContext.fallback,
 			fontToUnicode:     cmapContext.fontCMapsForStream(stream.SourceStart),
+			fontEncodings:     cmapContext.fontEncodingsForStream(stream.SourceStart),
 			fontMetrics:       cmapContext.fontMetricsForStream(stream.SourceStart),
+			cidMetrics:        cmapContext.cidMetricsForStream(stream.SourceStart),
 		})
 	}
 	return tree
@@ -771,12 +780,14 @@ type canonicalTextCandidate struct {
 }
 
 type parsedTextShow struct {
-	Text     string
-	Encoded  string
-	Encoding string
-	CMap     *toUnicodeCMap
-	Start    int
-	End      int
+	Text         string
+	Encoded      string
+	Encoding     string
+	CMap         *toUnicodeCMap
+	FontEncoding *pdfSimpleFontEncoding
+	TextState    pdfTextStateSnapshot
+	Start        int
+	End          int
 }
 
 func EditCanonical(input []byte, selector core.Match, mutation core.Mutation, invariants []core.Invariant) ([]byte, core.Report, core.Verification, error) {
@@ -889,14 +900,14 @@ func editCanonicalWithOptions(input []byte, selector core.Match, mutation core.M
 	if err != nil {
 		return nil, core.Report{}, core.Verification{}, err
 	}
-	report := core.Report{
+	report := WithNoFallbackPolicy(core.Report{
 		Format:        "pdf",
 		Edit:          plan.Operation,
 		FallbackUsed:  false,
 		NodesModified: 1,
 		MatchIndex:    matchIndex,
 		Invariants:    invariants,
-	}
+	})
 	return output, report, verification, nil
 }
 
@@ -944,11 +955,14 @@ func (g *pdfGraph) textShowCandidatesWithCMapContext(text string, cmapContext pd
 		if !ok || dictHasType(stream.Dict, "ObjStm") || dictHasType(stream.Dict, "XRef") {
 			continue
 		}
+		if isPDFImageXObjectStreamDict(stream.Dict) {
+			continue
+		}
 		decoded, err := g.decodePDFGraphObjectStream(object.ID, stream)
 		if err != nil {
 			continue
 		}
-		shows := parseCanonicalTextShows(decoded, cmapContext.fallback, cmapContext.fontCMapsForStream(stream.SourceStart))
+		shows := parseCanonicalTextShows(decoded, cmapContext.fallback, cmapContext.fontCMapsForStream(stream.SourceStart), cmapContext.fontEncodingsForStream(stream.SourceStart))
 		for _, show := range shows {
 			if text != "" && show.Text != text {
 				continue
@@ -964,13 +978,21 @@ func (g *pdfGraph) textShowCandidatesWithCMapContext(text string, cmapContext pd
 	return candidates, nil
 }
 
-func parseCanonicalTextShows(input []byte, cmap *toUnicodeCMap, fontCMaps map[string]*toUnicodeCMap) []parsedTextShow {
+func parseCanonicalTextShows(input []byte, cmap *toUnicodeCMap, fontCMaps map[string]*toUnicodeCMap, fontEncodings ...map[string]*pdfSimpleFontEncoding) []parsedTextShow {
 	shows := make([]parsedTextShow, 0)
-	ctx := textShowContext{toUnicode: cmap, fontToUnicode: fontCMaps}
+	var encodings map[string]*pdfSimpleFontEncoding
+	if len(fontEncodings) > 0 {
+		encodings = fontEncodings[0]
+	}
+	ctx := textShowContext{toUnicode: cmap, fontToUnicode: fontCMaps, fontEncodings: encodings}
 	activeFont := ""
+	textState := newPDFTextStateTracker()
+	stateScanAt := 0
 	for i := 0; i < len(input); i++ {
 		if font, next, ok := nextSetFontOperator(input, i, len(input)); ok {
 			activeFont = font
+			applyPDFTextStateOperators(input, stateScanAt, next, textState)
+			stateScanAt = next
 			i = next - 1
 			continue
 		}
@@ -985,7 +1007,7 @@ func parseCanonicalTextShows(input []byte, cmap *toUnicodeCMap, fontCMaps map[st
 		)
 		switch input[i] {
 		case '[':
-			arrayDecoded, arrayEncoded, arrayEnd, arrayUsedCMap, arrayOK := parseSimpleTJArrayText(input, i, len(input), ctx.cmapForFont(activeFont))
+			arrayDecoded, arrayEncoded, arrayEnd, arrayUsedCMap, arrayUsedFontEncoding, arrayOK := parseSimpleTJArrayText(input, i, len(input), ctx.cmapForFont(activeFont), ctx.fontEncodingForFont(activeFont))
 			if !arrayOK {
 				continue
 			}
@@ -1002,6 +1024,8 @@ func parseCanonicalTextShows(input []byte, cmap *toUnicodeCMap, fontCMaps map[st
 			encoding = "tj-array"
 			if arrayUsedCMap {
 				encoding = "tj-array-cmap"
+			} else if arrayUsedFontEncoding {
+				encoding = "tj-array-font-encoding"
 			}
 		case '(':
 			closeAt, ok = findLiteralEnd(input, i+1, len(input))
@@ -1011,8 +1035,13 @@ func parseCanonicalTextShows(input []byte, cmap *toUnicodeCMap, fontCMaps map[st
 			operandEnd = closeAt + 1
 			operandStart = i + 1
 			encoded = string(input[operandStart:closeAt])
-			decoded = decodeLiteralString(encoded)
 			encoding = "literal"
+			if fontEncoding := ctx.fontEncodingForFont(activeFont); fontEncoding != nil {
+				decoded = fontEncoding.DecodeBytes(decodeLiteralBytes(encoded))
+				encoding = "literal-font-encoding"
+			} else {
+				decoded = decodeLiteralString(encoded)
+			}
 		case '<':
 			if i+1 < len(input) && input[i+1] == '<' {
 				continue
@@ -1025,8 +1054,9 @@ func parseCanonicalTextShows(input []byte, cmap *toUnicodeCMap, fontCMaps map[st
 			operandStart = i + 1
 			encoded = string(input[operandStart:closeAt])
 			var usedCMap bool
+			var usedFontEncoding bool
 			activeCMap := ctx.cmapForFont(activeFont)
-			decoded, usedCMap, ok = decodeHexTextStringWithCMap([]byte(encoded), activeCMap)
+			decoded, usedCMap, usedFontEncoding, ok = decodeHexTextStringWithContext([]byte(encoded), activeCMap, ctx.fontEncodingForFont(activeFont))
 			if !ok {
 				i = closeAt
 				continue
@@ -1034,24 +1064,35 @@ func parseCanonicalTextShows(input []byte, cmap *toUnicodeCMap, fontCMaps map[st
 			encoding = "hex"
 			if usedCMap {
 				encoding = "hex-cmap"
+			} else if usedFontEncoding {
+				encoding = "hex-font-encoding"
 			}
 		default:
 			continue
 		}
-		op, _ := nextOperator(input, operandEnd, len(input))
+		op, opEnd := nextOperator(input, operandEnd, len(input))
 		if op == "" {
 			i = closeAt
 			continue
 		}
+		trailingOperands := applyPDFTextStateOperators(input, stateScanAt, operandStart, textState)
+		if !applyPDFTextShowOperatorState(op, trailingOperands, textState) {
+			i = opEnd - 1
+			stateScanAt = opEnd
+			continue
+		}
 		shows = append(shows, parsedTextShow{
-			Text:     decoded,
-			Encoded:  encoded,
-			Encoding: encoding,
-			CMap:     ctx.cmapForFont(activeFont),
-			Start:    operandStart,
-			End:      closeAt,
+			Text:         decoded,
+			Encoded:      encoded,
+			Encoding:     encoding,
+			CMap:         ctx.cmapForFont(activeFont),
+			FontEncoding: ctx.fontEncodingForFont(activeFont),
+			TextState:    textState.Snapshot(),
+			Start:        operandStart,
+			End:          closeAt,
 		})
-		i = closeAt
+		stateScanAt = opEnd
+		i = opEnd - 1
 	}
 	return shows
 }
@@ -1068,6 +1109,15 @@ func encodeCanonicalTextReplacement(show parsedTextShow, replacement string) (st
 			return "", errors.New("replacement for ToUnicode TJ array text is not representable by the CMap")
 		}
 		return "[<" + encoded + ">]", nil
+	case "tj-array-font-encoding":
+		if show.FontEncoding == nil {
+			return "", errors.New("matched text show has no simple font encoding")
+		}
+		encoded, ok := show.FontEncoding.EncodeHex(replacement)
+		if !ok {
+			return "", errors.New("replacement for simple font encoded TJ array text is not representable by the font encoding")
+		}
+		return "[<" + encoded + ">]", nil
 	case "hex":
 		return encodeHexTextString(replacement)
 	case "hex-cmap":
@@ -1076,6 +1126,24 @@ func encodeCanonicalTextReplacement(show parsedTextShow, replacement string) (st
 			return "", errors.New("replacement for ToUnicode hex text show operand is not representable by the CMap")
 		}
 		return encoded, nil
+	case "hex-font-encoding":
+		if show.FontEncoding == nil {
+			return "", errors.New("matched text show has no simple font encoding")
+		}
+		encoded, ok := show.FontEncoding.EncodeHex(replacement)
+		if !ok {
+			return "", errors.New("replacement for simple font encoded hex text show operand is not representable by the font encoding")
+		}
+		return encoded, nil
+	case "literal-font-encoding":
+		if show.FontEncoding == nil {
+			return "", errors.New("matched text show has no simple font encoding")
+		}
+		encoded, ok := show.FontEncoding.EncodeBytes(replacement)
+		if !ok {
+			return "", errors.New("replacement for simple font encoded literal text show operand is not representable by the font encoding")
+		}
+		return encodeLiteralBytes(encoded), nil
 	default:
 		return "", fmt.Errorf("unsupported text show operand encoding %q", show.Encoding)
 	}
@@ -1424,6 +1492,15 @@ func (g *pdfGraph) resolveDecodeParmsValue(value pdfValue, seen map[pdfObjectID]
 func dictHasType(dict pdfDict, name string) bool {
 	got, ok := dict["Type"].(pdfName)
 	return ok && string(got) == name
+}
+
+func dictHasName(dict pdfDict, key, name string) bool {
+	got, ok := dict[key].(pdfName)
+	return ok && string(got) == name
+}
+
+func isPDFImageXObjectStreamDict(dict pdfDict) bool {
+	return dictHasName(dict, "Subtype", "Image")
 }
 
 func dictInt(dict pdfDict, key string) (int, bool) {

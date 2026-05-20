@@ -1652,6 +1652,81 @@ func TestCLIEditWritesVerifiedPDF(t *testing.T) {
 	}
 }
 
+func TestCLIEditLayoutModePreserveWidthAllowsWidthProvenPlan(t *testing.T) {
+	path := writeLayoutProofFixture(t, "AB")
+	out := filepath.Join(t.TempDir(), "out.pdf")
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{
+			"edit", path,
+			"--format", "pdf",
+			"--kind", "pdf.content.text_show",
+			"--text", "AB",
+			"--replace", "BA",
+			"--layout-mode", "preserve-width",
+			"--verify", "reparse,old-gone,new-selectable",
+			"-o", out,
+			"--json",
+		})
+	})
+	var result struct {
+		LayoutMode string `json:"layout_mode"`
+		Report     struct {
+			Meta map[string]any `json:"meta"`
+		} `json:"report"`
+		Verification struct {
+			ReparseOK     bool `json:"reparse_ok"`
+			NewSelectable bool `json:"new_text_selectable"`
+		} `json:"verification"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.LayoutMode != "preserve-width" {
+		t.Fatalf("layout_mode = %q, want preserve-width", result.LayoutMode)
+	}
+	if result.Report.Meta["layout_mode"] != "preserve-width" || result.Report.Meta["layout_proof"] != "width_proven" {
+		t.Fatalf("report meta = %+v, want preserve-width width_proven", result.Report.Meta)
+	}
+	if result.Report.Meta["width_delta_units"] != float64(0) {
+		t.Fatalf("width_delta_units = %v, want 0", result.Report.Meta["width_delta_units"])
+	}
+	if !result.Verification.ReparseOK || !result.Verification.NewSelectable {
+		t.Fatalf("verification = %+v", result.Verification)
+	}
+	if _, err := os.Stat(out); err != nil {
+		t.Fatalf("output file was not written: %v", err)
+	}
+}
+
+func TestCLIEditLayoutModePreserveWidthRejectsReflowRequiredPlan(t *testing.T) {
+	path := writeLayoutProofFixture(t, "AA")
+	out := filepath.Join(t.TempDir(), "out.pdf")
+
+	_, err := captureStdoutAndError(t, func() error {
+		return run([]string{
+			"edit", path,
+			"--format", "pdf",
+			"--kind", "pdf.content.text_show",
+			"--text", "AA",
+			"--replace", "BB",
+			"--layout-mode", "preserve-width",
+			"-o", out,
+			"--json",
+		})
+	})
+	if err == nil {
+		t.Fatal("edit succeeded, want preserve-width layout refusal")
+	}
+	want := "layout mode preserve-width refused: layout_proof=reflow_required (expected width_proven)"
+	if err.Error() != want {
+		t.Fatalf("error = %q, want %q", err, want)
+	}
+	if _, statErr := os.Stat(out); !os.IsNotExist(statErr) {
+		t.Fatalf("output file exists after refused preserve-width edit: %v", statErr)
+	}
+}
+
 func TestCLIEditRewriteAutoAndSurgicalUseSurgicalPath(t *testing.T) {
 	for _, mode := range []string{"auto", "surgical"} {
 		t.Run(mode, func(t *testing.T) {
@@ -1715,10 +1790,29 @@ func TestCLIEditRejectsUnknownRewriteMode(t *testing.T) {
 	if err == nil {
 		t.Fatal("edit succeeded, want rewrite mode validation error")
 	}
-	want := `unsupported rewrite mode "overlay" (expected auto, surgical, or canonical)`
+	want := `unsupported rewrite mode "overlay" (expected auto, surgical, canonical, or preserve-structure)`
 	if err.Error() != want {
 		t.Fatalf("error = %q, want %q", err, want)
 	}
+}
+
+func TestCLIEditPreserveStructureTableXrefUsesAdapterWriterMode(t *testing.T) {
+	path := writeFixture(t)
+	out := filepath.Join(t.TempDir(), "preserve-structure.pdf")
+	stdout := captureStdout(t, func() error {
+		return run([]string{
+			"edit", path,
+			"--format", "pdf",
+			"--kind", "pdf.content.text_show",
+			"--text", "08-15-2024",
+			"--replace", "May 5, 2026",
+			"--rewrite", "preserve-structure",
+			"--verify", "reparse,old-gone,new-selectable",
+			"-o", out,
+			"--json",
+		})
+	})
+	assertCanonicalCLIEditResult(t, stdout)
 }
 
 func TestCLIEditCanonicalRewriteWritesVerifiedPDF(t *testing.T) {
@@ -2031,6 +2125,55 @@ func TestCLIEditObjectStreamPDFUsesCanonicalForAutoAndRejectsSurgical(t *testing
 	}
 	if bytes.Contains(written, []byte("/Type /ObjStm")) {
 		t.Fatalf("canonical output preserved object stream container:\n%s", written)
+	}
+}
+
+func TestCLIEditPreserveStructurePackedPDFsFailClosedWithExplicitRepackError(t *testing.T) {
+	cases := []struct {
+		name    string
+		fixture func(*testing.T) string
+		details []string
+	}{
+		{
+			name:    "object-stream",
+			fixture: writeObjectStreamContentFixture,
+			details: []string{"object_stream_objects=1", "xref_stream_objects=0"},
+		},
+		{
+			name:    "xref-stream",
+			fixture: writeXrefStreamContentFixture,
+			details: []string{"object_stream_objects=0", "xref_stream_objects=1"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := tc.fixture(t)
+			out := filepath.Join(t.TempDir(), "out.pdf")
+			err := run([]string{
+				"edit", path,
+				"--format", "pdf",
+				"--kind", "pdf.content.text_show",
+				"--text", "08-15-2024",
+				"--replace", "May 5, 2026",
+				"--rewrite", "preserve-structure",
+				"-o", out,
+				"--json",
+			})
+			if err == nil {
+				t.Fatal("preserve-structure edit succeeded, want packed writer refusal")
+			}
+			if !strings.Contains(err.Error(), "preserve-structure PDF writer cannot repack object streams or xref streams") {
+				t.Fatalf("error = %q, want explicit preserve-structure repack refusal", err)
+			}
+			for _, detail := range tc.details {
+				if !strings.Contains(err.Error(), detail) {
+					t.Fatalf("error = %q, want detail %q", err, detail)
+				}
+			}
+			if _, statErr := os.Stat(out); !os.IsNotExist(statErr) {
+				t.Fatalf("output file exists after preserve-structure refusal: %v", statErr)
+			}
+		})
 	}
 }
 
@@ -2546,6 +2689,22 @@ func writeFixture(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "fixture.pdf")
 	input := []byte("%PDF-1.3\n1 0 obj\n<< /Type /Page /Length 27 >>\nstream\nBT\n(08\\05515\\0552024) Tj\nET\nendstream\nendobj\nxref\n0 2\n0000000000 65535 f \n0000000009 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n100\n%%EOF\n")
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func writeLayoutProofFixture(t *testing.T, text string) string {
+	t.Helper()
+	content := []byte(fmt.Sprintf("BT\n/F1 12 Tf\n(%s) Tj\nET\n", text))
+	input := pdfFixture(
+		"<< /Type /Catalog >>",
+		"<< /Type /Page /Contents 4 0 R /Resources << /Font << /F1 3 0 R >> >> >>",
+		"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 65 /Widths [600 610] >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
+	)
+	path := filepath.Join(t.TempDir(), "layout-proof.pdf")
 	if err := os.WriteFile(path, input, 0644); err != nil {
 		t.Fatal(err)
 	}

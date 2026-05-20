@@ -113,14 +113,14 @@ func applyIncrementalTextEdit(input []byte, selector core.Match, mutation core.M
 	if err != nil {
 		return nil, core.Report{}, core.Verification{}, SignaturePreservationVerification{}, err
 	}
-	report := core.Report{
+	report := WithNoFallbackPolicy(core.Report{
 		Format:        "pdf",
 		Edit:          plan.Operation,
 		FallbackUsed:  false,
 		NodesModified: 1,
 		MatchIndex:    matchIndex,
 		Invariants:    invariants,
-	}
+	})
 	return output, report, verification, preservation, nil
 }
 

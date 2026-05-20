@@ -788,7 +788,8 @@ func edit(args []string) error {
 	kind := fs.String("kind", pdf.KindTextShow, "node kind")
 	text := fs.String("text", "", "node text")
 	replace := fs.String("replace", "", "replacement text")
-	rewrite := fs.String("rewrite", "auto", "rewrite mode: auto, surgical, canonical")
+	rewrite := fs.String("rewrite", "auto", "rewrite mode: auto, surgical, canonical, preserve-structure")
+	layoutModeFlag := fs.String("layout-mode", "allow-width-change", "layout mode: preserve-width, allow-width-change, reflow-line")
 	password := fs.String("password", "", "PDF password for explicit encrypted-PDF canonical rewrites")
 	matchIndex := optionalIntFlag{}
 	legacyIndex := optionalIntFlag{}
@@ -800,7 +801,7 @@ func edit(args []string) error {
 	fs.Var(&signatureModeFlag, "signature-mode", "digital signature mode: refuse, invalidate, preserve-incremental")
 	outputPath := fs.String("o", "", "output file")
 	asJSON := fs.Bool("json", false, "write JSON")
-	if err := fs.Parse(reorderFlags(args, map[string]bool{"json": true, "allow-signature-invalidation": true}, map[string]bool{"format": true, "kind": true, "text": true, "replace": true, "rewrite": true, "password": true, "match-index": true, "index": true, "verify": true, "signature-mode": true, "o": true})); err != nil {
+	if err := fs.Parse(reorderFlags(args, map[string]bool{"json": true, "allow-signature-invalidation": true}, map[string]bool{"format": true, "kind": true, "text": true, "replace": true, "rewrite": true, "layout-mode": true, "password": true, "match-index": true, "index": true, "verify": true, "signature-mode": true, "o": true})); err != nil {
 		return err
 	}
 	selectedFlag, err := coalesceMatchIndexFlags(matchIndex, legacyIndex)
@@ -822,6 +823,13 @@ func edit(args []string) error {
 	}
 	rewriteMode, err := parseRewriteMode(*rewrite)
 	if err != nil {
+		return err
+	}
+	layoutMode, err := parseLayoutMode(*layoutModeFlag)
+	if err != nil {
+		return err
+	}
+	if err := enforceLayoutMode(layoutMode, nil); err != nil && layoutMode == layoutModeReflowLine {
 		return err
 	}
 	if *allowSignatureInvalidation && rewriteMode == "surgical" {
@@ -854,6 +862,7 @@ func edit(args []string) error {
 			Replace:       *replace,
 			SelectedFlag:  selectedFlag,
 			Verify:        *verify,
+			LayoutMode:    layoutMode,
 			SignatureMode: signatureMode,
 			OutputPath:    *outputPath,
 			WriteJSON:     *asJSON,
@@ -863,6 +872,9 @@ func edit(args []string) error {
 		if rewriteMode == "surgical" {
 			return errors.New("surgical rewrite does not support encrypted PDFs; use --rewrite auto or --rewrite canonical with --password")
 		}
+		if rewriteMode == "preserve-structure" {
+			return errors.New("preserve-structure rewrite does not support encrypted PDFs; use --rewrite auto or --rewrite canonical with --password")
+		}
 		return canonicalEdit(input, canonicalEditRequest{
 			Format:        *format,
 			Kind:          *kind,
@@ -871,12 +883,13 @@ func edit(args []string) error {
 			Password:      *password,
 			SelectedFlag:  selectedFlag,
 			Verify:        *verify,
+			LayoutMode:    layoutMode,
 			SignatureMode: signatureMode,
 			OutputPath:    *outputPath,
 			WriteJSON:     *asJSON,
 		})
 	}
-	if rewriteMode == "canonical" {
+	if rewriteMode == "canonical" || rewriteMode == "preserve-structure" {
 		return canonicalEdit(input, canonicalEditRequest{
 			Format:        *format,
 			Kind:          *kind,
@@ -885,7 +898,9 @@ func edit(args []string) error {
 			Password:      *password,
 			SelectedFlag:  selectedFlag,
 			Verify:        *verify,
+			LayoutMode:    layoutMode,
 			SignatureMode: signatureMode,
+			WriterMode:    pdfWriterModeForRewrite(rewriteMode),
 			OutputPath:    *outputPath,
 			WriteJSON:     *asJSON,
 		})
@@ -901,6 +916,7 @@ func edit(args []string) error {
 				Password:      *password,
 				SelectedFlag:  selectedFlag,
 				Verify:        *verify,
+				LayoutMode:    layoutMode,
 				SignatureMode: signatureMode,
 				OutputPath:    *outputPath,
 				WriteJSON:     *asJSON,
@@ -920,6 +936,7 @@ func edit(args []string) error {
 			Password:      *password,
 			SelectedFlag:  selectedFlag,
 			Verify:        *verify,
+			LayoutMode:    layoutMode,
 			SignatureMode: signatureMode,
 			OutputPath:    *outputPath,
 			WriteJSON:     *asJSON,
@@ -947,6 +964,9 @@ func edit(args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := enforceLayoutMode(layoutMode, plan.Meta); err != nil {
+		return err
+	}
 	plan.Invariants = parseInvariants(*verify)
 	output, report, err := adapter.Apply(input, plan)
 	if err != nil {
@@ -965,9 +985,10 @@ func edit(args []string) error {
 	if selectedIndex != nil {
 		report.MatchIndex = selectedIndex
 	}
+	addLayoutModeToReportMeta(&report, layoutMode)
 	report.OutputPath = *outputPath
 	report.Verification = &verification
-	result := map[string]any{"report": report, "verification": verification}
+	result := map[string]any{"layout_mode": layoutMode, "report": report, "verification": verification}
 	if *asJSON {
 		return writeJSON(result)
 	}
@@ -983,7 +1004,9 @@ type canonicalEditRequest struct {
 	Password      string
 	SelectedFlag  optionalIntFlag
 	Verify        string
+	LayoutMode    layoutMode
 	SignatureMode pdf.SignatureInvalidationMode
+	WriterMode    pdf.PDFWriterMode
 	OutputPath    string
 	WriteJSON     bool
 }
@@ -991,16 +1014,79 @@ type canonicalEditRequest struct {
 func parseRewriteMode(raw string) (string, error) {
 	mode := strings.ToLower(strings.TrimSpace(raw))
 	switch mode {
-	case "auto", "surgical", "canonical":
+	case "auto", "surgical", "canonical", "preserve-structure":
 		return mode, nil
 	default:
-		return "", fmt.Errorf("unsupported rewrite mode %q (expected auto, surgical, or canonical)", raw)
+		return "", fmt.Errorf("unsupported rewrite mode %q (expected auto, surgical, canonical, or preserve-structure)", raw)
 	}
+}
+
+func pdfWriterModeForRewrite(rewriteMode string) pdf.PDFWriterMode {
+	if rewriteMode == "preserve-structure" {
+		return pdf.PDFWriterModePreserveStructure
+	}
+	return pdf.PDFWriterModeCanonical
+}
+
+type layoutMode string
+
+const (
+	layoutModePreserveWidth      layoutMode = "preserve-width"
+	layoutModeAllowWidthChange   layoutMode = "allow-width-change"
+	layoutModeReflowLine         layoutMode = "reflow-line"
+	layoutProofStatusWidthProven            = "width_proven"
+)
+
+func parseLayoutMode(raw string) (layoutMode, error) {
+	mode := layoutMode(strings.ToLower(strings.TrimSpace(raw)))
+	switch mode {
+	case layoutModePreserveWidth, layoutModeAllowWidthChange, layoutModeReflowLine:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("unsupported layout mode %q (expected preserve-width, allow-width-change, or reflow-line)", raw)
+	}
+}
+
+func enforceLayoutMode(mode layoutMode, meta map[string]any) error {
+	switch mode {
+	case layoutModeAllowWidthChange:
+		return nil
+	case layoutModeReflowLine:
+		return errors.New("layout mode reflow-line is not supported yet")
+	case layoutModePreserveWidth:
+		if meta != nil && fmt.Sprint(meta["layout_proof"]) == layoutProofStatusWidthProven {
+			return nil
+		}
+		proof := "unknown"
+		if meta != nil {
+			if value, ok := meta["layout_proof"]; ok && fmt.Sprint(value) != "" {
+				proof = fmt.Sprint(value)
+			}
+		}
+		return fmt.Errorf("layout mode preserve-width refused: layout_proof=%s (expected width_proven)", proof)
+	default:
+		return fmt.Errorf("unsupported layout mode %q", mode)
+	}
+}
+
+func addLayoutModeToReportMeta(report *core.Report, mode layoutMode) {
+	if report.Meta == nil {
+		report.Meta = map[string]any{}
+	}
+	report.Meta["layout_mode"] = string(mode)
 }
 
 func canonicalEdit(input []byte, req canonicalEditRequest) error {
 	if strings.ToLower(req.Format) != "pdf" {
 		return fmt.Errorf("canonical rewrite is unsupported for format %q", req.Format)
+	}
+	if req.WriterMode == pdf.PDFWriterModePreserveStructure {
+		if req.Password != "" {
+			return errors.New("preserve-structure rewrite does not support encrypted PDFs; use --rewrite auto or --rewrite canonical with --password")
+		}
+		if req.SignatureMode == pdf.SignatureInvalidationInvalidate {
+			return errors.New("preserve-structure rewrite does not support explicit signature invalidation; use --rewrite canonical when invalidating signatures")
+		}
 	}
 	invariants := parseInvariants(req.Verify)
 	selector := core.Match{Kind: req.Kind, Text: req.Text}
@@ -1025,9 +1111,16 @@ func canonicalEdit(input []byte, req canonicalEditRequest) error {
 			output, report, verification, err = pdf.ApplyCanonicalEditWithPassword(input, req.Password, selector, core.Mutation{Replace: req.Replace}, invariants)
 		}
 	} else {
-		output, report, verification, err = apply(input, selector, core.Mutation{Replace: req.Replace}, invariants)
+		if req.WriterMode == pdf.PDFWriterModePreserveStructure {
+			output, report, verification, err = pdf.ApplyCanonicalEditWithWriterMode(input, req.WriterMode, selector, core.Mutation{Replace: req.Replace}, invariants)
+		} else {
+			output, report, verification, err = apply(input, selector, core.Mutation{Replace: req.Replace}, invariants)
+		}
 	}
 	if err != nil {
+		return err
+	}
+	if err := enforceLayoutMode(req.LayoutMode, report.Meta); err != nil {
 		return err
 	}
 	if err := verificationError(verification, invariants); err != nil {
@@ -1036,9 +1129,10 @@ func canonicalEdit(input []byte, req canonicalEditRequest) error {
 	if err := os.WriteFile(req.OutputPath, output, 0644); err != nil {
 		return err
 	}
+	addLayoutModeToReportMeta(&report, req.LayoutMode)
 	report.OutputPath = req.OutputPath
 	report.Verification = &verification
-	result := map[string]any{"report": report, "verification": verification}
+	result := map[string]any{"layout_mode": req.LayoutMode, "report": report, "verification": verification}
 	if req.SignatureMode == pdf.SignatureInvalidationInvalidate {
 		result["signature_invalidation"] = "digital signatures invalidated; not preserved or re-signed"
 	}
@@ -1063,6 +1157,9 @@ func incrementalSignaturePreservingEdit(input []byte, req canonicalEditRequest) 
 	if err != nil {
 		return err
 	}
+	if err := enforceLayoutMode(req.LayoutMode, report.Meta); err != nil {
+		return err
+	}
 	if err := verificationError(verification, invariants); err != nil {
 		return err
 	}
@@ -1072,9 +1169,11 @@ func incrementalSignaturePreservingEdit(input []byte, req canonicalEditRequest) 
 	if err := os.WriteFile(req.OutputPath, output, 0644); err != nil {
 		return err
 	}
+	addLayoutModeToReportMeta(&report, req.LayoutMode)
 	report.OutputPath = req.OutputPath
 	report.Verification = &verification
 	result := map[string]any{
+		"layout_mode":            req.LayoutMode,
 		"report":                 report,
 		"verification":           verification,
 		"signature_preservation": signaturePreservation,

@@ -1,7 +1,9 @@
 package pdf
 
 import (
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/oxhq/binas/pkg/core"
@@ -48,5 +50,47 @@ func TestTrueEditFallbackPolicyRejectsFallbackInvariant(t *testing.T) {
 
 	if err := ValidateTrueTextEditFallbackPolicy(DefaultOverlayPolicy(), []core.Invariant{core.InvariantNoFallbackUsed}); err != nil {
 		t.Fatalf("ValidateTrueTextEditFallbackPolicy() no-fallback error = %v, want nil", err)
+	}
+}
+
+func TestTrueEditReportCarriesExplicitNoFallbackPolicy(t *testing.T) {
+	report := WithNoFallbackPolicy(core.Report{
+		Format:        "pdf",
+		Edit:          "pdf.canonical_content_stream_text_rewrite",
+		FallbackUsed:  false,
+		NodesModified: 1,
+		Invariants:    []core.Invariant{core.InvariantNoFallbackUsed},
+	})
+
+	if err := ValidateTrueTextEditReportFallbackPolicy(report); err != nil {
+		t.Fatalf("ValidateTrueTextEditReportFallbackPolicy() error = %v, want nil", err)
+	}
+
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"fallback_used":false`) || !strings.Contains(string(encoded), `"fallback_policy":{"fallback":"none","mode":"none"}`) {
+		t.Fatalf("report JSON missing explicit fallback policy: %s", encoded)
+	}
+}
+
+func TestTrueEditReportRejectsOverlayOrOCRFallbackPolicy(t *testing.T) {
+	for _, policy := range []OverlayPolicy{
+		{Fallback: FallbackOverlay, Mode: FallbackModeExplicit},
+		{Fallback: FallbackOCRTextLayer, Mode: FallbackModeExplicit},
+	} {
+		report := WithFallbackPolicy(core.Report{
+			Format:        "pdf",
+			Edit:          "pdf.canonical_content_stream_text_rewrite",
+			FallbackUsed:  true,
+			NodesModified: 1,
+			Invariants:    []core.Invariant{core.InvariantNoFallbackUsed},
+		}, policy)
+
+		err := ValidateTrueTextEditReportFallbackPolicy(report)
+		if !errors.Is(err, ErrTrueTextEditRejectsFallbackPolicy) {
+			t.Fatalf("ValidateTrueTextEditReportFallbackPolicy(%+v) error = %v, want ErrTrueTextEditRejectsFallbackPolicy", policy, err)
+		}
 	}
 }

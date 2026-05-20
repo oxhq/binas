@@ -48,7 +48,17 @@ type EncryptionMetadata struct {
 }
 
 type SignatureMetadata struct {
-	Present bool `json:"present"`
+	Present                       bool   `json:"present"`
+	ByteRangeCount                int    `json:"byte_range_count,omitempty"`
+	ContentsByteLength            *int   `json:"contents_byte_length,omitempty"`
+	SubFilter                     string `json:"sub_filter,omitempty"`
+	Filter                        string `json:"filter,omitempty"`
+	SigningTime                   string `json:"signing_time,omitempty"`
+	SignatureContainer            string `json:"signature_container,omitempty"`
+	DigestAlgorithm               string `json:"digest_algorithm,omitempty"`
+	DigestAlgorithmStatus         string `json:"digest_algorithm_status,omitempty"`
+	CryptographicValidation       bool   `json:"cryptographic_validation"`
+	CryptographicValidationStatus string `json:"cryptographic_validation_status"`
 }
 
 type UnsupportedEncryptionAlgorithmError struct {
@@ -88,12 +98,11 @@ func CheckSecurity(input []byte, opts SecurityOptions) error {
 
 func SecurityMetadataForInput(input []byte) SecurityMetadata {
 	boundaries := summarizeResidualBoundariesForInput(input)
+	signature := inspectSignatureInfo(input)
 	metadata := SecurityMetadata{
 		Encrypted: boundaries.HasEncryption,
 		Signed:    boundaries.HasSignature,
-		Signature: SignatureMetadata{
-			Present: boundaries.HasSignature,
-		},
+		Signature: signatureMetadataFromInfo(signature),
 	}
 	if boundaries.HasEncryption {
 		encryption := encryptionMetadataForInput(input)
@@ -103,6 +112,22 @@ func SecurityMetadataForInput(input []byte) SecurityMetadata {
 		metadata.Encryption = &encryption
 	}
 	return metadata
+}
+
+func signatureMetadataFromInfo(info signatureInfo) SignatureMetadata {
+	return SignatureMetadata{
+		Present:                       info.HasSignatureMarker,
+		ByteRangeCount:                info.ByteRangeCount,
+		ContentsByteLength:            info.ContentsByteLength,
+		SubFilter:                     info.SubFilter,
+		Filter:                        info.Filter,
+		SigningTime:                   info.SigningTime,
+		SignatureContainer:            info.SignatureContainer,
+		DigestAlgorithm:               info.DigestAlgorithm,
+		DigestAlgorithmStatus:         info.DigestAlgorithmStatus,
+		CryptographicValidation:       info.CryptographicValidation,
+		CryptographicValidationStatus: info.CryptographicValidationStatus,
+	}
 }
 
 func (m SecurityMetadata) HasSecurityBoundary() bool {

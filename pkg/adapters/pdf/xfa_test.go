@@ -518,7 +518,7 @@ func TestListXFAPacketsDirectXMLPacketKinds(t *testing.T) {
 		want string
 	}{
 		{name: "xml declaration before xdp root", xfa: "(<?xml version=\"1.0\"?><xdp:xdp xmlns:xdp=\"http://ns.adobe.com/xdp/\">text</xdp:xdp>)", want: "xdp"},
-		{name: "namespaced datasets root", xfa: "(<xfa:datasets>text</xfa:datasets>)", want: "datasets"},
+		{name: "namespaced datasets root", xfa: "(<!-- packet comment --><?xfa generator=\"binas\"?><xfa:datasets xmlns:xfa=\"http://www.xfa.org/schema/xfa-data/1.0/\">text</xfa:datasets>)", want: "datasets"},
 		{name: "generic xml root", xfa: "(<something>text</something>)", want: "xml"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -539,6 +539,32 @@ func TestListXFAPacketsDirectXMLPacketKinds(t *testing.T) {
 	}
 }
 
+func TestListXFAPacketsReportsExplicitPacketFamilyLabels(t *testing.T) {
+	input := testPDF("<< /Type /Catalog /AcroForm << /XFA [(template) (<template/>) (datasets) (<datasets/>) (config) (<config/>) (localeSet) (<localeSet/>) (sourceSet) (<sourceSet/>) (xdc) (<xdc/>) (xfdf) (<xfdf/>) (notXFA) (<template/>)] >> >>")
+
+	packets, err := ListXFAPackets(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{"template", "datasets", "config", "localeSet", "sourceSet", "xdc", "xfdf", "unknown"}
+	if len(packets) != len(want) {
+		t.Fatalf("packets = %+v, want %d packets", packets, len(want))
+	}
+	for i, wantKind := range want {
+		if packets[i].PacketKind != wantKind {
+			t.Fatalf("packet %d kind = %q, want %q; packet = %+v", i, packets[i].PacketKind, wantKind, packets[i])
+		}
+		encoded, err := json.Marshal(packets[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(encoded, []byte(`"packet_kind":"`+wantKind+`"`)) {
+			t.Fatalf("packet JSON %s missing explicit packet_kind %q", encoded, wantKind)
+		}
+	}
+}
+
 func TestListXFAPacketsXMLDiagnostics(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
@@ -556,7 +582,7 @@ func TestListXFAPacketsXMLDiagnostics(t *testing.T) {
 		},
 		{
 			name:          "comments and processing instructions before root",
-			xfa:           "(<!-- packet comment --><?xfa generator=\"binas\"?><xfa:datasets>text</xfa:datasets>)",
+			xfa:           "(<!-- packet comment --><?xfa generator=\"binas\"?><xfa:datasets xmlns:xfa=\"http://www.xfa.org/schema/xfa-data/1.0/\">text</xfa:datasets>)",
 			wantRoot:      "xfa:datasets",
 			wantJSONField: []byte(`"root_element":"xfa:datasets"`),
 		},
@@ -600,6 +626,36 @@ func TestListXFAPacketsXMLDiagnostics(t *testing.T) {
 	}
 }
 
+func TestListXFAPacketsUnsafeXMLDeclarationsReportDiagnosticsSafely(t *testing.T) {
+	input := testPDF("<< /Type /Catalog /AcroForm << /XFA (<?xml version=\"1.0\"?><!DOCTYPE xdp [<!ENTITY secret SYSTEM \"file:///etc/passwd\">]><template>&secret;</template>) >> >>")
+
+	packets, err := ListXFAPackets(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(packets) != 1 {
+		t.Fatalf("packets = %+v, want one packet", packets)
+	}
+	packet := packets[0]
+	if !packet.HasXMLProlog || !packet.UnsafeXML || packet.XMLParseError != "unsafe XML declaration: DOCTYPE is not supported" || packet.RootElement != "" {
+		t.Fatalf("packet XML diagnostics = %+v", packet)
+	}
+	encoded, err := json.Marshal(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range [][]byte{
+		[]byte(`"has_xml_prolog":true`),
+		[]byte(`"unsafe_xml":true`),
+		[]byte(`"xml_parse_error":"unsafe XML declaration: DOCTYPE is not supported"`),
+		[]byte(`"packet_kind":"unknown"`),
+	} {
+		if !bytes.Contains(encoded, want) {
+			t.Fatalf("packet JSON %s missing %s", encoded, want)
+		}
+	}
+}
+
 func TestListXFAPacketsXMLSafetyDiagnostics(t *testing.T) {
 	for _, tc := range []struct {
 		name           string
@@ -626,6 +682,11 @@ func TestListXFAPacketsXMLSafetyDiagnostics(t *testing.T) {
 			wantParseError: "unterminated XML processing instruction",
 		},
 		{
+			name:           "malformed namespaced datasets fails closed",
+			xfa:            "(<xfa:datasets xmlns:xfa=\"http://www.xfa.org/schema/xfa-data/1.0/\"><value></xfa:datasets>)",
+			wantParseError: "malformed XML root element",
+		},
+		{
 			name:     "safe template root has no safety error",
 			xfa:      "(<template>text</template>)",
 			wantRoot: "template",
@@ -645,11 +706,14 @@ func TestListXFAPacketsXMLSafetyDiagnostics(t *testing.T) {
 			if packet.UnsafeXML != tc.wantUnsafe || packet.XMLParseError != tc.wantParseError || packet.RootElement != tc.wantRoot {
 				t.Fatalf("packet XML safety metadata = %+v, want unsafe=%v parse_error=%q root=%q", packet, tc.wantUnsafe, tc.wantParseError, tc.wantRoot)
 			}
+			if tc.wantParseError != "" && packet.PacketKind != "unknown" {
+				t.Fatalf("packet kind = %q, want unknown for failed XML diagnostics; packet = %+v", packet.PacketKind, packet)
+			}
 		})
 	}
 }
 
-func TestListXFAPacketsOmitsUnknownPacketKind(t *testing.T) {
+func TestListXFAPacketsReportsUnknownPacketKind(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		xfa  string
@@ -668,16 +732,40 @@ func TestListXFAPacketsOmitsUnknownPacketKind(t *testing.T) {
 			if len(packets) != 1 {
 				t.Fatalf("packets = %+v, want one packet", packets)
 			}
-			if packets[0].PacketKind != "" {
-				t.Fatalf("packet kind = %q, want empty", packets[0].PacketKind)
+			if packets[0].PacketKind != "unknown" {
+				t.Fatalf("packet kind = %q, want unknown", packets[0].PacketKind)
 			}
 			encoded, err := json.Marshal(packets[0])
 			if err != nil {
 				t.Fatal(err)
 			}
-			if bytes.Contains(encoded, []byte("packet_kind")) {
-				t.Fatalf("packet_kind should be omitted for unknown packets: %s", encoded)
+			if !bytes.Contains(encoded, []byte(`"packet_kind":"unknown"`)) {
+				t.Fatalf("packet_kind should be explicit for unknown packets: %s", encoded)
 			}
 		})
+	}
+}
+
+func TestApplyCanonicalEditRefusesXFAWithoutFallback(t *testing.T) {
+	content := []byte("BT\n(old) Tj\nET\n")
+	input := testPDF(
+		"<< /Type /Catalog /AcroForm << /XFA (<template>old</template>) >> >>",
+		string(bytes.Join([][]byte{
+			[]byte("<< /Length 15 >>"),
+			[]byte("stream"),
+			content,
+			[]byte("endstream"),
+		}, []byte("\n"))),
+	)
+
+	output, report, verification, err := ApplyCanonicalEdit(input, core.Match{Kind: KindTextShow, Text: "old"}, core.Mutation{Replace: "new"}, nil)
+	if err == nil {
+		t.Fatal("expected generic canonical edit to refuse XFA")
+	}
+	if err.Error() != "unsupported PDF: XFA forms are not implemented" {
+		t.Fatalf("error = %q", err)
+	}
+	if output != nil || report.FallbackUsed || verification.ReparseOK {
+		t.Fatalf("generic XFA refusal leaked output/report/verification: output=%q report=%+v verification=%+v", output, report, verification)
 	}
 }

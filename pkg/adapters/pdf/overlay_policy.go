@@ -83,6 +83,37 @@ func ValidateTrueTextEditFallbackPolicy(policy OverlayPolicy, invariants []core.
 	return fmt.Errorf("%w: %s is not a true text edit", ErrTrueTextEditRejectsFallbackPolicy, policy.Fallback)
 }
 
+func WithNoFallbackPolicy(report core.Report) core.Report {
+	return WithFallbackPolicy(report, DefaultOverlayPolicy())
+}
+
+func WithFallbackPolicy(report core.Report, policy OverlayPolicy) core.Report {
+	policy = policy.normalized()
+	report.FallbackUsed = policy.UsesFallback()
+	report.FallbackPolicy = &core.FallbackPolicy{
+		Fallback: string(policy.Fallback),
+		Mode:     string(policy.Mode),
+	}
+	return report
+}
+
+func ValidateTrueTextEditReportFallbackPolicy(report core.Report) error {
+	policy := DefaultOverlayPolicy()
+	if report.FallbackPolicy != nil {
+		policy = OverlayPolicy{
+			Fallback: FallbackKind(report.FallbackPolicy.Fallback),
+			Mode:     FallbackMode(report.FallbackPolicy.Mode),
+		}
+	}
+	if err := ValidateTrueTextEditFallbackPolicy(policy, report.Invariants); err != nil {
+		return err
+	}
+	if report.FallbackUsed {
+		return fmt.Errorf("%w: report fallback_used=true violates %s", ErrTrueTextEditRejectsFallbackPolicy, core.InvariantNoFallbackUsed)
+	}
+	return nil
+}
+
 func (p OverlayPolicy) normalized() OverlayPolicy {
 	if p.Fallback == "" {
 		p.Fallback = FallbackNone

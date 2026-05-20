@@ -2,8 +2,10 @@ package pdf
 
 import (
 	"bytes"
+	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"unicode/utf8"
 
@@ -15,7 +17,7 @@ const xfaPacketPreviewRunes = 80
 type XFAPacketMetadata struct {
 	Index            int    `json:"index"`
 	Label            string `json:"label"`
-	PacketKind       string `json:"packet_kind,omitempty"`
+	PacketKind       string `json:"packet_kind"`
 	HasXMLProlog     bool   `json:"has_xml_prolog"`
 	RootElement      string `json:"root_element,omitempty"`
 	UnsafeXML        bool   `json:"unsafe_xml,omitempty"`
@@ -137,14 +139,14 @@ func ApplyXFAReplaceWithOptions(input []byte, oldText, newText string, options X
 	}
 	verification.OldTextRemoved = !bytes.Contains(output, []byte(oldText))
 	verification.NewSelectable = bytes.Contains(output, []byte(newText))
-	return output, core.Report{
+	return output, WithNoFallbackPolicy(core.Report{
 		Format:        "pdf",
 		Edit:          "pdf.xfa_replace",
 		FallbackUsed:  false,
 		NodesModified: 1,
 		MatchIndex:    selected,
 		Invariants:    []core.Invariant{core.InvariantReparse, core.InvariantNoFallbackUsed},
-	}, verification, nil
+	}), verification, nil
 }
 
 type xfaPacket struct {
@@ -288,10 +290,11 @@ func makeXFAPacketMetadata(label string, object *pdfIndirectObject, isStream boo
 }
 
 type xfaXMLDiagnostics struct {
-	hasProlog   bool
-	rootElement string
-	unsafe      bool
-	parseError  string
+	hasProlog     bool
+	rootElement   string
+	rootLocalName string
+	unsafe        bool
+	parseError    string
 }
 
 func xfaPacketXMLDiagnostics(text string) xfaXMLDiagnostics {
@@ -342,7 +345,13 @@ func xfaPacketXMLDiagnostics(text string) xfaXMLDiagnostics {
 				}
 				return out
 			}
+			localName, parseError := xfaPacketXMLRootLocalName(text)
+			if parseError != "" {
+				out.parseError = parseError
+				return out
+			}
 			out.rootElement = root
+			out.rootLocalName = localName
 			return out
 		}
 	}
@@ -368,6 +377,38 @@ func xfaPacketXMLRootElement(text string) (string, bool) {
 		return "", false
 	}
 	return root, true
+}
+
+func xfaPacketXMLRootLocalName(text string) (string, string) {
+	decoder := xml.NewDecoder(strings.NewReader(text))
+	rootLocalName := ""
+	for {
+		token, err := decoder.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", "malformed XML root element"
+		}
+		switch t := token.(type) {
+		case xml.StartElement:
+			if rootLocalName == "" {
+				rootLocalName = t.Name.Local
+			}
+		case xml.Directive:
+			directive := strings.TrimSpace(strings.ToUpper(string(t)))
+			if strings.HasPrefix(directive, "DOCTYPE") {
+				return "", "unsafe XML declaration: DOCTYPE is not supported"
+			}
+			if strings.HasPrefix(directive, "ENTITY") {
+				return "", "unsafe XML declaration: ENTITY is not supported"
+			}
+		}
+	}
+	if rootLocalName == "" {
+		return "", "malformed XML root element"
+	}
+	return rootLocalName, ""
 }
 
 func isConservativeXMLName(name string) bool {
@@ -404,13 +445,24 @@ func classifyXFAPacketKind(label, text string) string {
 	if strings.TrimSpace(label) != "" {
 		return classifyXFAPacketKindToken(label)
 	}
+	xmlDiagnostics := xfaPacketXMLDiagnostics(text)
+	if xmlDiagnostics.unsafe || xmlDiagnostics.parseError != "" {
+		return "unknown"
+	}
+	if xmlDiagnostics.rootLocalName != "" {
+		kind := classifyXFAPacketKindToken(xmlDiagnostics.rootLocalName)
+		if kind != "unknown" {
+			return kind
+		}
+		return "xml"
+	}
 	return classifyXFAPacketKindToken(xfaPacketRootToken(text))
 }
 
 func classifyXFAPacketKindToken(token string) string {
 	token = strings.TrimSpace(token)
 	if token == "" {
-		return ""
+		return "unknown"
 	}
 	if at := strings.IndexByte(token, ':'); at >= 0 {
 		token = token[at+1:]
@@ -418,12 +470,12 @@ func classifyXFAPacketKindToken(token string) string {
 	token = strings.TrimLeft(token, "/")
 	token = strings.TrimRight(token, "/")
 	switch token {
-	case "template", "datasets", "config", "localeSet", "connectionSet", "sourceSet", "xdp":
+	case "template", "datasets", "config", "localeSet", "connectionSet", "sourceSet", "xdc", "xfdf", "xdp":
 		return token
 	case "xml":
 		return "xml"
 	default:
-		return ""
+		return "unknown"
 	}
 }
 
@@ -436,7 +488,7 @@ func xfaPacketRootToken(text string) string {
 		if end := strings.Index(text, "?>"); end >= 0 {
 			text = strings.TrimSpace(text[end+2:])
 		} else {
-			return "xml"
+			return ""
 		}
 	}
 	if !strings.HasPrefix(text, "<") || strings.HasPrefix(text, "</") {
@@ -444,7 +496,7 @@ func xfaPacketRootToken(text string) string {
 	}
 	text = text[1:]
 	if strings.HasPrefix(text, "!") || strings.HasPrefix(text, "?") {
-		return "xml"
+		return ""
 	}
 	end := len(text)
 	for i, r := range text {
@@ -454,10 +506,10 @@ func xfaPacketRootToken(text string) string {
 		}
 	}
 	if end == 0 {
-		return "xml"
+		return ""
 	}
 	root := text[:end]
-	if classifyXFAPacketKindToken(root) == "" {
+	if classifyXFAPacketKindToken(root) == "unknown" {
 		return "xml"
 	}
 	return root

@@ -3,12 +3,18 @@ package pdf
 import "strconv"
 
 type pdfTextStateSnapshot struct {
-	InTextObject bool
-	FontName     string
-	FontSize     float64
-	Leading      float64
-	X            float64
-	Y            float64
+	InTextObject      bool
+	FontName          string
+	FontSize          float64
+	Leading           float64
+	CharSpacing       float64
+	WordSpacing       float64
+	HorizontalScaling float64
+	TextRise          float64
+	RenderingMode     int
+	TextMatrix        [6]float64
+	X                 float64
+	Y                 float64
 }
 
 type pdfTextStateTracker struct {
@@ -57,6 +63,56 @@ func (t *pdfTextStateTracker) Apply(operator string, operands ...string) bool {
 		}
 		t.state.Leading = leading
 		return true
+	case "Tc":
+		if !t.state.InTextObject || len(operands) < 1 {
+			return false
+		}
+		charSpacing, ok := parsePDFTextStateNumber(operands[len(operands)-1])
+		if !ok {
+			return false
+		}
+		t.state.CharSpacing = charSpacing
+		return true
+	case "Tw":
+		if !t.state.InTextObject || len(operands) < 1 {
+			return false
+		}
+		wordSpacing, ok := parsePDFTextStateNumber(operands[len(operands)-1])
+		if !ok {
+			return false
+		}
+		t.state.WordSpacing = wordSpacing
+		return true
+	case "Tz":
+		if !t.state.InTextObject || len(operands) < 1 {
+			return false
+		}
+		horizontalScaling, ok := parsePDFTextStateNumber(operands[len(operands)-1])
+		if !ok {
+			return false
+		}
+		t.state.HorizontalScaling = horizontalScaling
+		return true
+	case "Ts":
+		if !t.state.InTextObject || len(operands) < 1 {
+			return false
+		}
+		textRise, ok := parsePDFTextStateNumber(operands[len(operands)-1])
+		if !ok {
+			return false
+		}
+		t.state.TextRise = textRise
+		return true
+	case "Tr":
+		if !t.state.InTextObject || len(operands) < 1 {
+			return false
+		}
+		renderingMode, ok := parsePDFTextStateInteger(operands[len(operands)-1])
+		if !ok {
+			return false
+		}
+		t.state.RenderingMode = renderingMode
+		return true
 	case "Td", "TD":
 		if !t.state.InTextObject || len(operands) < 2 {
 			return false
@@ -73,6 +129,23 @@ func (t *pdfTextStateTracker) Apply(operator string, operands ...string) bool {
 			t.state.Leading = -ty
 		}
 		t.move(tx, ty)
+		return true
+	case "Tm":
+		if !t.state.InTextObject || len(operands) < 6 {
+			return false
+		}
+		var matrix [6]float64
+		start := len(operands) - len(matrix)
+		for i := range matrix {
+			value, ok := parsePDFTextStateNumber(operands[start+i])
+			if !ok {
+				return false
+			}
+			matrix[i] = value
+		}
+		t.state.TextMatrix = matrix
+		t.state.X = matrix[4]
+		t.state.Y = matrix[5]
 		return true
 	case "T*":
 		if !t.state.InTextObject {
@@ -103,6 +176,14 @@ func parsePDFTextStateFontName(token string) (string, bool) {
 
 func parsePDFTextStateNumber(token string) (float64, bool) {
 	value, err := strconv.ParseFloat(token, 64)
+	if err != nil {
+		return 0, false
+	}
+	return value, true
+}
+
+func parsePDFTextStateInteger(token string) (int, bool) {
+	value, err := strconv.Atoi(token)
 	if err != nil {
 		return 0, false
 	}

@@ -218,7 +218,7 @@ func annotationContentsEditOptions(options []AnnotationContentsEditOptions) Anno
 
 func annotationContentsEditAppearanceNote(appearanceRegenerated, appearanceRemoved bool) string {
 	if appearanceRegenerated {
-		return "basic annotation /AP /N appearance stream was regenerated from /Contents and /Rect"
+		return "basic annotation /AP /N appearance stream was regenerated from /Subtype, /Rect, and supported style entries"
 	}
 	if appearanceRemoved {
 		return "stale annotation /AP was removed after updating /Contents"
@@ -228,18 +228,26 @@ func annotationContentsEditAppearanceNote(appearanceRegenerated, appearanceRemov
 
 func buildBasicAnnotationAppearance(candidate annotationCandidate, contents string) (pdfStreamObject, error) {
 	subtype := annotationSubtype(candidate.Dict)
-	switch subtype {
-	case "Text", "FreeText":
-	default:
-		return pdfStreamObject{}, fmt.Errorf("cannot regenerate annotation appearance: unsupported annotation subtype %q", subtype)
-	}
 	rect := annotationRect(candidate.Dict)
 	if len(rect) != 4 || rect[2] <= rect[0] || rect[3] <= rect[1] {
 		return pdfStreamObject{}, fmt.Errorf("cannot regenerate annotation appearance: annotation %d has no usable /Rect", candidate.Index)
 	}
 	width := rect[2] - rect[0]
 	height := rect[3] - rect[1]
-	return basicAnnotationAppearanceStream(width, height, contents)
+	switch subtype {
+	case "Text", "FreeText":
+		return basicAnnotationAppearanceStream(width, height, contents)
+	case "Square", "Circle":
+		return basicShapeAnnotationAppearanceStream(subtype, width, height, annotationNumericArray(candidate.Dict, "C")), nil
+	case "Highlight", "Underline", "StrikeOut":
+		quadPoints, err := annotationQuadPoints(candidate.Dict, candidate.Index)
+		if err != nil {
+			return pdfStreamObject{}, err
+		}
+		return basicTextMarkupAnnotationAppearanceStream(subtype, rect, width, height, annotationNumericArray(candidate.Dict, "C"), quadPoints), nil
+	default:
+		return pdfStreamObject{}, fmt.Errorf("cannot regenerate annotation appearance: unsupported annotation subtype %q", subtype)
+	}
 }
 
 func basicAnnotationAppearanceStream(width, height float64, contents string) (pdfStreamObject, error) {
@@ -268,6 +276,142 @@ func basicAnnotationAppearanceStream(width, height float64, contents string) (pd
 		},
 		Data: []byte(data.String()),
 	}, nil
+}
+
+func basicShapeAnnotationAppearanceStream(subtype string, width, height float64, color []float64) pdfStreamObject {
+	var data strings.Builder
+	data.WriteString("q\n")
+	data.WriteString("1 w\n")
+	writeBasicAnnotationStrokeColor(&data, color)
+	switch subtype {
+	case "Circle":
+		writeBasicAnnotationEllipse(&data, width, height)
+	default:
+		fmt.Fprintf(&data, "0.5 0.5 %s %s re S\n", pdfNumberToken(width-1), pdfNumberToken(height-1))
+	}
+	data.WriteString("Q")
+
+	return pdfStreamObject{
+		Dict: pdfDict{
+			"Type":     pdfName("XObject"),
+			"Subtype":  pdfName("Form"),
+			"FormType": 1,
+			"BBox":     pdfArray{0, 0, width, height},
+		},
+		Data: []byte(data.String()),
+	}
+}
+
+func basicTextMarkupAnnotationAppearanceStream(subtype string, rect []float64, width, height float64, color []float64, quadPoints []float64) pdfStreamObject {
+	var data strings.Builder
+	data.WriteString("q\n")
+	switch subtype {
+	case "Highlight":
+		writeBasicAnnotationFillColor(&data, color, []float64{1, 1, 0})
+		writeBasicHighlightQuads(&data, rect, quadPoints)
+	case "Underline", "StrikeOut":
+		data.WriteString("1 w\n")
+		writeBasicAnnotationStrokeColor(&data, color)
+		writeBasicTextMarkupLines(&data, subtype, rect, quadPoints)
+	}
+	data.WriteString("Q")
+
+	return pdfStreamObject{
+		Dict: pdfDict{
+			"Type":     pdfName("XObject"),
+			"Subtype":  pdfName("Form"),
+			"FormType": 1,
+			"BBox":     pdfArray{0, 0, width, height},
+		},
+		Data: []byte(data.String()),
+	}
+}
+
+func writeBasicHighlightQuads(data *strings.Builder, rect []float64, quadPoints []float64) {
+	for i := 0; i < len(quadPoints); i += 8 {
+		x1, y1 := annotationAppearancePoint(rect, quadPoints[i], quadPoints[i+1])
+		x2, y2 := annotationAppearancePoint(rect, quadPoints[i+2], quadPoints[i+3])
+		x3, y3 := annotationAppearancePoint(rect, quadPoints[i+4], quadPoints[i+5])
+		x4, y4 := annotationAppearancePoint(rect, quadPoints[i+6], quadPoints[i+7])
+		fmt.Fprintf(data, "%s %s m\n", pdfNumberToken(x1), pdfNumberToken(y1))
+		fmt.Fprintf(data, "%s %s l\n", pdfNumberToken(x2), pdfNumberToken(y2))
+		fmt.Fprintf(data, "%s %s l\n", pdfNumberToken(x4), pdfNumberToken(y4))
+		fmt.Fprintf(data, "%s %s l f\n", pdfNumberToken(x3), pdfNumberToken(y3))
+	}
+}
+
+func writeBasicTextMarkupLines(data *strings.Builder, subtype string, rect []float64, quadPoints []float64) {
+	for i := 0; i < len(quadPoints); i += 8 {
+		minX, minY, maxX, maxY := annotationQuadBounds(rect, quadPoints[i:i+8])
+		y := minY + (maxY-minY)*0.1
+		if subtype == "StrikeOut" {
+			y = minY + (maxY-minY)*0.5
+		}
+		fmt.Fprintf(data, "%s %s m\n", pdfNumberToken(minX), pdfNumberToken(y))
+		fmt.Fprintf(data, "%s %s l S\n", pdfNumberToken(maxX), pdfNumberToken(y))
+	}
+}
+
+func annotationAppearancePoint(rect []float64, x, y float64) (float64, float64) {
+	return x - rect[0], y - rect[1]
+}
+
+func annotationQuadBounds(rect []float64, quad []float64) (float64, float64, float64, float64) {
+	x, y := annotationAppearancePoint(rect, quad[0], quad[1])
+	minX, minY, maxX, maxY := x, y, x, y
+	for i := 2; i < len(quad); i += 2 {
+		x, y = annotationAppearancePoint(rect, quad[i], quad[i+1])
+		if x < minX {
+			minX = x
+		}
+		if y < minY {
+			minY = y
+		}
+		if x > maxX {
+			maxX = x
+		}
+		if y > maxY {
+			maxY = y
+		}
+	}
+	return minX, minY, maxX, maxY
+}
+
+func writeBasicAnnotationStrokeColor(data *strings.Builder, color []float64) {
+	switch len(color) {
+	case 1:
+		fmt.Fprintf(data, "%s G\n", pdfNumberToken(color[0]))
+	case 3:
+		fmt.Fprintf(data, "%s %s %s RG\n", pdfNumberToken(color[0]), pdfNumberToken(color[1]), pdfNumberToken(color[2]))
+	default:
+		data.WriteString("0 0 0 RG\n")
+	}
+}
+
+func writeBasicAnnotationFillColor(data *strings.Builder, color []float64, defaultRGB []float64) {
+	switch len(color) {
+	case 1:
+		fmt.Fprintf(data, "%s g\n", pdfNumberToken(color[0]))
+	case 3:
+		fmt.Fprintf(data, "%s %s %s rg\n", pdfNumberToken(color[0]), pdfNumberToken(color[1]), pdfNumberToken(color[2]))
+	default:
+		fmt.Fprintf(data, "%s %s %s rg\n", pdfNumberToken(defaultRGB[0]), pdfNumberToken(defaultRGB[1]), pdfNumberToken(defaultRGB[2]))
+	}
+}
+
+func writeBasicAnnotationEllipse(data *strings.Builder, width, height float64) {
+	const bezierCircleKappa = 0.5522847498
+	cx := width / 2
+	cy := height / 2
+	rx := (width - 1) / 2
+	ry := (height - 1) / 2
+	ox := rx * bezierCircleKappa
+	oy := ry * bezierCircleKappa
+	fmt.Fprintf(data, "%s %s m\n", pdfNumberToken(cx+rx), pdfNumberToken(cy))
+	fmt.Fprintf(data, "%s %s %s %s %s %s c\n", pdfNumberToken(cx+rx), pdfNumberToken(cy+oy), pdfNumberToken(cx+ox), pdfNumberToken(cy+ry), pdfNumberToken(cx), pdfNumberToken(cy+ry))
+	fmt.Fprintf(data, "%s %s %s %s %s %s c\n", pdfNumberToken(cx-ox), pdfNumberToken(cy+ry), pdfNumberToken(cx-rx), pdfNumberToken(cy+oy), pdfNumberToken(cx-rx), pdfNumberToken(cy))
+	fmt.Fprintf(data, "%s %s %s %s %s %s c\n", pdfNumberToken(cx-rx), pdfNumberToken(cy-oy), pdfNumberToken(cx-ox), pdfNumberToken(cy-ry), pdfNumberToken(cx), pdfNumberToken(cy-ry))
+	fmt.Fprintf(data, "%s %s %s %s %s %s c S\n", pdfNumberToken(cx+ox), pdfNumberToken(cy-ry), pdfNumberToken(cx+rx), pdfNumberToken(cy-oy), pdfNumberToken(cx+rx), pdfNumberToken(cy))
 }
 
 func nextAnnotationAppearanceObjectID(graph *pdfGraph) pdfObjectID {
@@ -655,6 +799,26 @@ func annotationQuadPointsCount(dict pdfDict) int {
 		return 0
 	}
 	return len(points) / 8
+}
+
+func annotationQuadPoints(dict pdfDict, annotationIndex int) ([]float64, error) {
+	value, ok := dict["QuadPoints"]
+	if !ok {
+		return nil, fmt.Errorf("cannot regenerate annotation appearance: annotation %d has no /QuadPoints", annotationIndex)
+	}
+	array, ok := value.(pdfArray)
+	if !ok || len(array) == 0 || len(array)%8 != 0 {
+		return nil, fmt.Errorf("cannot regenerate annotation appearance: annotation %d has malformed /QuadPoints", annotationIndex)
+	}
+	points := make([]float64, 0, len(array))
+	for _, item := range array {
+		number, ok := pdfNumericValue(item)
+		if !ok {
+			return nil, fmt.Errorf("cannot regenerate annotation appearance: annotation %d has malformed /QuadPoints", annotationIndex)
+		}
+		points = append(points, number)
+	}
+	return points, nil
 }
 
 func pdfNumericValue(value pdfValue) (float64, bool) {

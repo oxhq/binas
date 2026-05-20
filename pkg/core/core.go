@@ -147,26 +147,34 @@ const (
 )
 
 type EditPlan struct {
-	Target     NodeID      `json:"target"`
-	Operation  string      `json:"operation"`
-	OldText    string      `json:"old_text"`
-	NewText    string      `json:"new_text"`
-	Old        []byte      `json:"-"`
-	New        []byte      `json:"-"`
-	Span       Span        `json:"span"`
-	PageCount  int         `json:"page_count,omitempty"`
-	Invariants []Invariant `json:"invariants"`
+	Target     NodeID         `json:"target"`
+	Operation  string         `json:"operation"`
+	OldText    string         `json:"old_text"`
+	NewText    string         `json:"new_text"`
+	Old        []byte         `json:"-"`
+	New        []byte         `json:"-"`
+	Span       Span           `json:"span"`
+	PageCount  int            `json:"page_count,omitempty"`
+	Invariants []Invariant    `json:"invariants"`
+	Meta       map[string]any `json:"meta,omitempty"`
 }
 
 type Report struct {
-	Format        string        `json:"format"`
-	Edit          string        `json:"edit,omitempty"`
-	FallbackUsed  bool          `json:"fallback_used"`
-	NodesModified int           `json:"nodes_modified"`
-	MatchIndex    *int          `json:"match_index,omitempty"`
-	OutputPath    string        `json:"output_path,omitempty"`
-	Invariants    []Invariant   `json:"invariants,omitempty"`
-	Verification  *Verification `json:"verification,omitempty"`
+	Format         string          `json:"format"`
+	Edit           string          `json:"edit,omitempty"`
+	FallbackUsed   bool            `json:"fallback_used"`
+	FallbackPolicy *FallbackPolicy `json:"fallback_policy,omitempty"`
+	NodesModified  int             `json:"nodes_modified"`
+	MatchIndex     *int            `json:"match_index,omitempty"`
+	OutputPath     string          `json:"output_path,omitempty"`
+	Invariants     []Invariant     `json:"invariants,omitempty"`
+	Verification   *Verification   `json:"verification,omitempty"`
+	Meta           map[string]any  `json:"meta,omitempty"`
+}
+
+type FallbackPolicy struct {
+	Fallback string `json:"fallback"`
+	Mode     string `json:"mode"`
 }
 
 type Verification struct {

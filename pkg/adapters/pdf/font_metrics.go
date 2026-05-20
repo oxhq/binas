@@ -88,12 +88,105 @@ func enrichTextShowFontWidthMetadata(meta map[string]any, font string, encoded s
 		return
 	}
 	meta["width_units"] = widthUnits
+	annotateTextShowLayoutProofMetadata(meta, &widthUnits, nil)
+	meta["font_first_char"] = metrics.FirstChar
+	meta["font_widths"] = append([]int(nil), metrics.Widths...)
 	if missingUsed {
 		meta["width_source"] = "/Widths+/MissingWidth"
 		meta["missing_width_used"] = true
+		if metrics.MissingWidth != nil {
+			meta["font_missing_width"] = *metrics.MissingWidth
+		}
 		return
 	}
 	meta["width_source"] = "/Widths"
+}
+
+func textShowReplacementLayoutProofMetadata(nodeMeta map[string]any, newEncoded string) map[string]any {
+	if nodeMeta == nil {
+		return nil
+	}
+	oldWidth, ok := metadataInt(nodeMeta["width_units"])
+	if !ok {
+		return nil
+	}
+	metrics, ok := simpleFontMetricsFromMetadata(nodeMeta)
+	if !ok {
+		return textShowCIDReplacementLayoutProofMetadata(nodeMeta, newEncoded)
+	}
+	encoding, _ := nodeMeta["encoding"].(string)
+	codes, ok := textShowSimpleFontCodes(newEncoded, encoding)
+	if !ok {
+		return map[string]any{
+			"layout_proof": layoutProofStatusWidthUnproven,
+		}
+	}
+	newWidth, missingUsed, ok := metrics.widthUnits(codes)
+	if !ok {
+		return map[string]any{
+			"layout_proof": layoutProofStatusWidthUnproven,
+		}
+	}
+	out := map[string]any{
+		"old_width_units": oldWidth,
+		"new_width_units": newWidth,
+	}
+	annotateTextShowLayoutProofMetadata(out, &oldWidth, &newWidth)
+	if missingUsed {
+		out["missing_width_used"] = true
+	}
+	return out
+}
+
+func simpleFontMetricsFromMetadata(meta map[string]any) (pdfSimpleFontMetrics, bool) {
+	firstChar, ok := metadataInt(meta["font_first_char"])
+	if !ok {
+		return pdfSimpleFontMetrics{}, false
+	}
+	widths, ok := metadataIntSlice(meta["font_widths"])
+	if !ok || len(widths) == 0 {
+		return pdfSimpleFontMetrics{}, false
+	}
+	metrics := pdfSimpleFontMetrics{
+		FirstChar: firstChar,
+		Widths:    widths,
+	}
+	if missingWidth, ok := metadataInt(meta["font_missing_width"]); ok {
+		metrics.MissingWidth = &missingWidth
+	}
+	return metrics, true
+}
+
+func metadataInt(value any) (int, bool) {
+	switch v := value.(type) {
+	case int:
+		return v, true
+	case int64:
+		return int(v), true
+	case float64:
+		if v == float64(int(v)) {
+			return int(v), true
+		}
+	}
+	return 0, false
+}
+
+func metadataIntSlice(value any) ([]int, bool) {
+	switch v := value.(type) {
+	case []int:
+		return append([]int(nil), v...), true
+	case []any:
+		out := make([]int, 0, len(v))
+		for _, item := range v {
+			n, ok := metadataInt(item)
+			if !ok {
+				return nil, false
+			}
+			out = append(out, n)
+		}
+		return out, true
+	}
+	return nil, false
 }
 
 func (m pdfSimpleFontMetrics) widthUnits(codes []byte) (int, bool, bool) {

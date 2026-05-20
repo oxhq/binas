@@ -82,6 +82,53 @@ func TestSecuritySignaturePreserveIncrementalAcceptsParseableByteRangeProof(t *t
 	}
 }
 
+func TestSecurityMetadataIncludesDirectSignatureDictionaryMetadata(t *testing.T) {
+	input := testPDF(
+		"<< /Type /Catalog /SigFlags 3 /AcroForm << /Fields [2 0 R] >> >>",
+		"<< /FT /Sig /T (Approval) /V 3 0 R >>",
+		"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /M (D:20260518123456-07'00') /ByteRange [0 10 20 30] /Contents <01020f> >>",
+	)
+
+	metadata := SecurityMetadataForInput(input)
+	signature := metadata.Signature
+	if !metadata.Signed || !signature.Present {
+		t.Fatalf("signature metadata = %+v, want present signed PDF", metadata)
+	}
+	if signature.ByteRangeCount != 2 {
+		t.Fatalf("ByteRangeCount = %d, want 2", signature.ByteRangeCount)
+	}
+	if signature.ContentsByteLength == nil || *signature.ContentsByteLength != 3 {
+		t.Fatalf("ContentsByteLength = %v, want 3", signature.ContentsByteLength)
+	}
+	if signature.Filter != "Adobe.PPKLite" || signature.SubFilter != "adbe.pkcs7.detached" || signature.SigningTime != "D:20260518123456-07'00'" {
+		t.Fatalf("signature dictionary metadata = %+v, want parsed filter/subfilter/signing time", signature)
+	}
+	if signature.SignatureContainer != "pkcs7" || signature.DigestAlgorithm != signatureDigestAlgorithmUnknown || signature.DigestAlgorithmStatus != signatureDigestAlgorithmNotParsed {
+		t.Fatalf("signature diagnostics = container %q digest %q/%q, want pkcs7/unknown/%q", signature.SignatureContainer, signature.DigestAlgorithm, signature.DigestAlgorithmStatus, signatureDigestAlgorithmNotParsed)
+	}
+	if signature.CryptographicValidation || signature.CryptographicValidationStatus != signatureCryptographicValidationNotPerformed {
+		t.Fatalf("cryptographic validation = %t/%q, want false/%q", signature.CryptographicValidation, signature.CryptographicValidationStatus, signatureCryptographicValidationNotPerformed)
+	}
+}
+
+func TestSecurityMetadataIncludesSignatureDigestDiagnostics(t *testing.T) {
+	input := testPDF(
+		"<< /Type /Catalog /SigFlags 3 >>",
+		"<< /Type /Sig /ByteRange [0 10 20 30] /Contents <302006092a864886f70d010702060960864801650304020100000000000000000000> >>",
+	)
+
+	signature := SecurityMetadataForInput(input).Signature
+	if signature.SignatureContainer != "pkcs7" {
+		t.Fatalf("SignatureContainer = %q, want pkcs7", signature.SignatureContainer)
+	}
+	if signature.DigestAlgorithm != "sha256" || signature.DigestAlgorithmStatus != signatureDigestAlgorithmContentsOIDHint {
+		t.Fatalf("digest algorithm = %q/%q, want sha256/%q", signature.DigestAlgorithm, signature.DigestAlgorithmStatus, signatureDigestAlgorithmContentsOIDHint)
+	}
+	if signature.CryptographicValidation || signature.CryptographicValidationStatus != signatureCryptographicValidationNotPerformed {
+		t.Fatalf("cryptographic validation = %t/%q, want false/%q", signature.CryptographicValidation, signature.CryptographicValidationStatus, signatureCryptographicValidationNotPerformed)
+	}
+}
+
 func TestSecuritySignaturePreserveIncrementalRequiresByteRangeProof(t *testing.T) {
 	input := testPDF("<< /Type /Catalog /SigFlags 3 >>", "<<>>")
 

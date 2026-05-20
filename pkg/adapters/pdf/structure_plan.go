@@ -15,12 +15,33 @@ type pdfStructurePlan struct {
 	ObjectStreamObjects int
 	XrefStreamObjects   int
 	UnknownObjects      int
+	HasTableXref        bool
+	HasXrefStream       bool
+	HasHybridXref       bool
 	Objects             []pdfStructureObjectPlan
 }
 
 type pdfStructureObjectPlan struct {
 	ID     pdfObjectID
 	Origin pdfStructureObjectOrigin
+}
+
+func (p pdfStructurePlan) metadata() map[string]any {
+	return map[string]any{
+		"total_objects":          p.TotalObjects,
+		"normal_objects":         p.NormalObjects,
+		"object_stream_objects":  p.ObjectStreamObjects,
+		"xref_stream_objects":    p.XrefStreamObjects,
+		"unknown_objects":        p.UnknownObjects,
+		"has_table_xref":         p.HasTableXref,
+		"has_xref_stream":        p.HasXrefStream,
+		"has_hybrid_xref":        p.HasHybridXref,
+		"requires_packed_writer": p.requiresPackedWriter(),
+	}
+}
+
+func (p pdfStructurePlan) requiresPackedWriter() bool {
+	return p.ObjectStreamObjects > 0 || p.XrefStreamObjects > 0 || p.HasHybridXref
 }
 
 func summarizePDFStructurePlan(graph *pdfGraph) pdfStructurePlan {
@@ -39,7 +60,10 @@ func summarizePDFStructurePlan(graph *pdfGraph) pdfStructurePlan {
 	}
 
 	plan := pdfStructurePlan{
-		Objects: make([]pdfStructureObjectPlan, 0, len(graph.Objects)),
+		HasTableXref:  graph.Xref.HasTable,
+		HasXrefStream: graph.Xref.HasStream,
+		HasHybridXref: graph.Xref.HasHybridStream,
+		Objects:       make([]pdfStructureObjectPlan, 0, len(graph.Objects)),
 	}
 	for _, object := range sortedPDFObjects(graph.Objects) {
 		origin := pdfStructureOriginForObject(object, xrefObjects, xrefStreamObjects)

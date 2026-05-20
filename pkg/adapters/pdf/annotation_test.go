@@ -3,6 +3,7 @@ package pdf
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -135,6 +136,217 @@ func TestApplyAnnotationContentsEditCanRegenerateBasicTextAppearance(t *testing.
 	}
 }
 
+func TestApplyAnnotationContentsEditCanRegenerateSquareAppearance(t *testing.T) {
+	input := testPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Page /Annots [3 0 R] >>",
+		"<< /Type /Annot /Subtype /Square /Rect [10 20 50 45] /Contents (old square) /C [1 0.5 0] >>",
+	)
+
+	output, report, verification, err := ApplyAnnotationContentsEdit(input, 0, "fresh square", AnnotationContentsEditOptions{
+		RegenerateAppearance: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !report.AppearanceRegenerated || report.AppearanceInvalidated || report.AppearanceRemoved {
+		t.Fatalf("appearance report = regenerated %v invalidated %v removed %v note %q", report.AppearanceRegenerated, report.AppearanceInvalidated, report.AppearanceRemoved, report.AppearanceNote)
+	}
+	if !strings.Contains(report.AppearanceNote, "basic") {
+		t.Fatalf("appearance note = %q, want basic regeneration note", report.AppearanceNote)
+	}
+	if !verification.ReparseOK || !verification.ContentsUpdated || !verification.PageUnchanged || !verification.AppearanceRegenerated || verification.AppearanceInvalidated || verification.AppearanceRemoved {
+		t.Fatalf("verification = %+v", verification)
+	}
+
+	stream := annotationCandidateNormalAppearanceStream(t, output, 0)
+	if got := string(stream.Data); !strings.Contains(got, "1 0.5 0 RG") || !strings.Contains(got, "0.5 0.5 39 24 re S") {
+		t.Fatalf("square appearance data = %q", got)
+	}
+	if bbox := stream.Dict["BBox"].(pdfArray); len(bbox) != 4 || fmt.Sprint(bbox[2]) != "40" || fmt.Sprint(bbox[3]) != "25" {
+		t.Fatalf("square BBox = %+v, want width 40 height 25", bbox)
+	}
+}
+
+func TestApplyAnnotationContentsEditCanRegenerateCircleAppearance(t *testing.T) {
+	input := testPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Page /Annots [3 0 R] >>",
+		"<< /Type /Annot /Subtype /Circle /Rect [0 0 20 10] /Contents (old circle) /C [0.25] >>",
+	)
+
+	output, report, verification, err := ApplyAnnotationContentsEdit(input, 0, "fresh circle", AnnotationContentsEditOptions{
+		RegenerateAppearance: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !report.AppearanceRegenerated || report.AppearanceInvalidated || report.AppearanceRemoved {
+		t.Fatalf("appearance report = regenerated %v invalidated %v removed %v note %q", report.AppearanceRegenerated, report.AppearanceInvalidated, report.AppearanceRemoved, report.AppearanceNote)
+	}
+	if !verification.ReparseOK || !verification.ContentsUpdated || !verification.PageUnchanged || !verification.AppearanceRegenerated || verification.AppearanceInvalidated || verification.AppearanceRemoved {
+		t.Fatalf("verification = %+v", verification)
+	}
+
+	stream := annotationCandidateNormalAppearanceStream(t, output, 0)
+	got := string(stream.Data)
+	for _, want := range []string{
+		"0.25 G",
+		"19.5 5 m",
+		" c\n",
+		" c S\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("circle appearance missing %q in %q", want, got)
+		}
+	}
+	if bbox := stream.Dict["BBox"].(pdfArray); len(bbox) != 4 || fmt.Sprint(bbox[2]) != "20" || fmt.Sprint(bbox[3]) != "10" {
+		t.Fatalf("circle BBox = %+v, want width 20 height 10", bbox)
+	}
+}
+
+func TestApplyAnnotationContentsEditCanRegenerateHighlightAppearance(t *testing.T) {
+	input := testPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Page /Annots [3 0 R] >>",
+		"<< /Type /Annot /Subtype /Highlight /Rect [10 20 80 40] /Contents (old highlight) /C [0.5 0.75 0.25] /QuadPoints [12 36 72 36 12 24 72 24] >>",
+	)
+
+	output, report, verification, err := ApplyAnnotationContentsEdit(input, 0, "fresh highlight", AnnotationContentsEditOptions{
+		RegenerateAppearance: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !report.AppearanceRegenerated || report.AppearanceInvalidated || report.AppearanceRemoved {
+		t.Fatalf("appearance report = regenerated %v invalidated %v removed %v note %q", report.AppearanceRegenerated, report.AppearanceInvalidated, report.AppearanceRemoved, report.AppearanceNote)
+	}
+	if !strings.Contains(report.AppearanceNote, "basic") {
+		t.Fatalf("appearance note = %q, want basic regeneration note", report.AppearanceNote)
+	}
+	if !verification.ReparseOK || !verification.ContentsUpdated || !verification.PageUnchanged || !verification.AppearanceRegenerated || verification.AppearanceInvalidated || verification.AppearanceRemoved {
+		t.Fatalf("verification = %+v", verification)
+	}
+
+	stream := annotationCandidateNormalAppearanceStream(t, output, 0)
+	got := string(stream.Data)
+	for _, want := range []string{
+		"0.5 0.75 0.25 rg",
+		"2 16 m",
+		"62 16 l",
+		"62 4 l",
+		"2 4 l f",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("highlight appearance missing %q in %q", want, got)
+		}
+	}
+	if bbox := stream.Dict["BBox"].(pdfArray); len(bbox) != 4 || fmt.Sprint(bbox[2]) != "70" || fmt.Sprint(bbox[3]) != "20" {
+		t.Fatalf("highlight BBox = %+v, want width 70 height 20", bbox)
+	}
+}
+
+func TestApplyAnnotationContentsEditCanRegenerateUnderlineAndStrikeOutAppearance(t *testing.T) {
+	tests := []struct {
+		name          string
+		subtype       string
+		color         string
+		wantColor     string
+		wantFirstLine string
+		wantSecond    string
+	}{
+		{
+			name:          "underline",
+			subtype:       "Underline",
+			color:         "[0 0 1]",
+			wantColor:     "0 0 1 RG",
+			wantFirstLine: "4 3.2 m",
+			wantSecond:    "54 3.2 l S",
+		},
+		{
+			name:          "strikeout",
+			subtype:       "StrikeOut",
+			color:         "[0.25]",
+			wantColor:     "0.25 G",
+			wantFirstLine: "4 8 m",
+			wantSecond:    "54 8 l S",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := testPDF(
+				"<< /Type /Catalog /Pages 2 0 R >>",
+				"<< /Type /Page /Annots [3 0 R] >>",
+				fmt.Sprintf("<< /Type /Annot /Subtype /%s /Rect [10 20 80 40] /Contents (old markup) /C %s /QuadPoints [14 34 64 34 14 22 64 22] >>", tt.subtype, tt.color),
+			)
+
+			output, report, verification, err := ApplyAnnotationContentsEdit(input, 0, "fresh markup", AnnotationContentsEditOptions{
+				RegenerateAppearance: true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !report.AppearanceRegenerated || !verification.AppearanceRegenerated {
+				t.Fatalf("appearance was not regenerated: report %+v verification %+v", report, verification)
+			}
+
+			stream := annotationCandidateNormalAppearanceStream(t, output, 0)
+			got := string(stream.Data)
+			for _, want := range []string{tt.wantColor, tt.wantFirstLine, tt.wantSecond} {
+				if !strings.Contains(got, want) {
+					t.Fatalf("%s appearance missing %q in %q", tt.subtype, want, got)
+				}
+			}
+		})
+	}
+}
+
+func TestApplyAnnotationContentsEditRegenerateMarkupAppearanceRequiresDirectUsableQuadPoints(t *testing.T) {
+	tests := []struct {
+		name    string
+		annot   string
+		wantErr string
+	}{
+		{
+			name:    "missing",
+			annot:   "<< /Type /Annot /Subtype /Highlight /Rect [0 0 10 10] /Contents (old note) >>",
+			wantErr: "has no /QuadPoints",
+		},
+		{
+			name:    "wrong length",
+			annot:   "<< /Type /Annot /Subtype /Underline /Rect [0 0 10 10] /Contents (old note) /QuadPoints [0 0 10 10] >>",
+			wantErr: "has malformed /QuadPoints",
+		},
+		{
+			name:    "non numeric",
+			annot:   "<< /Type /Annot /Subtype /StrikeOut /Rect [0 0 10 10] /Contents (old note) /QuadPoints [0 0 10 10 0 5 /bad 5] >>",
+			wantErr: "has malformed /QuadPoints",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := testPDF(
+				"<< /Type /Catalog /Pages 2 0 R >>",
+				"<< /Type /Page /Annots [3 0 R] >>",
+				tt.annot,
+			)
+
+			_, _, _, err := ApplyAnnotationContentsEdit(input, 0, "new note", AnnotationContentsEditOptions{
+				RegenerateAppearance: true,
+			})
+			if err == nil {
+				t.Fatal("expected regenerate appearance to fail")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %q, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestApplyAnnotationContentsEditRegeneratesMultilineWrappedAppearance(t *testing.T) {
 	input := testPDF(
 		"<< /Type /Catalog /Pages 2 0 R >>",
@@ -210,7 +422,7 @@ func TestApplyAnnotationContentsEditRegenerateAppearanceFailsForUnsupportedSubty
 	input := testPDF(
 		"<< /Type /Catalog /Pages 2 0 R >>",
 		"<< /Type /Page /Annots [3 0 R] >>",
-		"<< /Type /Annot /Subtype /Square /Rect [0 0 10 10] /Contents (old note) >>",
+		"<< /Type /Annot /Subtype /Popup /Rect [0 0 10 10] /Contents (old note) >>",
 	)
 
 	_, _, _, err := ApplyAnnotationContentsEdit(input, 0, "new note", AnnotationContentsEditOptions{
@@ -219,7 +431,7 @@ func TestApplyAnnotationContentsEditRegenerateAppearanceFailsForUnsupportedSubty
 	if err == nil {
 		t.Fatal("expected regenerate appearance to fail for unsupported subtype")
 	}
-	if !strings.Contains(err.Error(), `unsupported annotation subtype "Square"`) {
+	if !strings.Contains(err.Error(), `unsupported annotation subtype "Popup"`) {
 		t.Fatalf("error = %q", err)
 	}
 }
@@ -434,6 +646,23 @@ func annotationCandidateHasAP(t *testing.T, input []byte, index int) bool {
 func annotationCandidateHasNormalAppearanceStream(t *testing.T, input []byte, index int) bool {
 	t.Helper()
 
+	_, ok := annotationCandidateNormalAppearanceStreamIfPresent(t, input, index)
+	return ok
+}
+
+func annotationCandidateNormalAppearanceStream(t *testing.T, input []byte, index int) pdfStreamObject {
+	t.Helper()
+
+	stream, ok := annotationCandidateNormalAppearanceStreamIfPresent(t, input, index)
+	if !ok {
+		t.Fatalf("updated annotation missing normal appearance stream:\n%s", input)
+	}
+	return stream
+}
+
+func annotationCandidateNormalAppearanceStreamIfPresent(t *testing.T, input []byte, index int) (pdfStreamObject, bool) {
+	t.Helper()
+
 	graph, err := parsePDFGraph(input)
 	if err != nil {
 		t.Fatal(err)
@@ -444,20 +673,20 @@ func annotationCandidateHasNormalAppearanceStream(t *testing.T, input []byte, in
 	}
 	ap, ok := candidates[index].Dict["AP"].(pdfDict)
 	if !ok {
-		return false
+		return pdfStreamObject{}, false
 	}
 	switch normal := ap["N"].(type) {
 	case pdfRef:
 		object := graph.Objects[normal.ID]
 		if object == nil {
-			return false
+			return pdfStreamObject{}, false
 		}
-		_, ok := object.Value.(pdfStreamObject)
-		return ok
+		stream, ok := object.Value.(pdfStreamObject)
+		return stream, ok
 	case pdfStreamObject:
-		return true
+		return normal, true
 	default:
-		return false
+		return pdfStreamObject{}, false
 	}
 }
 

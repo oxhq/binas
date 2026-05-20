@@ -183,6 +183,7 @@ func (Adapter) PlanEdit(tree *core.Tree, selector core.Match, mutation core.Muta
 	if err != nil {
 		return nil, err
 	}
+	layoutProofMeta := textShowReplacementLayoutProofMetadata(target.Meta, newEncoded)
 	if filter, _ := target.Meta["stream_filter"].(string); !isPassthroughPDFStreamFilter(filter) {
 		decodeParms, _ := target.Meta["stream_decode_parms"].(string)
 		streamBytes, ok := target.Meta["stream_encoded"].([]byte)
@@ -239,6 +240,7 @@ func (Adapter) PlanEdit(tree *core.Tree, selector core.Match, mutation core.Muta
 				core.InvariantPageUnchanged,
 				core.InvariantNoFallbackUsed,
 			},
+			Meta: layoutProofMeta,
 		}, nil
 	}
 	if target.Span.Len() != int64(len(oldEncoded)) {
@@ -268,6 +270,7 @@ func (Adapter) PlanEdit(tree *core.Tree, selector core.Match, mutation core.Muta
 			core.InvariantPageUnchanged,
 			core.InvariantNoFallbackUsed,
 		},
+		Meta: layoutProofMeta,
 	}, nil
 }
 
@@ -307,13 +310,14 @@ func (Adapter) Apply(input []byte, plan *core.EditPlan) ([]byte, core.Report, er
 	if err != nil {
 		return nil, core.Report{}, err
 	}
-	return output, core.Report{
+	return output, WithNoFallbackPolicy(core.Report{
 		Format:        "pdf",
 		Edit:          plan.Operation,
 		FallbackUsed:  false,
 		NodesModified: 1,
 		Invariants:    plan.Invariants,
-	}, nil
+		Meta:          plan.Meta,
+	}), nil
 }
 
 func (a Adapter) Verify(output []byte, plan *core.EditPlan) (core.Verification, error) {
@@ -557,8 +561,21 @@ func parseStreams(input []byte, tree *core.Tree, root core.NodeID, cmapContext p
 			"length_ref":     stream.lengthIndirect,
 			"encoded_length": len(streamBytes),
 		}
+		if stream.imageXObject {
+			streamMeta["image_xobject"] = true
+		}
 		if filterChain := parsePDFStreamFilterChain(stream.filter); len(filterChain) > 0 {
 			streamMeta["filter_chain"] = filterChain
+		}
+		if stream.imageXObject && markPDFImageXObjectFilterPassThrough(streamMeta, stream.filter) {
+			streamID := tree.AddNode(core.Node{
+				Kind: KindStream,
+				Span: core.Span{Start: int64(stream.dataStart), End: int64(stream.dataEnd)},
+				Meta: streamMeta,
+			})
+			tree.Nodes[root].Children = append(tree.Nodes[root].Children, streamID)
+			pos = stream.endstreamAt + len("endstream")
+			continue
 		}
 		if stream.unsupportedReason != "" {
 			streamMeta["unsupported"] = stream.unsupportedReason
@@ -590,6 +607,10 @@ func parseStreams(input []byte, tree *core.Tree, root core.NodeID, cmapContext p
 			Meta: streamMeta,
 		})
 		tree.Nodes[root].Children = append(tree.Nodes[root].Children, streamID)
+		if stream.imageXObject {
+			pos = stream.endstreamAt + len("endstream")
+			continue
+		}
 		parseTextShow(decodedBytes, 0, len(decodedBytes), tree, streamID, textShowContext{
 			sourceOffset:      stream.dataStart,
 			streamSpan:        core.Span{Start: int64(stream.dataStart), End: int64(stream.dataEnd)},
@@ -599,7 +620,9 @@ func parseStreams(input []byte, tree *core.Tree, root core.NodeID, cmapContext p
 			decodedContent:    bytes.Clone(decodedBytes),
 			toUnicode:         cmapContext.fallback,
 			fontToUnicode:     cmapContext.fontCMapsForStream(stream.dataStart),
+			fontEncodings:     cmapContext.fontEncodingsForStream(stream.dataStart),
 			fontMetrics:       cmapContext.fontMetricsForStream(stream.dataStart),
+			cidMetrics:        cmapContext.cidMetricsForStream(stream.dataStart),
 		})
 		pos = stream.endstreamAt + len("endstream")
 	}
@@ -622,6 +645,9 @@ func enrichPDFStreamNodeMetadata(tree *core.Tree) {
 		}
 		filter, _ := meta["filter"].(string)
 		addPDFStreamFilterCapabilityMetadata(meta, filter)
+		if imageXObject, _ := meta["image_xobject"].(bool); imageXObject {
+			markPDFImageXObjectFilterPassThrough(meta, filter)
+		}
 		if filterChain := parsePDFStreamFilterChain(filter); len(filterChain) > 0 {
 			if _, ok := meta["filter_chain"]; !ok {
 				meta["filter_chain"] = filterChain
@@ -635,6 +661,28 @@ func enrichPDFStreamNodeMetadata(tree *core.Tree) {
 	}
 }
 
+func markPDFImageXObjectFilterPassThrough(meta map[string]any, filter string) bool {
+	chain := normalizePDFStreamFilterCapabilityChain(parsePDFStreamFilterChain(filter))
+	if len(chain) == 0 || !pdfStreamFilterChainContainsImagePassThrough(chain) {
+		return false
+	}
+	meta["filter_capability"] = string(pdfStreamFilterCapabilityPassThroughImage)
+	meta["filter_editable"] = false
+	meta["filter_pass_through"] = true
+	meta["filter_target"] = false
+	meta["filter_chain"] = chain
+	return true
+}
+
+func pdfStreamFilterChainContainsImagePassThrough(filters []string) bool {
+	for _, filter := range filters {
+		if isImagePassThroughPDFStreamFilter(filter) {
+			return true
+		}
+	}
+	return false
+}
+
 type streamInfo struct {
 	streamAt          int
 	dataStart         int
@@ -645,6 +693,7 @@ type streamInfo struct {
 	lengthIndirect    bool
 	filter            string
 	decodeParms       string
+	imageXObject      bool
 	unsupportedReason string
 }
 
@@ -700,6 +749,7 @@ func findNextStream(input []byte, pos int) (streamInfo, bool, error) {
 		}
 	}
 	filter, decodeParms, filterUnsupported := findDirectStreamFilterAndDecodeParms(input, objStart, streamAt)
+	imageXObject := isDirectImageXObjectStreamDictionary(input, objStart, streamAt)
 	if unsupportedReason == "" {
 		unsupportedReason = filterUnsupported
 	}
@@ -716,8 +766,34 @@ func findNextStream(input []byte, pos int) (streamInfo, bool, error) {
 		lengthIndirect:    indirect,
 		filter:            filter,
 		decodeParms:       decodeParms,
+		imageXObject:      imageXObject,
 		unsupportedReason: unsupportedReason,
 	}, true, nil
+}
+
+func isDirectImageXObjectStreamDictionary(input []byte, start, end int) bool {
+	if start < 0 || end > len(input) || start >= end {
+		return false
+	}
+	dictStartRel := bytes.Index(input[start:end], []byte("<<"))
+	if dictStartRel == -1 {
+		return false
+	}
+	dictStart := start + dictStartRel
+	dictEnd, ok := findDictionaryEnd(input, dictStart)
+	if !ok || dictEnd > end {
+		return false
+	}
+	parser := pdfValueParser{input: input[dictStart:dictEnd]}
+	value, err := parser.parseValue()
+	if err != nil {
+		return false
+	}
+	dict, ok := value.(pdfDict)
+	if !ok {
+		return false
+	}
+	return dictHasName(dict, "Subtype", "Image")
 }
 
 func findDirectStreamFilter(input []byte, start, end int) (string, string) {
@@ -1304,14 +1380,20 @@ type textShowContext struct {
 	decodedContent    []byte
 	toUnicode         *toUnicodeCMap
 	fontToUnicode     map[string]*toUnicodeCMap
+	fontEncodings     map[string]*pdfSimpleFontEncoding
 	fontMetrics       map[string]pdfSimpleFontMetrics
+	cidMetrics        map[string]pdfCIDFontMetrics
 }
 
 func parseTextShow(input []byte, start, end int, tree *core.Tree, streamID core.NodeID, ctx textShowContext) {
 	activeFont := ""
+	textState := newPDFTextStateTracker()
+	stateScanAt := start
 	for i := start; i < end; i++ {
 		if font, next, ok := nextSetFontOperator(input, i, end); ok {
 			activeFont = font
+			applyPDFTextStateOperators(input, stateScanAt, next, textState)
+			stateScanAt = next
 			i = next - 1
 			continue
 		}
@@ -1326,7 +1408,7 @@ func parseTextShow(input []byte, start, end int, tree *core.Tree, streamID core.
 		)
 		switch input[i] {
 		case '[':
-			arrayDecoded, arrayEncoded, arrayEnd, arrayUsedCMap, arrayOK := parseSimpleTJArrayText(input, i, end, ctx.cmapForFont(activeFont))
+			arrayDecoded, arrayEncoded, arrayEnd, arrayUsedCMap, arrayUsedFontEncoding, arrayOK := parseSimpleTJArrayText(input, i, end, ctx.cmapForFont(activeFont), ctx.fontEncodingForFont(activeFont))
 			if !arrayOK {
 				continue
 			}
@@ -1343,6 +1425,8 @@ func parseTextShow(input []byte, start, end int, tree *core.Tree, streamID core.
 			encoding = "tj-array"
 			if arrayUsedCMap {
 				encoding = "tj-array-cmap"
+			} else if arrayUsedFontEncoding {
+				encoding = "tj-array-font-encoding"
 			}
 		case '(':
 			closeAt, ok = findLiteralEnd(input, i+1, end)
@@ -1352,8 +1436,13 @@ func parseTextShow(input []byte, start, end int, tree *core.Tree, streamID core.
 			operandEnd = closeAt + 1
 			operandStart = i + 1
 			encoded = string(input[operandStart:closeAt])
-			decoded = decodeLiteralString(encoded)
 			encoding = "literal"
+			if fontEncoding := ctx.fontEncodingForFont(activeFont); fontEncoding != nil {
+				decoded = fontEncoding.DecodeBytes(decodeLiteralBytes(encoded))
+				encoding = "literal-font-encoding"
+			} else {
+				decoded = decodeLiteralString(encoded)
+			}
 		case '<':
 			if i+1 < end && input[i+1] == '<' {
 				continue
@@ -1366,8 +1455,9 @@ func parseTextShow(input []byte, start, end int, tree *core.Tree, streamID core.
 			operandStart = i + 1
 			encoded = string(input[operandStart:closeAt])
 			var usedCMap bool
+			var usedFontEncoding bool
 			cmap := ctx.cmapForFont(activeFont)
-			decoded, usedCMap, ok = decodeHexTextStringWithCMap([]byte(encoded), cmap)
+			decoded, usedCMap, usedFontEncoding, ok = decodeHexTextStringWithContext([]byte(encoded), cmap, ctx.fontEncodingForFont(activeFont))
 			if !ok {
 				i = closeAt
 				continue
@@ -1375,13 +1465,21 @@ func parseTextShow(input []byte, start, end int, tree *core.Tree, streamID core.
 			encoding = "hex"
 			if usedCMap {
 				encoding = "hex-cmap"
+			} else if usedFontEncoding {
+				encoding = "hex-font-encoding"
 			}
 		default:
 			continue
 		}
-		op, _ := nextOperator(input, operandEnd, end)
+		op, opEnd := nextOperator(input, operandEnd, end)
 		if op == "" {
 			i = closeAt
+			continue
+		}
+		trailingOperands := applyPDFTextStateOperators(input, stateScanAt, operandStart, textState)
+		if !applyPDFTextShowOperatorState(op, trailingOperands, textState) {
+			i = opEnd - 1
+			stateScanAt = opEnd
 			continue
 		}
 		span := core.Span{Start: int64(ctx.sourceOffset + operandStart), End: int64(ctx.sourceOffset + closeAt)}
@@ -1390,13 +1488,21 @@ func parseTextShow(input []byte, start, end int, tree *core.Tree, streamID core.
 			"encoded":  encoded,
 			"encoding": encoding,
 		}
+		enrichTextShowTextStateMetadata(meta, textState.Snapshot())
 		if encoding == "hex-cmap" || encoding == "tj-array-cmap" {
 			meta["cmap"] = ctx.cmapForFont(activeFont)
 			if activeFont != "" {
 				meta["font"] = activeFont
 			}
 		}
+		if encoding == "hex-font-encoding" || encoding == "literal-font-encoding" || encoding == "tj-array-font-encoding" {
+			meta["font_encoding"] = ctx.fontEncodingForFont(activeFont)
+			if activeFont != "" {
+				meta["font"] = activeFont
+			}
+		}
 		enrichTextShowFontWidthMetadata(meta, activeFont, encoded, encoding, ctx.fontMetrics)
+		enrichTextShowCIDWidthMetadata(meta, activeFont, encoded, encoding, ctx.cidMetrics)
 		if !isPassthroughPDFStreamFilter(ctx.streamFilter) {
 			span = ctx.streamSpan
 			meta["stream_filter"] = ctx.streamFilter
@@ -1413,7 +1519,8 @@ func parseTextShow(input []byte, start, end int, tree *core.Tree, streamID core.
 			Meta:  meta,
 		})
 		tree.Nodes[streamID].Children = append(tree.Nodes[streamID].Children, textID)
-		i = closeAt
+		stateScanAt = opEnd
+		i = opEnd - 1
 	}
 }
 
@@ -1424,6 +1531,15 @@ func (ctx textShowContext) cmapForFont(font string) *toUnicodeCMap {
 		}
 	}
 	return ctx.toUnicode
+}
+
+func (ctx textShowContext) fontEncodingForFont(font string) *pdfSimpleFontEncoding {
+	if font != "" && ctx.fontEncodings != nil {
+		if encoding, ok := ctx.fontEncodings[font]; ok {
+			return encoding
+		}
+	}
+	return nil
 }
 
 func encodeTextShowReplacement(target core.Node, replacement string) (string, error) {
@@ -1440,6 +1556,16 @@ func encodeTextShowReplacement(target core.Node, replacement string) (string, er
 			return "", errors.New("replacement for ToUnicode TJ array text is not representable by the CMap")
 		}
 		return "[<" + encoded + ">]", nil
+	case "tj-array-font-encoding":
+		fontEncoding, _ := target.Meta["font_encoding"].(*pdfSimpleFontEncoding)
+		if fontEncoding == nil {
+			return "", errors.New("matched text node has no simple font encoding")
+		}
+		encoded, ok := fontEncoding.EncodeHex(replacement)
+		if !ok {
+			return "", errors.New("replacement for simple font encoded TJ array text is not representable by the font encoding")
+		}
+		return "[<" + encoded + ">]", nil
 	case "hex":
 		return encodeHexTextString(replacement)
 	case "hex-cmap":
@@ -1449,55 +1575,82 @@ func encodeTextShowReplacement(target core.Node, replacement string) (string, er
 			return "", errors.New("replacement for ToUnicode hex text show operand is not representable by the CMap")
 		}
 		return encoded, nil
+	case "hex-font-encoding":
+		fontEncoding, _ := target.Meta["font_encoding"].(*pdfSimpleFontEncoding)
+		if fontEncoding == nil {
+			return "", errors.New("matched text node has no simple font encoding")
+		}
+		encoded, ok := fontEncoding.EncodeHex(replacement)
+		if !ok {
+			return "", errors.New("replacement for simple font encoded hex text show operand is not representable by the font encoding")
+		}
+		return encoded, nil
+	case "literal-font-encoding":
+		fontEncoding, _ := target.Meta["font_encoding"].(*pdfSimpleFontEncoding)
+		if fontEncoding == nil {
+			return "", errors.New("matched text node has no simple font encoding")
+		}
+		encoded, ok := fontEncoding.EncodeBytes(replacement)
+		if !ok {
+			return "", errors.New("replacement for simple font encoded literal text show operand is not representable by the font encoding")
+		}
+		return encodeLiteralBytes(encoded), nil
 	default:
 		return "", fmt.Errorf("unsupported text show operand encoding %q", encoding)
 	}
 }
 
-func parseSimpleTJArrayText(input []byte, start, end int, cmap *toUnicodeCMap) (string, string, int, bool, bool) {
+func parseSimpleTJArrayText(input []byte, start, end int, cmap *toUnicodeCMap, fontEncoding *pdfSimpleFontEncoding) (string, string, int, bool, bool, bool) {
 	if start >= end || input[start] != '[' {
-		return "", "", start, false, false
+		return "", "", start, false, false, false
 	}
 	var decoded strings.Builder
 	usedCMap := false
+	usedFontEncoding := false
 	i := start + 1
 	for {
 		i = skipPDFSpaceAndComments(input, i)
 		if i >= end {
-			return "", "", start, false, false
+			return "", "", start, false, false, false
 		}
 		switch input[i] {
 		case ']':
-			return decoded.String(), string(input[start : i+1]), i + 1, usedCMap, true
+			return decoded.String(), string(input[start : i+1]), i + 1, usedCMap, usedFontEncoding, true
 		case '(':
 			closeAt, ok := findLiteralEnd(input, i+1, end)
 			if !ok {
-				return "", "", start, false, false
+				return "", "", start, false, false, false
 			}
 			if cmap != nil {
-				return "", "", start, false, false
+				return "", "", start, false, false, false
 			}
-			decoded.WriteString(decodeLiteralString(string(input[i+1 : closeAt])))
+			if fontEncoding != nil {
+				decoded.WriteString(fontEncoding.DecodeBytes(decodeLiteralBytes(string(input[i+1 : closeAt]))))
+				usedFontEncoding = true
+			} else {
+				decoded.WriteString(decodeLiteralString(string(input[i+1 : closeAt])))
+			}
 			i = closeAt + 1
 		case '<':
 			if i+1 < end && input[i+1] == '<' {
-				return "", "", start, false, false
+				return "", "", start, false, false, false
 			}
 			closeAt, ok := findHexStringEnd(input, i+1, end)
 			if !ok {
-				return "", "", start, false, false
+				return "", "", start, false, false, false
 			}
-			text, used, ok := decodeHexTextStringWithCMap(input[i+1:closeAt], cmap)
-			if !ok || (!used && !isASCIIText(text)) {
-				return "", "", start, false, false
+			text, usedCMapForText, usedFontEncodingForText, ok := decodeHexTextStringWithContext(input[i+1:closeAt], cmap, fontEncoding)
+			if !ok || (!usedCMapForText && !usedFontEncodingForText && !isASCIIText(text)) {
+				return "", "", start, false, false, false
 			}
-			usedCMap = usedCMap || used
+			usedCMap = usedCMap || usedCMapForText
+			usedFontEncoding = usedFontEncoding || usedFontEncodingForText
 			decoded.WriteString(text)
 			i = closeAt + 1
 		default:
 			numberEnd, ok := scanPDFNumber(input, i, end)
 			if !ok || !isPDFTokenEnd(input, numberEnd) {
-				return "", "", start, false, false
+				return "", "", start, false, false, false
 			}
 			i = numberEnd
 		}
@@ -1669,11 +1822,15 @@ func replaceByteRange(input []byte, start, end int, replacement []byte) []byte {
 }
 
 func decodeLiteralString(encoded string) string {
-	var out strings.Builder
+	return string(decodeLiteralBytes(encoded))
+}
+
+func decodeLiteralBytes(encoded string) []byte {
+	out := make([]byte, 0, len(encoded))
 	for i := 0; i < len(encoded); i++ {
 		c := encoded[i]
 		if c != '\\' {
-			out.WriteByte(c)
+			out = append(out, c)
 			continue
 		}
 		if i+1 >= len(encoded) {
@@ -1682,22 +1839,22 @@ func decodeLiteralString(encoded string) string {
 		n := encoded[i+1]
 		switch n {
 		case 'n':
-			out.WriteByte('\n')
+			out = append(out, '\n')
 			i++
 		case 'r':
-			out.WriteByte('\r')
+			out = append(out, '\r')
 			i++
 		case 't':
-			out.WriteByte('\t')
+			out = append(out, '\t')
 			i++
 		case 'b':
-			out.WriteByte('\b')
+			out = append(out, '\b')
 			i++
 		case 'f':
-			out.WriteByte('\f')
+			out = append(out, '\f')
 			i++
 		case '(', ')', '\\':
-			out.WriteByte(n)
+			out = append(out, n)
 			i++
 		case '\r', '\n':
 			i++
@@ -1712,16 +1869,16 @@ func decodeLiteralString(encoded string) string {
 				}
 				v, err := strconv.ParseInt(encoded[i+1:j], 8, 16)
 				if err == nil {
-					out.WriteByte(byte(v))
+					out = append(out, byte(v))
 					i = j - 1
 					continue
 				}
 			}
-			out.WriteByte(n)
+			out = append(out, n)
 			i++
 		}
 	}
-	return out.String()
+	return out
 }
 
 func decodeHexTextString(encoded []byte) (string, bool) {
@@ -1733,13 +1890,24 @@ func decodeHexTextString(encoded []byte) (string, bool) {
 }
 
 func decodeHexTextStringWithCMap(encoded []byte, cmap *toUnicodeCMap) (string, bool, bool) {
+	decoded, usedCMap, _, ok := decodeHexTextStringWithContext(encoded, cmap, nil)
+	return decoded, usedCMap, ok
+}
+
+func decodeHexTextStringWithContext(encoded []byte, cmap *toUnicodeCMap, fontEncoding *pdfSimpleFontEncoding) (string, bool, bool, bool) {
 	if cmap != nil {
 		if decoded, ok := cmap.DecodeHex(encoded); ok {
-			return decoded, true, true
+			return decoded, true, false, true
 		}
 	}
-	decoded, ok := decodeHexTextString(encoded)
-	return decoded, false, ok
+	decodedBytes, ok := decodeHexBytes(encoded)
+	if !ok {
+		return "", false, false, false
+	}
+	if fontEncoding != nil {
+		return fontEncoding.DecodeBytes(decodedBytes), false, true, true
+	}
+	return string(decodedBytes), false, false, true
 }
 
 func encodeHexTextString(text string) (string, error) {
@@ -1770,6 +1938,10 @@ func hexNibble(b byte) (byte, bool) {
 }
 
 func encodeLiteralString(text string) string {
+	return encodeLiteralBytes([]byte(text))
+}
+
+func encodeLiteralBytes(text []byte) string {
 	var out strings.Builder
 	for i := 0; i < len(text); i++ {
 		switch text[i] {

@@ -14,9 +14,11 @@ type pdfToUnicodeMap map[string]string
 type toUnicodeCMap = pdfToUnicodeMap
 
 type pdfCMapContext struct {
-	fallback          *toUnicodeCMap
-	streamFontCMaps   map[int]map[string]*toUnicodeCMap
-	streamFontMetrics map[int]map[string]pdfSimpleFontMetrics
+	fallback             *toUnicodeCMap
+	streamFontCMaps      map[int]map[string]*toUnicodeCMap
+	streamFontMetrics    map[int]map[string]pdfSimpleFontMetrics
+	streamCIDFontMetrics map[int]map[string]pdfCIDFontMetrics
+	streamFontEncodings  map[int]map[string]*pdfSimpleFontEncoding
 }
 
 func singleToUnicodeCMap(input []byte) *toUnicodeCMap {
@@ -37,15 +39,47 @@ func pdfCMapContextForInput(input []byte, opts pdfGraphParseOptions) pdfCMapCont
 
 func (g *pdfGraph) cmapContext() pdfCMapContext {
 	ctx := pdfCMapContext{
-		streamFontCMaps:   g.streamFontToUnicodeCMaps(),
-		streamFontMetrics: g.streamFontMetrics(),
+		streamFontCMaps:      g.streamFontToUnicodeCMaps(),
+		streamFontMetrics:    g.streamFontMetrics(),
+		streamCIDFontMetrics: g.streamCIDFontMetrics(),
+		streamFontEncodings:  g.streamFontEncodings(),
 	}
+	formCMaps, formMetrics, formEncodings := g.invokedFormXObjectFontContexts()
+	mergeStreamFontCMaps(ctx.streamFontCMaps, formCMaps)
+	mergeStreamFontMetrics(ctx.streamFontMetrics, formMetrics)
+	mergeStreamFontEncodings(ctx.streamFontEncodings, formEncodings)
 	cmap, ok := g.singleToUnicodeMap()
 	if !ok {
 		return ctx
 	}
 	ctx.fallback = &cmap
 	return ctx
+}
+
+func (g *pdfGraph) streamFontEncodings() map[int]map[string]*pdfSimpleFontEncoding {
+	out := make(map[int]map[string]*pdfSimpleFontEncoding)
+	for _, object := range sortedPDFObjects(g.Objects) {
+		page, ok := object.Value.(pdfDict)
+		if !ok || !dictHasType(page, "Page") {
+			continue
+		}
+		fonts := g.pageFontEncodings(page)
+		if len(fonts) == 0 {
+			continue
+		}
+		for _, stream := range g.pageContentStreams(page) {
+			out[stream.SourceStart] = fonts
+		}
+	}
+	return out
+}
+
+func (g *pdfGraph) pageFontEncodings(page pdfDict) map[string]*pdfSimpleFontEncoding {
+	resources, ok := g.pageResources(page)
+	if !ok {
+		return nil
+	}
+	return g.fontEncodingsForResources(resources)
 }
 
 func (g *pdfGraph) singleToUnicodeMap() (pdfToUnicodeMap, bool) {
@@ -100,11 +134,91 @@ func (g *pdfGraph) streamFontToUnicodeCMaps() map[int]map[string]*toUnicodeCMap 
 	return out
 }
 
+const maxPDFFormXObjectResourceDepth = 4
+
+func (g *pdfGraph) invokedFormXObjectFontContexts() (map[int]map[string]*toUnicodeCMap, map[int]map[string]pdfSimpleFontMetrics, map[int]map[string]*pdfSimpleFontEncoding) {
+	cmaps := make(map[int]map[string]*toUnicodeCMap)
+	metrics := make(map[int]map[string]pdfSimpleFontMetrics)
+	encodings := make(map[int]map[string]*pdfSimpleFontEncoding)
+	for _, object := range sortedPDFObjects(g.Objects) {
+		page, ok := object.Value.(pdfDict)
+		if !ok || !dictHasType(page, "Page") {
+			continue
+		}
+		resources, ok := g.pageResources(page)
+		if !ok {
+			continue
+		}
+		for _, content := range g.pageContentStreamObjects(page) {
+			decoded, err := g.decodePDFGraphObjectStream(content.ID, content.Stream)
+			if err != nil {
+				continue
+			}
+			g.collectInvokedFormXObjectFontContexts(decoded, resources, 0, nil, cmaps, metrics, encodings)
+		}
+	}
+	return cmaps, metrics, encodings
+}
+
+func (g *pdfGraph) collectInvokedFormXObjectFontContexts(input []byte, resources pdfDict, depth int, visited map[pdfObjectID]bool, cmaps map[int]map[string]*toUnicodeCMap, metrics map[int]map[string]pdfSimpleFontMetrics, encodings map[int]map[string]*pdfSimpleFontEncoding) {
+	if depth >= maxPDFFormXObjectResourceDepth || len(input) == 0 || resources == nil {
+		return
+	}
+	xobjects, ok := g.resolvePDFDict(resources["XObject"])
+	if !ok {
+		return
+	}
+	for _, name := range pdfDirectDoXObjectNames(input) {
+		ref, ok := xobjects[name].(pdfRef)
+		if !ok {
+			continue
+		}
+		if visited != nil && visited[ref.ID] {
+			continue
+		}
+		object, ok := g.Objects[ref.ID]
+		if !ok {
+			continue
+		}
+		stream, ok := object.Value.(pdfStreamObject)
+		if !ok || !dictHasType(stream.Dict, "XObject") || !pdfDictHasSubtype(stream.Dict, "Form") {
+			continue
+		}
+		formResources := resources
+		if resolved, ok := g.resolvePDFDict(stream.Dict["Resources"]); ok {
+			formResources = resolved
+		}
+		if fontCMaps := g.fontToUnicodeCMapsForResources(formResources); len(fontCMaps) > 0 {
+			cmaps[stream.SourceStart] = fontCMaps
+		}
+		if fontMetrics := g.fontMetricsForResources(formResources); len(fontMetrics) > 0 {
+			metrics[stream.SourceStart] = fontMetrics
+		}
+		if fontEncodings := g.fontEncodingsForResources(formResources); len(fontEncodings) > 0 {
+			encodings[stream.SourceStart] = fontEncodings
+		}
+		decoded, err := g.decodePDFGraphObjectStream(ref.ID, stream)
+		if err != nil {
+			continue
+		}
+		nextVisited := clonePDFObjectIDSet(visited)
+		if nextVisited == nil {
+			nextVisited = make(map[pdfObjectID]bool)
+		}
+		nextVisited[ref.ID] = true
+		g.collectInvokedFormXObjectFontContexts(decoded, formResources, depth+1, nextVisited, cmaps, metrics, encodings)
+	}
+}
+
 func (g *pdfGraph) pageFontToUnicodeCMaps(page pdfDict) map[string]*toUnicodeCMap {
 	resources, ok := g.pageResources(page)
 	if !ok {
 		return nil
 	}
+	return g.fontToUnicodeCMapsForResources(resources)
+}
+
+func (g *pdfGraph) fontToUnicodeCMapsForResources(resources pdfDict) map[string]*toUnicodeCMap {
 	fonts, ok := g.resolvePDFDict(resources["Font"])
 	if !ok {
 		return nil
@@ -126,6 +240,110 @@ func (g *pdfGraph) pageFontToUnicodeCMaps(page pdfDict) map[string]*toUnicodeCMa
 		return nil
 	}
 	return out
+}
+
+func (g *pdfGraph) fontMetricsForResources(resources pdfDict) map[string]pdfSimpleFontMetrics {
+	fonts, ok := g.resolvePDFDict(resources["Font"])
+	if !ok {
+		return nil
+	}
+	out := make(map[string]pdfSimpleFontMetrics)
+	for name, value := range fonts {
+		fontDict, ok := g.resolvePDFDict(value)
+		if !ok {
+			continue
+		}
+		metrics, ok := parseSimpleFontMetrics(fontDict)
+		if !ok {
+			continue
+		}
+		out[name] = metrics
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func (g *pdfGraph) fontEncodingsForResources(resources pdfDict) map[string]*pdfSimpleFontEncoding {
+	fonts, ok := g.resolvePDFDict(resources["Font"])
+	if !ok {
+		return nil
+	}
+	out := make(map[string]*pdfSimpleFontEncoding)
+	for name, value := range fonts {
+		ref, ok := value.(pdfRef)
+		if !ok {
+			continue
+		}
+		encoding, ok := g.simpleEncodingForFont(ref.ID)
+		if ok {
+			out[name] = encoding
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func pdfDirectDoXObjectNames(input []byte) []string {
+	names := make([]string, 0)
+	for i := 0; i < len(input); i++ {
+		if input[i] != '/' || (i > 0 && !isPDFTokenBoundary(input, i-1)) {
+			continue
+		}
+		start := i + 1
+		end := start
+		for end < len(input) && !isPDFSpace(input[end]) && !isPDFDelimiter(input[end]) {
+			end++
+		}
+		if end == start {
+			continue
+		}
+		op, _ := nextPDFContentToken(input, end)
+		if op != "Do" {
+			continue
+		}
+		names = append(names, string(input[start:end]))
+		i = end - 1
+	}
+	return names
+}
+
+func nextPDFContentToken(input []byte, start int) (string, int) {
+	i := start
+	for i < len(input) && isPDFSpace(input[i]) {
+		i++
+	}
+	j := i
+	for j < len(input) && !isPDFSpace(input[j]) && !isPDFDelimiter(input[j]) {
+		j++
+	}
+	return string(input[i:j]), j
+}
+
+func pdfDictHasSubtype(dict pdfDict, name string) bool {
+	got, ok := dict["Subtype"].(pdfName)
+	return ok && string(got) == name
+}
+
+func mergeStreamFontCMaps(dst, src map[int]map[string]*toUnicodeCMap) {
+	for sourceStart, fonts := range src {
+		dst[sourceStart] = fonts
+	}
+}
+
+func mergeStreamFontMetrics(dst, src map[int]map[string]pdfSimpleFontMetrics) {
+	for sourceStart, fonts := range src {
+		dst[sourceStart] = fonts
+	}
+}
+
+func mergeStreamFontEncodings(dst, src map[int]map[string]*pdfSimpleFontEncoding) {
+	for sourceStart, fonts := range src {
+		dst[sourceStart] = fonts
+	}
 }
 
 func (g *pdfGraph) pageResources(page pdfDict) (pdfDict, bool) {
@@ -163,6 +381,20 @@ func (g *pdfGraph) inheritedPageResources(parent pdfValue) (pdfDict, bool) {
 }
 
 func (g *pdfGraph) pageContentStreams(page pdfDict) []pdfStreamObject {
+	contents := g.pageContentStreamObjects(page)
+	out := make([]pdfStreamObject, 0, len(contents))
+	for _, content := range contents {
+		out = append(out, content.Stream)
+	}
+	return out
+}
+
+type pdfPageContentStream struct {
+	ID     pdfObjectID
+	Stream pdfStreamObject
+}
+
+func (g *pdfGraph) pageContentStreamObjects(page pdfDict) []pdfPageContentStream {
 	value, ok := page["Contents"]
 	if !ok {
 		return nil
@@ -181,7 +413,7 @@ func (g *pdfGraph) pageContentStreams(page pdfDict) []pdfStreamObject {
 	default:
 		return nil
 	}
-	out := make([]pdfStreamObject, 0, len(refs))
+	out := make([]pdfPageContentStream, 0, len(refs))
 	for _, ref := range refs {
 		object, ok := g.Objects[ref.ID]
 		if !ok {
@@ -189,7 +421,7 @@ func (g *pdfGraph) pageContentStreams(page pdfDict) []pdfStreamObject {
 		}
 		stream, ok := object.Value.(pdfStreamObject)
 		if ok {
-			out = append(out, stream)
+			out = append(out, pdfPageContentStream{ID: ref.ID, Stream: stream})
 		}
 	}
 	return out
@@ -244,6 +476,27 @@ func (g *pdfGraph) toUnicodeCMapForFont(fontID pdfObjectID) (pdfToUnicodeMap, bo
 	return parseToUnicodeCMap(decoded)
 }
 
+func (g *pdfGraph) simpleEncodingForFont(fontID pdfObjectID) (*pdfSimpleFontEncoding, bool) {
+	object, ok := g.Objects[fontID]
+	if !ok {
+		return nil, false
+	}
+	var dict pdfDict
+	switch value := object.Value.(type) {
+	case pdfDict:
+		dict = value
+	case pdfStreamObject:
+		dict = value.Dict
+	default:
+		return nil, false
+	}
+	encodingValue, ok := dict["Encoding"]
+	if !ok {
+		return nil, false
+	}
+	return parseSimpleFontEncoding(encodingValue)
+}
+
 func (c pdfCMapContext) fontCMapsForStream(sourceStart int) map[string]*toUnicodeCMap {
 	if c.streamFontCMaps == nil {
 		return nil
@@ -256,6 +509,13 @@ func (c pdfCMapContext) fontMetricsForStream(sourceStart int) map[string]pdfSimp
 		return nil
 	}
 	return c.streamFontMetrics[sourceStart]
+}
+
+func (c pdfCMapContext) fontEncodingsForStream(sourceStart int) map[string]*pdfSimpleFontEncoding {
+	if c.streamFontEncodings == nil {
+		return nil
+	}
+	return c.streamFontEncodings[sourceStart]
 }
 
 func parseToUnicodeCMap(input []byte) (pdfToUnicodeMap, bool) {
