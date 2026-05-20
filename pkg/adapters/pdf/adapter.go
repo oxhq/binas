@@ -174,6 +174,12 @@ func (Adapter) PlanEdit(tree *core.Tree, selector core.Match, mutation core.Muta
 		return nil, fmt.Errorf("match index %d out of range for %d matches", index, len(matches))
 	}
 	target := matches[index]
+	if filter, ok := target.Meta["stream_filter"].(string); ok {
+		decodeParms, _ := target.Meta["stream_decode_parms"].(string)
+		if !pdfStreamFilterCapabilityAllowsTextTargetsWithDecodeParms(filter, decodeParms) {
+			return nil, fmt.Errorf("unsupported PDF stream filter target for text edit %q", normalizePDFStreamFilter(filter))
+		}
+	}
 	oldEncoded, ok := target.Meta["encoded"].(string)
 	if !ok || oldEncoded == "" {
 		return nil, errors.New("matched text node has no editable encoded span")
@@ -614,6 +620,10 @@ func parseStreams(input []byte, tree *core.Tree, root core.NodeID, cmapContext p
 		streamIDsBySourceStart[stream.dataStart] = streamID
 		tree.Nodes[root].Children = append(tree.Nodes[root].Children, streamID)
 		if stream.imageXObject {
+			pos = stream.endstreamAt + len("endstream")
+			continue
+		}
+		if !pdfStreamFilterCapabilityAllowsTextTargetsWithDecodeParms(stream.filter, stream.decodeParms) {
 			pos = stream.endstreamAt + len("endstream")
 			continue
 		}
@@ -1414,6 +1424,9 @@ type textShowContext struct {
 }
 
 func parseTextShow(input []byte, start, end int, tree *core.Tree, streamID core.NodeID, ctx textShowContext) {
+	if !pdfStreamFilterCapabilityAllowsTextTargetsWithDecodeParms(ctx.streamFilter, ctx.streamDecodeParms) {
+		return
+	}
 	activeFont := ""
 	textState := newPDFTextStateTracker()
 	stateScanAt := start

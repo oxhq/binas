@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -2731,6 +2732,170 @@ func TestCLIEditMatchIndexOneEditsSecondMatch(t *testing.T) {
 	}
 }
 
+func TestCLIInspectValidateQueryAndEditProveImagePassThroughDoesNotBlockTextEdit(t *testing.T) {
+	path, imageBytes := writeImagePassThroughAndFlateTextFixture(t)
+	out := filepath.Join(t.TempDir(), "out.pdf")
+
+	inspectOut := captureStdout(t, func() error {
+		return run([]string{"inspect", path, "--format", "pdf", "--json"})
+	})
+	var inspect struct {
+		Streams       []coreNodeJSON         `json:"streams"`
+		StreamFilters streamFilterReportJSON `json:"stream_filters"`
+	}
+	if err := json.Unmarshal([]byte(inspectOut), &inspect); err != nil {
+		t.Fatal(err)
+	}
+	assertCLIStreamFilterSummary(t, inspect.StreamFilters, 2, 1, 1, 0)
+	imageMeta := requireCLIStreamMeta(t, inspect.Streams, "filter_capability", "pass_through_image")
+	if imageMeta["image_xobject"] != true || imageMeta["filter_editable"] != false || imageMeta["filter_pass_through"] != true || imageMeta["filter_target"] != false {
+		t.Fatalf("image stream metadata = %+v, want pass-through non-target image boundary", imageMeta)
+	}
+	flateMeta := requireCLIStreamMeta(t, inspect.Streams, "filter_capability", "editable_reversible")
+	if flateMeta["filter_editable"] != true || flateMeta["filter_pass_through"] != false || flateMeta["filter_target"] != true {
+		t.Fatalf("Flate stream metadata = %+v, want editable target", flateMeta)
+	}
+
+	validateOut := captureStdout(t, func() error {
+		return run([]string{"validate", path, "--format", "pdf", "--json"})
+	})
+	var validation struct {
+		Valid         bool                   `json:"valid"`
+		Streams       []coreNodeJSON         `json:"streams"`
+		StreamFilters streamFilterReportJSON `json:"stream_filters"`
+	}
+	if err := json.Unmarshal([]byte(validateOut), &validation); err != nil {
+		t.Fatal(err)
+	}
+	if !validation.Valid {
+		t.Fatalf("validation valid = false, want true")
+	}
+	assertCLIStreamFilterSummary(t, validation.StreamFilters, 2, 1, 1, 0)
+	requireCLIStreamMeta(t, validation.Streams, "filter_capability", "pass_through_image")
+
+	queryOut := captureStdout(t, func() error {
+		return run([]string{"query", path, "--format", "pdf", "--kind", "pdf.stream", "--meta", "filter_capability=pass_through_image", "--json"})
+	})
+	var query struct {
+		Count   int            `json:"count"`
+		Matches []coreNodeJSON `json:"matches"`
+	}
+	if err := json.Unmarshal([]byte(queryOut), &query); err != nil {
+		t.Fatal(err)
+	}
+	if query.Count != 1 || len(query.Matches) != 1 {
+		t.Fatalf("query pass-through stream count = %d/%d, want 1", query.Count, len(query.Matches))
+	}
+	if query.Matches[0].Meta["filter_pass_through"] != true || query.Matches[0].Meta["filter_target"] != false {
+		t.Fatalf("query stream metadata = %+v, want pass-through non-target", query.Matches[0].Meta)
+	}
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{
+			"edit", path,
+			"--format", "pdf",
+			"--kind", "pdf.content.text_show",
+			"--text", "FLATE-TEXT",
+			"--replace", "EDITED-TXT",
+			"-o", out,
+			"--json",
+		})
+	})
+	assertCLISelectableEditResult(t, stdout)
+	written, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(written, imageBytes) {
+		t.Fatal("pass-through image stream bytes changed during unrelated edit")
+	}
+	oldQueryOut := captureStdout(t, func() error {
+		return run([]string{"query", out, "--format", "pdf", "--kind", "pdf.content.text_show", "--text", "FLATE-TEXT", "--json"})
+	})
+	assertCLIQueryCount(t, oldQueryOut, 0)
+	newQueryOut := captureStdout(t, func() error {
+		return run([]string{"query", out, "--format", "pdf", "--kind", "pdf.content.text_show", "--text", "EDITED-TXT", "--json"})
+	})
+	assertCLIQueryCount(t, newQueryOut, 1)
+}
+
+func TestCLIUnsupportedTargetFilterJSONReportsBoundaryAndNoFallback(t *testing.T) {
+	path := writeUnsupportedTargetAndFlateTextFixture(t)
+	out := filepath.Join(t.TempDir(), "out.pdf")
+
+	validateOut := captureStdout(t, func() error {
+		return run([]string{"validate", path, "--format", "pdf", "--json"})
+	})
+	var validation struct {
+		Valid         bool                   `json:"valid"`
+		Streams       []coreNodeJSON         `json:"streams"`
+		StreamFilters streamFilterReportJSON `json:"stream_filters"`
+	}
+	if err := json.Unmarshal([]byte(validateOut), &validation); err != nil {
+		t.Fatal(err)
+	}
+	if !validation.Valid {
+		t.Fatalf("validation valid = false, want true parse with explicit unsupported stream metadata")
+	}
+	assertCLIStreamFilterSummary(t, validation.StreamFilters, 2, 1, 0, 1)
+	unsupportedMeta := requireCLIStreamMeta(t, validation.Streams, "filter_capability", "unsupported_target")
+	if unsupportedMeta["unsupported"] != `unsupported PDF stream filter "FooDecode"` || unsupportedMeta["filter_editable"] != false || unsupportedMeta["filter_target"] != true {
+		t.Fatalf("unsupported stream metadata = %+v, want explicit FooDecode target boundary", unsupportedMeta)
+	}
+
+	queryOut := captureStdout(t, func() error {
+		return run([]string{"query", path, "--format", "pdf", "--kind", "pdf.stream", "--meta", "filter_capability=unsupported_target", "--json"})
+	})
+	var query struct {
+		Count   int            `json:"count"`
+		Matches []coreNodeJSON `json:"matches"`
+	}
+	if err := json.Unmarshal([]byte(queryOut), &query); err != nil {
+		t.Fatal(err)
+	}
+	if query.Count != 1 || len(query.Matches) != 1 || query.Matches[0].Meta["unsupported"] != `unsupported PDF stream filter "FooDecode"` {
+		t.Fatalf("unsupported stream query = %+v, want one explicit FooDecode stream", query)
+	}
+
+	stdout, err := captureStdoutAndError(t, func() error {
+		return run([]string{
+			"edit", path,
+			"--format", "pdf",
+			"--kind", "pdf.content.text_show",
+			"--text", "UNSUPPORTED-TEXT",
+			"--replace", "EDITED-UNSUPPORTED",
+			"-o", out,
+			"--json",
+		})
+	})
+	if err == nil {
+		t.Fatal("edit succeeded, want unsupported target boundary error")
+	}
+	if !strings.Contains(err.Error(), `unsupported stream filter targets present: unsupported PDF stream filter "FooDecode"`) {
+		t.Fatalf("error = %q, want unsupported filter boundary", err)
+	}
+	var result struct {
+		Error              string                 `json:"error"`
+		EditStatus         string                 `json:"edit_status"`
+		FallbackUsed       bool                   `json:"fallback_used"`
+		UnsupportedStreams []coreNodeJSON         `json:"unsupported_streams"`
+		StreamFilters      streamFilterReportJSON `json:"stream_filters"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.EditStatus != "unsupported" || result.FallbackUsed || len(result.UnsupportedStreams) != 1 {
+		t.Fatalf("edit error JSON = %+v, want unsupported/no-fallback with one stream", result)
+	}
+	if !strings.Contains(result.Error, `unsupported PDF stream filter "FooDecode"`) {
+		t.Fatalf("error JSON = %q, want FooDecode reason", result.Error)
+	}
+	assertCLIStreamFilterSummary(t, result.StreamFilters, 2, 1, 0, 1)
+	if _, statErr := os.Stat(out); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("output stat error = %v, want no output file", statErr)
+	}
+}
+
 func TestCLIEditASCII85FlateFilterArrayWritesVerifiedPDF(t *testing.T) {
 	path := writeASCII85FlateFilterArrayFixture(t)
 	out := filepath.Join(t.TempDir(), "out.pdf")
@@ -3709,6 +3874,40 @@ func writeASCII85FlateFilterArrayFixture(t *testing.T) string {
 	return path
 }
 
+func writeImagePassThroughAndFlateTextFixture(t *testing.T) (string, []byte) {
+	t.Helper()
+	imageBytes := []byte("opaque DCT image bytes BT\n(IMAGE-ONLY) Tj\nET\n")
+	decoded := []byte("BT\n(FLATE-TEXT) Tj\nET\n")
+	encoded := cliFlate(t, decoded)
+	input := pdfFixture(
+		"<< /Type /Page >>",
+		fmt.Sprintf("<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length %d /Filter /DCTDecode >>\nstream\n%sendstream", len(imageBytes), imageBytes),
+		fmt.Sprintf("<< /Length %d /Filter /FlateDecode >>\nstream\n%sendstream", len(encoded), encoded),
+	)
+	path := filepath.Join(t.TempDir(), "image-pass-through-flate-text.pdf")
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path, imageBytes
+}
+
+func writeUnsupportedTargetAndFlateTextFixture(t *testing.T) string {
+	t.Helper()
+	unsupported := []byte("BT\n(UNSUPPORTED-TEXT) Tj\nET\n")
+	decoded := []byte("BT\n(FLATE-TEXT) Tj\nET\n")
+	encoded := cliFlate(t, decoded)
+	input := pdfFixture(
+		"<< /Type /Page >>",
+		fmt.Sprintf("<< /Length %d /Filter /FooDecode >>\nstream\n%sendstream", len(unsupported), unsupported),
+		fmt.Sprintf("<< /Length %d /Filter /FlateDecode >>\nstream\n%sendstream", len(encoded), encoded),
+	)
+	path := filepath.Join(t.TempDir(), "unsupported-target-flate-text.pdf")
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 func writeFlateDecodeParmsPredictor12Fixture(t *testing.T) string {
 	t.Helper()
 	decoded := []byte("BT\n(08\\05515\\0552024) Tj\nET\n")
@@ -4030,6 +4229,39 @@ func assertCLISelectableEditResult(t *testing.T, stdout string) {
 	if !result.Verification.ReparseOK || !result.Verification.OldTextRemoved || !result.Verification.NewSelectable || !result.Verification.PageUnchanged {
 		t.Fatalf("verification = %+v", result.Verification)
 	}
+}
+
+type coreNodeJSON struct {
+	Kind string         `json:"kind"`
+	Meta map[string]any `json:"meta"`
+}
+
+type streamFilterReportJSON struct {
+	Total              int `json:"total"`
+	EditableTargets    int `json:"editable_targets"`
+	PassThroughStreams int `json:"pass_through_streams"`
+	UnsupportedTargets int `json:"unsupported_targets"`
+}
+
+func assertCLIStreamFilterSummary(t *testing.T, got streamFilterReportJSON, total, editable, passThrough, unsupported int) {
+	t.Helper()
+	if got.Total != total || got.EditableTargets != editable || got.PassThroughStreams != passThrough || got.UnsupportedTargets != unsupported {
+		t.Fatalf("stream filter summary = %+v, want total=%d editable=%d pass_through=%d unsupported=%d", got, total, editable, passThrough, unsupported)
+	}
+}
+
+func requireCLIStreamMeta(t *testing.T, streams []coreNodeJSON, key string, value any) map[string]any {
+	t.Helper()
+	for _, stream := range streams {
+		if stream.Kind != "pdf.stream" {
+			continue
+		}
+		if fmt.Sprint(stream.Meta[key]) == fmt.Sprint(value) {
+			return stream.Meta
+		}
+	}
+	t.Fatalf("missing stream with %s=%v in %+v", key, value, streams)
+	return nil
 }
 
 func containsString(values []string, want string) bool {

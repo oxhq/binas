@@ -3,6 +3,7 @@ package pdf
 import (
 	"bytes"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/oxhq/binas/pkg/core"
@@ -44,6 +45,7 @@ func TestFilterCapabilityClassifiesImageFiltersAsNonEditablePassThrough(t *testi
 		{name: "ccitt", filter: "/CCITTFaxDecode", want: []string{"CCITTFaxDecode"}},
 		{name: "ccitt abbreviation", filter: "/CCF", want: []string{"CCITTFaxDecode"}},
 		{name: "jbig2", filter: "/JBIG2Decode", want: []string{"JBIG2Decode"}},
+		{name: "image only chain", filter: "[/DCTDecode /JPXDecode]", want: []string{"DCTDecode", "JPXDecode"}},
 	}
 
 	for _, tc := range cases {
@@ -69,6 +71,9 @@ func TestFilterCapabilityClassifiesMixedOrUnknownFiltersAsUnsupportedTarget(t *t
 		{name: "unknown", filter: "/FooDecode", want: []string{"FooDecode"}},
 		{name: "image plus editable", filter: "[/DCTDecode /FlateDecode]", want: []string{"DCTDecode", "FlateDecode"}},
 		{name: "editable plus image", filter: "[/ASCII85Decode /JPXDecode]", want: []string{"ASCII85Decode", "JPXDecode"}},
+		{name: "abbreviated mixed image chain", filter: "[/A85 /DCT]", want: []string{"ASCII85Decode", "DCTDecode"}},
+		{name: "crypt", filter: "/Crypt", want: []string{"Crypt"}},
+		{name: "editable plus crypt", filter: "[/FlateDecode /Crypt]", want: []string{"FlateDecode", "Crypt"}},
 	}
 
 	for _, tc := range cases {
@@ -86,7 +91,7 @@ func TestFilterCapabilityClassifiesMixedOrUnknownFiltersAsUnsupportedTarget(t *t
 }
 
 func TestFilterCapabilityClassifiesIdentityAsPassThrough(t *testing.T) {
-	for _, filter := range []string{"", " ", "Identity", "/Identity"} {
+	for _, filter := range []string{"", " ", "Identity", "/Identity", "null"} {
 		t.Run(filter, func(t *testing.T) {
 			got := classifyPDFStreamFilterCapability(filter)
 			if got.Class != pdfStreamFilterCapabilityIdentityPassThrough {
@@ -284,6 +289,64 @@ func TestImageXObjectMixedFilterArrayPassThroughDoesNotBlockFlateTextEdit(t *tes
 	}
 }
 
+func TestCanonicalGraphImageXObjectMixedFilterArrayPassThroughDoesNotBlockFlateTextEdit(t *testing.T) {
+	decoded := []byte("BT\n(FLATE-TEXT) Tj\nET\n")
+	encoded, err := encodeFlateDecode(decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	imageLike := []byte("BT\n(IMAGE-ONLY) Tj\nET\n")
+	input := testPDF(
+		"<< /Type /Page >>",
+		fmt.Sprintf("<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length %d /Filter [/ASCII85Decode /DCTDecode] >>\nstream\n%sendstream", len(imageLike), imageLike),
+		fmt.Sprintf("<< /Length %d /Filter /FlateDecode >>\nstream\n%sendstream", len(encoded), encoded),
+	)
+
+	graph, err := parsePDFGraph(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree := graph.toTree(input)
+	enrichPDFStreamNodeMetadata(tree)
+	if matches := tree.Query(core.Match{Kind: KindTextShow, Text: "IMAGE-ONLY"}); len(matches) != 0 {
+		t.Fatalf("image text matches = %d, want 0", len(matches))
+	}
+	if matches := tree.Query(core.Match{Kind: KindTextShow, Text: "FLATE-TEXT"}); len(matches) != 1 {
+		t.Fatalf("Flate text matches = %d, want 1", len(matches))
+	}
+	streams := tree.Query(core.Match{Kind: KindStream})
+	if len(streams) != 2 {
+		t.Fatalf("stream nodes = %d, want 2", len(streams))
+	}
+	imageMeta := streams[0].Meta
+	if imageMeta["filter_capability"] != string(pdfStreamFilterCapabilityPassThroughImage) {
+		t.Fatalf("image filter_capability = %v, want %q", imageMeta["filter_capability"], pdfStreamFilterCapabilityPassThroughImage)
+	}
+	if imageMeta["filter_editable"] != false || imageMeta["filter_pass_through"] != true || imageMeta["filter_target"] != false {
+		t.Fatalf("image filter metadata = editable:%v pass_through:%v target:%v, want false/true/false", imageMeta["filter_editable"], imageMeta["filter_pass_through"], imageMeta["filter_target"])
+	}
+	if _, ok := imageMeta["unsupported"]; ok {
+		t.Fatalf("unsupported metadata present for image pass-through stream: %+v", imageMeta)
+	}
+	if _, ok := imageMeta["decoded_length"]; ok {
+		t.Fatalf("decoded_length present for image pass-through stream: %+v", imageMeta)
+	}
+
+	output, _, verification, err := ApplyCanonicalEdit(input, core.Match{Kind: KindTextShow, Text: "FLATE-TEXT"}, core.Mutation{Replace: "EDITED"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.ReparseOK || !verification.OldTextRemoved || !verification.NewSelectable || !verification.PageUnchanged {
+		t.Fatalf("verification failed: %+v", verification)
+	}
+	if !bytes.Contains(output, imageLike) {
+		t.Fatal("image stream bytes changed during canonical content edit")
+	}
+	if bytes.Contains(output, []byte("IMAGE-ONLY")) && !bytes.Contains(output, imageLike) {
+		t.Fatal("image stream text-like bytes changed unexpectedly")
+	}
+}
+
 func TestImageXObjectRawStreamDoesNotProduceEditableTextShow(t *testing.T) {
 	imageBytes := []byte("BT\n(IMAGE) Tj\nET\n")
 	contentBytes := []byte("BT\n(PAGE) Tj\nET\n")
@@ -342,6 +405,45 @@ func TestImageXObjectRawStreamDoesNotProduceEditableTextShow(t *testing.T) {
 	}
 }
 
+func TestCanonicalGraphImageXObjectRawContentReferenceDoesNotProduceEditableTextShow(t *testing.T) {
+	imageBytes := []byte("BT\n(IMAGE) Tj\nET\n")
+	contentBytes := []byte("BT\n(PAGE) Tj\nET\n")
+	input := testPDF(
+		"<< /Type /Page /Contents [2 0 R 3 0 R] >>",
+		fmt.Sprintf("<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length %d >>\nstream\n%sendstream", len(imageBytes), imageBytes),
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(contentBytes), contentBytes),
+	)
+
+	graph, err := parsePDFGraph(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidates, err := graph.textShowCandidates("IMAGE"); err != nil {
+		t.Fatal(err)
+	} else if len(candidates) != 0 {
+		t.Fatalf("image text candidates = %d, want 0", len(candidates))
+	}
+	if candidates, err := graph.textShowCandidates("PAGE"); err != nil {
+		t.Fatal(err)
+	} else if len(candidates) != 1 {
+		t.Fatalf("page text candidates = %d, want 1", len(candidates))
+	}
+
+	if _, _, _, err := ApplyCanonicalEdit(input, core.Match{Kind: KindTextShow, Text: "IMAGE"}, core.Mutation{Replace: "EDITED"}, nil); err == nil {
+		t.Fatal("expected canonical edit inside image XObject bytes to fail closed")
+	}
+	output, _, verification, err := ApplyCanonicalEdit(input, core.Match{Kind: KindTextShow, Text: "PAGE"}, core.Mutation{Replace: "EDITED"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.ReparseOK || !verification.OldTextRemoved || !verification.NewSelectable || !verification.PageUnchanged {
+		t.Fatalf("verification failed: %+v", verification)
+	}
+	if !bytes.Contains(output, imageBytes) {
+		t.Fatal("image stream bytes changed during canonical page content edit")
+	}
+}
+
 func TestFilterCapabilityUnsupportedTargetDoesNotBlockFlateTextEdit(t *testing.T) {
 	unsupportedBytes := []byte("BT\n(UNSUPPORTED-TEXT) Tj\nET\n")
 	decoded := []byte("BT\n(FLATE-TEXT) Tj\nET\n")
@@ -384,6 +486,9 @@ func TestFilterCapabilityUnsupportedTargetDoesNotBlockFlateTextEdit(t *testing.T
 	if _, ok := unsupportedMeta["decoded_length"]; ok {
 		t.Fatalf("decoded_length present for unsupported target stream: %+v", unsupportedMeta)
 	}
+	if _, err := adapter.PlanEdit(tree, core.Match{Kind: KindTextShow, Text: "UNSUPPORTED-TEXT"}, core.Mutation{Replace: "EDITED"}); err == nil {
+		t.Fatal("expected edit planning for unsupported target text to fail closed")
+	}
 
 	plan, err := adapter.PlanEdit(tree, core.Match{Kind: KindTextShow, Text: "FLATE-TEXT"}, core.Mutation{Replace: "EDITED"})
 	if err != nil {
@@ -394,6 +499,134 @@ func TestFilterCapabilityUnsupportedTargetDoesNotBlockFlateTextEdit(t *testing.T
 		t.Fatal(err)
 	}
 	verification, err := adapter.Verify(output, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.ReparseOK || !verification.OldTextRemoved || !verification.NewSelectable || !verification.PageUnchanged {
+		t.Fatalf("verification failed: %+v", verification)
+	}
+}
+
+func TestFilterCapabilityUnsupportedCryptTargetDoesNotProduceEditableText(t *testing.T) {
+	cryptBytes := []byte("BT\n(CRYPT-TEXT) Tj\nET\n")
+	decoded := []byte("BT\n(FLATE-TEXT) Tj\nET\n")
+	encoded, err := encodeFlateDecode(decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := testPDF(
+		"<< /Type /Page >>",
+		fmt.Sprintf("<< /Length %d /Filter /Crypt >>\nstream\n%sendstream", len(cryptBytes), cryptBytes),
+		fmt.Sprintf("<< /Length %d /Filter /FlateDecode >>\nstream\n%sendstream", len(encoded), encoded),
+	)
+
+	adapter := NewAdapter()
+	tree, err := adapter.Parse(input, core.ParseOptions{Strict: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if matches := tree.Query(core.Match{Kind: KindTextShow, Text: "CRYPT-TEXT"}); len(matches) != 0 {
+		t.Fatalf("crypt stream text matches = %d, want 0", len(matches))
+	}
+	if _, err := adapter.PlanEdit(tree, core.Match{Kind: KindTextShow, Text: "CRYPT-TEXT"}, core.Mutation{Replace: "EDITED"}); err == nil {
+		t.Fatal("expected edit planning for unsupported crypt target text to fail closed")
+	}
+	if matches := tree.Query(core.Match{Kind: KindTextShow, Text: "FLATE-TEXT"}); len(matches) != 1 {
+		t.Fatalf("Flate text matches = %d, want 1", len(matches))
+	}
+
+	streams := tree.Query(core.Match{Kind: KindStream})
+	if len(streams) != 2 {
+		t.Fatalf("stream nodes = %d, want 2", len(streams))
+	}
+	cryptMeta := streams[0].Meta
+	if cryptMeta["filter_capability"] != string(pdfStreamFilterCapabilityUnsupportedTarget) {
+		t.Fatalf("crypt filter_capability = %v, want %q", cryptMeta["filter_capability"], pdfStreamFilterCapabilityUnsupportedTarget)
+	}
+	if cryptMeta["filter_editable"] != false || cryptMeta["filter_pass_through"] != false || cryptMeta["filter_target"] != true {
+		t.Fatalf("crypt filter metadata = editable:%v pass_through:%v target:%v, want false/false/true", cryptMeta["filter_editable"], cryptMeta["filter_pass_through"], cryptMeta["filter_target"])
+	}
+	if cryptMeta["decoded_length"] != len(cryptBytes) {
+		t.Fatalf("crypt decoded_length = %v, want %d", cryptMeta["decoded_length"], len(cryptBytes))
+	}
+}
+
+func TestFilterCapabilityExplicitCryptIdentityTargetRemainsEditable(t *testing.T) {
+	content := []byte("BT\n(CRYPT-IDENTITY) Tj\nET\n")
+	input := testPDF(
+		"<< /Type /Page >>",
+		fmt.Sprintf("<< /Length %d /Filter /Crypt /DecodeParms << /Name /Identity >> >>\nstream\n%sendstream", len(content), content),
+	)
+
+	adapter := NewAdapter()
+	tree, err := adapter.Parse(input, core.ParseOptions{Strict: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if matches := tree.Query(core.Match{Kind: KindTextShow, Text: "CRYPT-IDENTITY"}); len(matches) != 1 {
+		t.Fatalf("crypt identity text matches = %d, want 1", len(matches))
+	}
+	plan, err := adapter.PlanEdit(tree, core.Match{Kind: KindTextShow, Text: "CRYPT-IDENTITY"}, core.Mutation{Replace: "CRYPT-EDITED"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, _, err := adapter.Apply(input, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verification, err := adapter.Verify(output, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.ReparseOK || !verification.OldTextRemoved || !verification.NewSelectable || !verification.PageUnchanged {
+		t.Fatalf("verification failed: %+v", verification)
+	}
+}
+
+func TestCanonicalGraphUnsupportedTargetFailsClosedButDoesNotBlockFlateTextEdit(t *testing.T) {
+	unsupportedBytes := []byte("BT\n(UNSUPPORTED-TEXT) Tj\nET\n")
+	decoded := []byte("BT\n(FLATE-TEXT) Tj\nET\n")
+	encoded, err := encodeFlateDecode(decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := testPDF(
+		"<< /Type /Page >>",
+		fmt.Sprintf("<< /Length %d /Filter /FooDecode >>\nstream\n%sendstream", len(unsupportedBytes), unsupportedBytes),
+		fmt.Sprintf("<< /Length %d /Filter /FlateDecode >>\nstream\n%sendstream", len(encoded), encoded),
+	)
+
+	graph, err := parsePDFGraph(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree := graph.toTree(input)
+	enrichPDFStreamNodeMetadata(tree)
+	streams := tree.Query(core.Match{Kind: KindStream})
+	if len(streams) != 2 {
+		t.Fatalf("stream nodes = %d, want 2", len(streams))
+	}
+	unsupportedMeta := streams[0].Meta
+	if unsupportedMeta["filter_capability"] != string(pdfStreamFilterCapabilityUnsupportedTarget) {
+		t.Fatalf("unsupported filter_capability = %v, want %q", unsupportedMeta["filter_capability"], pdfStreamFilterCapabilityUnsupportedTarget)
+	}
+	if unsupportedMeta["filter_editable"] != false || unsupportedMeta["filter_pass_through"] != false || unsupportedMeta["filter_target"] != true {
+		t.Fatalf("unsupported filter metadata = editable:%v pass_through:%v target:%v, want false/false/true", unsupportedMeta["filter_editable"], unsupportedMeta["filter_pass_through"], unsupportedMeta["filter_target"])
+	}
+	if got := fmt.Sprint(unsupportedMeta["unsupported"]); !strings.Contains(got, "FooDecode") {
+		t.Fatalf("unsupported metadata = %v, want FooDecode", unsupportedMeta["unsupported"])
+	}
+	if _, ok := unsupportedMeta["decoded_length"]; ok {
+		t.Fatalf("decoded_length present for unsupported target stream: %+v", unsupportedMeta)
+	}
+	if matches := tree.Query(core.Match{Kind: KindTextShow, Text: "UNSUPPORTED-TEXT"}); len(matches) != 0 {
+		t.Fatalf("unsupported stream text matches = %d, want 0", len(matches))
+	}
+
+	if _, _, _, err := ApplyCanonicalEdit(input, core.Match{Kind: KindTextShow, Text: "UNSUPPORTED-TEXT"}, core.Mutation{Replace: "EDITED"}, nil); err == nil {
+		t.Fatal("expected canonical edit inside unsupported target stream to fail closed")
+	}
+	_, _, verification, err := ApplyCanonicalEdit(input, core.Match{Kind: KindTextShow, Text: "FLATE-TEXT"}, core.Mutation{Replace: "EDITED"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

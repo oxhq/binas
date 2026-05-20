@@ -118,6 +118,61 @@ func TestParseKeepsUnsupportedFilteredStreamMetadataWithoutDecodedLength(t *test
 		t.Fatalf("filter = %v, want DCTDecode", meta["filter"])
 	}
 	assertStringSliceMeta(t, meta, "filter_chain", []string{"DCTDecode"})
+	if meta["filter_capability"] != string(pdfStreamFilterCapabilityPassThroughImage) {
+		t.Fatalf("filter_capability = %v, want %q", meta["filter_capability"], pdfStreamFilterCapabilityPassThroughImage)
+	}
+	if meta["filter_editable"] != false || meta["filter_pass_through"] != true || meta["filter_target"] != false {
+		t.Fatalf("filter metadata = editable:%v pass_through:%v target:%v, want false/true/false", meta["filter_editable"], meta["filter_pass_through"], meta["filter_target"])
+	}
+}
+
+func TestImagePassThroughFlateImageXObjectDoesNotProduceEditableText(t *testing.T) {
+	imageDecoded := []byte("BT\n(IMAGE-TEXT) Tj\nET\n")
+	imageEncoded, err := encodeFlateDecode(imageDecoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("BT\n(PAGE-TEXT) Tj\nET\n")
+	input := testPDF(
+		"<< /Type /Page >>",
+		fmt.Sprintf("<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length %d /Filter /FlateDecode >>\nstream\n%sendstream", len(imageEncoded), imageEncoded),
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
+	)
+
+	adapter := NewAdapter()
+	tree, err := adapter.Parse(input, core.ParseOptions{Strict: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if matches := tree.Query(core.Match{Kind: KindTextShow, Text: "IMAGE-TEXT"}); len(matches) != 0 {
+		t.Fatalf("image text matches = %d, want 0", len(matches))
+	}
+	if matches := tree.Query(core.Match{Kind: KindTextShow, Text: "PAGE-TEXT"}); len(matches) != 1 {
+		t.Fatalf("page text matches = %d, want 1", len(matches))
+	}
+
+	streams := tree.Query(core.Match{Kind: KindStream})
+	if len(streams) != 2 {
+		t.Fatalf("stream nodes = %d, want 2", len(streams))
+	}
+	if streams[0].Meta["image_xobject"] != true {
+		t.Fatalf("image stream metadata = %+v, want image_xobject=true", streams[0].Meta)
+	}
+	if streams[0].Meta["filter_capability"] != string(pdfStreamFilterCapabilityEditableReversible) {
+		t.Fatalf("image filter_capability = %v, want %q", streams[0].Meta["filter_capability"], pdfStreamFilterCapabilityEditableReversible)
+	}
+
+	plan, err := adapter.PlanEdit(tree, core.Match{Kind: KindTextShow, Text: "PAGE-TEXT"}, core.Mutation{Replace: "EDITED"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, _, err := adapter.Apply(input, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(output, imageEncoded) {
+		t.Fatal("image stream bytes changed during page content edit")
+	}
 }
 
 func TestParseFindsHexStringTextShowNodes(t *testing.T) {
@@ -217,6 +272,29 @@ func TestPlanEditHexStringRejectsNonASCIIReplacement(t *testing.T) {
 		t.Fatal("expected non-ASCII hex replacement to fail closed")
 	}
 	if err.Error() != "replacement for hex text show operand must be ASCII" {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestPlanEditUnsupportedFilterTextNodeFailsClosed(t *testing.T) {
+	tree := &core.Tree{Format: "pdf"}
+	tree.Root = tree.AddNode(core.Node{Kind: KindDocument})
+	textID := tree.AddNode(core.Node{
+		Kind:  KindTextShow,
+		Span:  core.Span{Start: 10, End: 20},
+		Value: "IMAGE-TEXT",
+		Meta: map[string]any{
+			"encoded":       "IMAGE-TEXT",
+			"stream_filter": "/DCTDecode",
+		},
+	})
+	tree.Nodes[tree.Root].Children = append(tree.Nodes[tree.Root].Children, textID)
+
+	_, err := NewAdapter().PlanEdit(tree, core.Match{Kind: KindTextShow, Text: "IMAGE-TEXT"}, core.Mutation{Replace: "EDITED"})
+	if err == nil {
+		t.Fatal("expected unsupported stream target edit planning to fail closed")
+	}
+	if err.Error() != `unsupported PDF stream filter target for text edit "DCTDecode"` {
 		t.Fatalf("error = %q", err)
 	}
 }

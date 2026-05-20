@@ -548,11 +548,20 @@ func writeSemanticEditResult(output []byte, report core.Report, verification cor
 }
 
 type validationResult struct {
-	Format   string   `json:"format"`
-	Valid    bool     `json:"valid"`
-	Errors   []string `json:"errors"`
-	Warnings []string `json:"warnings"`
-	Root     any      `json:"root,omitempty"`
+	Format        string              `json:"format"`
+	Valid         bool                `json:"valid"`
+	Errors        []string            `json:"errors"`
+	Warnings      []string            `json:"warnings"`
+	Root          any                 `json:"root,omitempty"`
+	Streams       []core.Node         `json:"streams,omitempty"`
+	StreamFilters *streamFilterReport `json:"stream_filters,omitempty"`
+}
+
+type streamFilterReport struct {
+	Total              int `json:"total"`
+	EditableTargets    int `json:"editable_targets"`
+	PassThroughStreams int `json:"pass_through_streams"`
+	UnsupportedTargets int `json:"unsupported_targets"`
 }
 
 type optionalIntFlag struct {
@@ -656,6 +665,8 @@ func validate(args []string) error {
 		if root, ok := tree.Node(tree.Root); ok {
 			result.Root = root.Value
 		}
+		result.Streams = streamNodes(tree)
+		result.StreamFilters = streamFilterReportFor(result.Streams)
 		result.Warnings = append(result.Warnings, validationWarnings(tree)...)
 	}
 	if strings.ToLower(*format) == "pdf" {
@@ -798,10 +809,15 @@ func inspect(args []string) error {
 		return errors.New("inspect produced no parse tree")
 	}
 	root, _ := tree.Node(tree.Root)
+	streams := streamNodes(tree)
 	result := map[string]any{
 		"format": tree.Format,
 		"nodes":  len(tree.Nodes),
 		"root":   rootWithSecurityMetadata(root.Value, input),
+	}
+	if len(streams) > 0 {
+		result["streams"] = streams
+		result["stream_filters"] = streamFilterReportFor(streams)
 	}
 	if parseErr != nil {
 		result["parse_error"] = parseErr.Error()
@@ -860,6 +876,93 @@ func query(args []string) error {
 		fmt.Printf("%d %s %d:%d %v\n", match.ID, match.Kind, match.Span.Start, match.Span.End, match.Value)
 	}
 	return nil
+}
+
+func streamNodes(tree *core.Tree) []core.Node {
+	if tree == nil {
+		return nil
+	}
+	streams := make([]core.Node, 0)
+	for _, node := range tree.Nodes {
+		if node.Kind == pdf.KindStream {
+			streams = append(streams, node)
+		}
+	}
+	return streams
+}
+
+func streamFilterReportFor(streams []core.Node) *streamFilterReport {
+	if len(streams) == 0 {
+		return nil
+	}
+	report := streamFilterReport{Total: len(streams)}
+	for _, stream := range streams {
+		if metaBool(stream.Meta, "filter_editable") && metaBool(stream.Meta, "filter_target") {
+			report.EditableTargets++
+		}
+		if metaBool(stream.Meta, "filter_pass_through") {
+			report.PassThroughStreams++
+		}
+		if !metaBool(stream.Meta, "filter_editable") && metaBool(stream.Meta, "filter_target") {
+			report.UnsupportedTargets++
+		}
+	}
+	return &report
+}
+
+func metaBool(meta map[string]any, key string) bool {
+	value, ok := meta[key]
+	if !ok {
+		return false
+	}
+	got, ok := value.(bool)
+	return ok && got
+}
+
+func editPlanErrorWithStreamBoundaries(err error, tree *core.Tree) error {
+	unsupported := unsupportedTargetStreamNodes(tree)
+	if err == nil || len(unsupported) == 0 {
+		return err
+	}
+	reasons := make([]string, 0, len(unsupported))
+	for _, stream := range unsupported {
+		if reason, _ := stream.Meta["unsupported"].(string); reason != "" {
+			reasons = append(reasons, reason)
+			continue
+		}
+		if capability, _ := stream.Meta["filter_capability"].(string); capability != "" {
+			reasons = append(reasons, capability)
+		}
+	}
+	if len(reasons) == 0 {
+		return err
+	}
+	return fmt.Errorf("%w; unsupported stream filter targets present: %s", err, strings.Join(reasons, "; "))
+}
+
+func writeEditErrorJSON(err error, tree *core.Tree) error {
+	unsupported := unsupportedTargetStreamNodes(tree)
+	if len(unsupported) == 0 {
+		return nil
+	}
+	return writeJSON(map[string]any{
+		"error":               err.Error(),
+		"edit_status":         "unsupported",
+		"fallback_used":       false,
+		"unsupported_streams": unsupported,
+		"stream_filters":      streamFilterReportFor(streamNodes(tree)),
+	})
+}
+
+func unsupportedTargetStreamNodes(tree *core.Tree) []core.Node {
+	streams := streamNodes(tree)
+	unsupported := make([]core.Node, 0)
+	for _, stream := range streams {
+		if !metaBool(stream.Meta, "filter_editable") && metaBool(stream.Meta, "filter_target") {
+			unsupported = append(unsupported, stream)
+		}
+	}
+	return unsupported
 }
 
 func edit(args []string) error {
@@ -1042,6 +1145,12 @@ func edit(args []string) error {
 	}
 	plan, err := adapter.PlanEdit(tree, selector, core.Mutation{Replace: *replace})
 	if err != nil {
+		err = editPlanErrorWithStreamBoundaries(err, tree)
+		if *asJSON {
+			if jsonErr := writeEditErrorJSON(err, tree); jsonErr != nil {
+				return jsonErr
+			}
+		}
 		return err
 	}
 	if err := enforceLayoutMode(layoutMode, plan.Meta); err != nil {

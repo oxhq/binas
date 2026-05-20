@@ -331,6 +331,100 @@ func TestCorpusDecodeParmsPredictor12BitsPerComponent16Rewrite(t *testing.T) {
 	assertCorpusTextMatches(t, reparsed, "WXYZ", 1)
 }
 
+func TestCorpusP2ImageOnlyFiltersPassThroughWhileSupportedContentEdits(t *testing.T) {
+	input := readCorpusPDF(t, "p2-image-only-filters-supported-content.pdf")
+	adapter := NewAdapter()
+
+	tree, err := adapter.Parse(input, core.ParseOptions{Strict: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	streams := tree.Query(core.Match{Kind: KindStream})
+	if len(streams) != 6 {
+		t.Fatalf("stream nodes = %d, want 6", len(streams))
+	}
+	assertCorpusTextMatches(t, tree, "P2-TEXT", 1)
+
+	p2AssertEditableStreamMetadata(t, streams[0].Meta, false)
+	p2AssertPassThroughImageStreamMetadata(t, streams[1].Meta, []string{"DCTDecode"})
+	p2AssertPassThroughImageStreamMetadata(t, streams[2].Meta, []string{"JPXDecode"})
+	p2AssertPassThroughImageStreamMetadata(t, streams[3].Meta, []string{"CCITTFaxDecode"})
+	p2AssertPassThroughImageStreamMetadata(t, streams[4].Meta, []string{"JBIG2Decode"})
+	p2AssertPassThroughImageStreamMetadata(t, streams[5].Meta, []string{"DCTDecode", "JPXDecode"})
+
+	plan, err := adapter.PlanEdit(tree, core.Match{Kind: KindTextShow, Text: "P2-TEXT"}, core.Mutation{Replace: "P2-DONE"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, report, err := adapter.Apply(input, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.FallbackUsed {
+		t.Fatal("unexpected fallback")
+	}
+	verification, err := adapter.Verify(output, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.ReparseOK || !verification.OldTextRemoved || !verification.NewSelectable || !verification.PageUnchanged {
+		t.Fatalf("verification failed: %+v", verification)
+	}
+	if bytes.Count(output, []byte("p2 image bytes")) != 5 {
+		t.Fatal("image stream bytes changed during supported content edit")
+	}
+
+	reparsed, err := adapter.Parse(output, core.ParseOptions{Strict: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertCorpusTextMatches(t, reparsed, "P2-DONE", 1)
+}
+
+func TestCorpusP2UnsupportedNonImageFilterFailsClosedButSupportedContentEdits(t *testing.T) {
+	input := readCorpusPDF(t, "p2-unsupported-nonimage-filter-text.pdf")
+	adapter := NewAdapter()
+
+	tree, err := adapter.Parse(input, core.ParseOptions{Strict: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	streams := tree.Query(core.Match{Kind: KindStream})
+	if len(streams) != 2 {
+		t.Fatalf("stream nodes = %d, want 2", len(streams))
+	}
+	p2AssertUnsupportedTargetStreamMetadata(t, streams[0].Meta, "FooDecode")
+	p2AssertEditableStreamMetadata(t, streams[1].Meta, false)
+	assertCorpusTextMatches(t, tree, "UNSUPPORTED-P2", 0)
+	assertCorpusTextMatches(t, tree, "SUPPORTED-P2", 1)
+
+	if _, err := adapter.PlanEdit(tree, core.Match{Kind: KindTextShow, Text: "UNSUPPORTED-P2"}, core.Mutation{Replace: "P2-BLOCKED"}); err == nil {
+		t.Fatal("expected unsupported non-image stream target edit to fail closed")
+	}
+
+	plan, err := adapter.PlanEdit(tree, core.Match{Kind: KindTextShow, Text: "SUPPORTED-P2"}, core.Mutation{Replace: "SUPPORTED-OK"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, report, err := adapter.Apply(input, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.FallbackUsed {
+		t.Fatal("unexpected fallback")
+	}
+	verification, err := adapter.Verify(output, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.ReparseOK || !verification.OldTextRemoved || !verification.NewSelectable || !verification.PageUnchanged {
+		t.Fatalf("verification failed: %+v", verification)
+	}
+	if !bytes.Contains(output, []byte("(UNSUPPORTED-P2) Tj")) {
+		t.Fatal("unsupported stream bytes changed during supported content edit")
+	}
+}
+
 func TestCorpusMalformedMissingEOFStrictError(t *testing.T) {
 	input := readCorpusPDF(t, "malformed-missing-eof.pdf")
 	adapter := NewAdapter()
@@ -561,5 +655,54 @@ func assertCorpusTextMatches(t *testing.T, tree *core.Tree, text string, want in
 	got := tree.Query(core.Match{Kind: KindTextShow, Text: text})
 	if len(got) != want {
 		t.Fatalf("%q matches = %d, want %d", text, len(got), want)
+	}
+}
+
+func p2AssertEditableStreamMetadata(t *testing.T, meta map[string]any, wantFilterTarget bool) {
+	t.Helper()
+	if meta["filter_capability"] != string(pdfStreamFilterCapabilityIdentityPassThrough) {
+		t.Fatalf("filter_capability = %v, want %q; meta=%+v", meta["filter_capability"], pdfStreamFilterCapabilityIdentityPassThrough, meta)
+	}
+	if meta["filter_editable"] != false || meta["filter_pass_through"] != true || meta["filter_target"] != wantFilterTarget {
+		t.Fatalf("filter metadata = editable:%v pass_through:%v target:%v, want false/true/%v; meta=%+v", meta["filter_editable"], meta["filter_pass_through"], meta["filter_target"], wantFilterTarget, meta)
+	}
+	if _, ok := meta["unsupported"]; ok {
+		t.Fatalf("unsupported metadata present for editable stream: %+v", meta)
+	}
+}
+
+func p2AssertPassThroughImageStreamMetadata(t *testing.T, meta map[string]any, wantChain []string) {
+	t.Helper()
+	if meta["image_xobject"] != true {
+		t.Fatalf("image_xobject = %v, want true; meta=%+v", meta["image_xobject"], meta)
+	}
+	if meta["filter_capability"] != string(pdfStreamFilterCapabilityPassThroughImage) {
+		t.Fatalf("filter_capability = %v, want %q; meta=%+v", meta["filter_capability"], pdfStreamFilterCapabilityPassThroughImage, meta)
+	}
+	if meta["filter_editable"] != false || meta["filter_pass_through"] != true || meta["filter_target"] != false {
+		t.Fatalf("filter metadata = editable:%v pass_through:%v target:%v, want false/true/false; meta=%+v", meta["filter_editable"], meta["filter_pass_through"], meta["filter_target"], meta)
+	}
+	if _, ok := meta["unsupported"]; ok {
+		t.Fatalf("unsupported metadata present for image pass-through stream: %+v", meta)
+	}
+	if _, ok := meta["decoded_length"]; ok {
+		t.Fatalf("decoded_length present for image pass-through stream: %+v", meta)
+	}
+	assertStringSliceMeta(t, meta, "filter_chain", wantChain)
+}
+
+func p2AssertUnsupportedTargetStreamMetadata(t *testing.T, meta map[string]any, wantFilter string) {
+	t.Helper()
+	if meta["unsupported"] != fmt.Sprintf("unsupported PDF stream filter %q", wantFilter) {
+		t.Fatalf("unsupported metadata = %v, want unsupported filter %q; meta=%+v", meta["unsupported"], wantFilter, meta)
+	}
+	if meta["filter_capability"] != string(pdfStreamFilterCapabilityUnsupportedTarget) {
+		t.Fatalf("filter_capability = %v, want %q; meta=%+v", meta["filter_capability"], pdfStreamFilterCapabilityUnsupportedTarget, meta)
+	}
+	if meta["filter_editable"] != false || meta["filter_pass_through"] != false || meta["filter_target"] != true {
+		t.Fatalf("filter metadata = editable:%v pass_through:%v target:%v, want false/false/true; meta=%+v", meta["filter_editable"], meta["filter_pass_through"], meta["filter_target"], meta)
+	}
+	if _, ok := meta["decoded_length"]; ok {
+		t.Fatalf("decoded_length present for unsupported target stream: %+v", meta)
 	}
 }

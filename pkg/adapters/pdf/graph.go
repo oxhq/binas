@@ -700,7 +700,11 @@ func (g *pdfGraph) toTree(input []byte) *core.Tree {
 		if !ok || dictHasType(stream.Dict, "ObjStm") || dictHasType(stream.Dict, "XRef") {
 			continue
 		}
-		_, err := g.decodePDFGraphObjectStream(object.ID, stream)
+		imageXObject := isPDFImageXObjectStreamDict(stream.Dict)
+		var err error
+		if !pdfGraphStreamIsImagePassThrough(stream) {
+			_, err = g.decodePDFGraphObjectStream(object.ID, stream)
+		}
 		streamMeta := map[string]any{
 			"object_number":     object.ID.Number,
 			"object_generation": object.ID.Generation,
@@ -709,7 +713,7 @@ func (g *pdfGraph) toTree(input []byte) *core.Tree {
 			"decode_parms":      g.pdfGraphDecodeParmsString(stream.Dict),
 			"canonical_graph":   true,
 		}
-		if isPDFImageXObjectStreamDict(stream.Dict) {
+		if imageXObject {
 			streamMeta["image_xobject"] = true
 		}
 		if object.InObjectStream {
@@ -758,6 +762,9 @@ func (g *pdfGraph) textShowStreamContexts(cmapContext pdfCMapContext) []pdfGraph
 		}
 		pageID := object.ID
 		for _, content := range g.pageContentStreamObjects(page) {
+			if isPDFImageXObjectStreamDict(content.Stream.Dict) {
+				continue
+			}
 			streamObject, ok := g.Objects[content.ID]
 			if !ok {
 				continue
@@ -806,6 +813,14 @@ func (g *pdfGraph) textShowStreamContexts(cmapContext pdfCMapContext) []pdfGraph
 		})
 	}
 	return contexts
+}
+
+func pdfGraphStreamIsImagePassThrough(stream pdfStreamObject) bool {
+	if !isPDFImageXObjectStreamDict(stream.Dict) {
+		return false
+	}
+	chain := normalizePDFStreamFilterCapabilityChain(parsePDFStreamFilterChain(pdfGraphStreamFilterString(stream.Dict)))
+	return len(chain) == 0 || pdfStreamFilterChainContainsImagePassThrough(chain)
 }
 
 func (g *pdfGraph) appendInvokedFormTextShowContexts(input []byte, resources pdfDict, pageID *pdfObjectID, depth int, visited map[pdfObjectID]bool, fallback *toUnicodeCMap, contexts *[]pdfGraphTextShowStreamContext, seenFallback map[pdfObjectID]bool) {

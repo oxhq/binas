@@ -1,5 +1,7 @@
 package pdf
 
+import "strings"
+
 const (
 	pdfFilterCCITTFaxDecode = "CCITTFaxDecode"
 	pdfFilterDCTDecode      = "DCTDecode"
@@ -33,6 +35,45 @@ func addPDFStreamFilterCapabilityMetadata(meta map[string]any, filter string) {
 	meta["filter_editable"] = capability.Editable
 	meta["filter_pass_through"] = capability.PassThrough
 	meta["filter_target"] = capability.Target
+}
+
+func pdfStreamFilterCapabilityAllowsTextTargets(filter string) bool {
+	return pdfStreamFilterCapabilityAllowsTextTargetsWithDecodeParms(filter, "")
+}
+
+func pdfStreamFilterCapabilityAllowsTextTargetsWithDecodeParms(filter, decodeParms string) bool {
+	capability := classifyPDFStreamFilterCapability(filter)
+	if capability.Class == pdfStreamFilterCapabilityIdentityPassThrough || capability.Editable {
+		return true
+	}
+	filters := normalizePDFStreamFilterCapabilityChain(parsePDFStreamFilterChain(filter))
+	if len(filters) == 0 {
+		return true
+	}
+	params, err := parsePDFStreamDecodeParms(filters, decodeParms)
+	if err != nil {
+		return false
+	}
+	hasNamedCrypt := false
+	hasExplicitIdentityCrypt := false
+	for i, filter := range filters {
+		if filter == pdfFilterCrypt {
+			name := pdfCryptFilterName(params[i].crypt)
+			if name == "Identity" && params[i].crypt != nil && strings.TrimSpace(decodeParms) != "" {
+				hasExplicitIdentityCrypt = true
+				continue
+			}
+			if name == "" || name == "Identity" {
+				return false
+			}
+			hasNamedCrypt = true
+			continue
+		}
+		if !isEditableReversiblePDFStreamFilter(filter) {
+			return false
+		}
+	}
+	return hasNamedCrypt || hasExplicitIdentityCrypt
 }
 
 func classifyPDFStreamFilterCapability(filter string) pdfStreamFilterCapability {
@@ -71,7 +112,14 @@ func normalizePDFStreamFilterCapabilityChain(filters []string) []string {
 	}
 	out := make([]string, 0, len(filters))
 	for _, filter := range filters {
-		out = append(out, normalizePDFStreamFilterCapabilityName(filter))
+		filter = normalizePDFStreamFilterCapabilityName(filter)
+		if filter == "" || filter == "Identity" {
+			continue
+		}
+		out = append(out, filter)
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }
@@ -83,6 +131,8 @@ func normalizePDFStreamFilterCapabilityName(filter string) string {
 		return pdfFilterCCITTFaxDecode
 	case "DCT":
 		return pdfFilterDCTDecode
+	case "null":
+		return "Identity"
 	default:
 		return filter
 	}
