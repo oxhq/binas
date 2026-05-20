@@ -494,6 +494,13 @@ func (g *pdfGraph) simpleEncodingForFont(fontID pdfObjectID) (*pdfSimpleFontEnco
 	if !ok {
 		return nil, false
 	}
+	if ref, ok := encodingValue.(pdfRef); ok {
+		if resolved, ok := g.resolvePDFDict(ref); ok {
+			encodingValue = resolved
+		} else {
+			return nil, false
+		}
+	}
 	return parseSimpleFontEncoding(encodingValue)
 }
 
@@ -519,24 +526,24 @@ func (c pdfCMapContext) fontEncodingsForStream(sourceStart int) map[string]*pdfS
 }
 
 func parseToUnicodeCMap(input []byte) (pdfToUnicodeMap, bool) {
-	fields := bytes.Fields(input)
+	fields := tokenizeToUnicodeCMap(input)
 	out := make(pdfToUnicodeMap)
 	for i := 0; i < len(fields); i++ {
-		switch string(fields[i]) {
+		switch fields[i].Text {
 		case "beginbfchar":
 			if i == 0 {
 				continue
 			}
-			count, err := strconv.Atoi(string(fields[i-1]))
+			count, err := strconv.Atoi(fields[i-1].Text)
 			if err != nil {
 				continue
 			}
 			j := i + 1
 			for n := 0; n < count && j+1 < len(fields); n++ {
-				src, srcOK := pdfHexToken(fields[j])
-				dst, dstOK := pdfHexToken(fields[j+1])
+				src, srcOK := pdfCMapHexSourceToken(fields[j])
+				dst, dstOK := pdfCMapStringToken(fields[j+1])
 				if srcOK && dstOK {
-					out[strings.ToUpper(src)] = decodeUTF16BEHex(dst)
+					out[src] = decodeCMapDestinationBytes(dst)
 				}
 				j += 2
 			}
@@ -545,21 +552,21 @@ func parseToUnicodeCMap(input []byte) (pdfToUnicodeMap, bool) {
 			if i == 0 {
 				continue
 			}
-			count, err := strconv.Atoi(string(fields[i-1]))
+			count, err := strconv.Atoi(fields[i-1].Text)
 			if err != nil {
 				continue
 			}
 			j := i + 1
 			for n := 0; n < count && j+2 < len(fields); n++ {
-				startHex, startOK := pdfHexToken(fields[j])
-				endHex, endOK := pdfHexToken(fields[j+1])
-				if startOK && endOK && len(fields[j+2]) > 0 && fields[j+2][0] == '[' {
+				startHex, startOK := pdfCMapHexSourceToken(fields[j])
+				endHex, endOK := pdfCMapHexSourceToken(fields[j+1])
+				if startOK && endOK && fields[j+2].Text == "[" {
 					j = addCMapArrayRange(out, startHex, endHex, fields, j+2)
 					continue
 				}
-				dstHex, dstOK := pdfHexToken(fields[j+2])
+				dst, dstOK := pdfCMapStringToken(fields[j+2])
 				if startOK && endOK && dstOK {
-					addCMapSequentialRange(out, startHex, endHex, dstHex)
+					addCMapSequentialRange(out, startHex, endHex, dst)
 				}
 				j += 3
 			}
@@ -567,6 +574,80 @@ func parseToUnicodeCMap(input []byte) (pdfToUnicodeMap, bool) {
 		}
 	}
 	return out, len(out) > 0
+}
+
+type pdfCMapToken struct {
+	Kind string
+	Text string
+	Raw  []byte
+}
+
+func tokenizeToUnicodeCMap(input []byte) []pdfCMapToken {
+	tokens := make([]pdfCMapToken, 0)
+	for i := 0; i < len(input); {
+		i = skipPDFSpaceAndComments(input, i)
+		if i >= len(input) {
+			break
+		}
+		switch input[i] {
+		case '[':
+			tokens = append(tokens, pdfCMapToken{Kind: "delimiter", Text: "["})
+			i++
+		case ']':
+			tokens = append(tokens, pdfCMapToken{Kind: "delimiter", Text: "]"})
+			i++
+		case '(':
+			closeAt, ok := findLiteralEnd(input, i+1, len(input))
+			if !ok {
+				i++
+				continue
+			}
+			tokens = append(tokens, pdfCMapToken{Kind: "string", Raw: []byte(decodeLiteralString(string(input[i+1 : closeAt])))})
+			i = closeAt + 1
+		case '<':
+			if i+1 < len(input) && input[i+1] == '<' {
+				end, ok := findDictionaryEnd(input, i)
+				if !ok {
+					i += 2
+					continue
+				}
+				i = end
+				continue
+			}
+			closeAt, ok := findHexStringEnd(input, i+1, len(input))
+			if !ok {
+				i++
+				continue
+			}
+			raw, ok := decodeHexBytes(input[i+1 : closeAt])
+			if ok {
+				tokens = append(tokens, pdfCMapToken{Kind: "string", Raw: raw, Text: strings.ToUpper(compactPDFHex(input[i+1 : closeAt]))})
+			}
+			i = closeAt + 1
+		default:
+			j := i
+			for j < len(input) && !isPDFSpace(input[j]) && !isPDFDelimiter(input[j]) {
+				j++
+			}
+			if j > i {
+				tokens = append(tokens, pdfCMapToken{Kind: "name", Text: string(input[i:j])})
+			} else {
+				j++
+			}
+			i = j
+		}
+	}
+	return tokens
+}
+
+func compactPDFHex(input []byte) string {
+	out := make([]byte, 0, len(input))
+	for _, b := range input {
+		if !isPDFSpace(b) {
+			out = append(out, b)
+		}
+	}
+	return string(out)
 }
 
 func (m pdfToUnicodeMap) DecodeHex(encoded []byte) (string, bool) {
@@ -688,20 +769,34 @@ func pdfHexToken(token []byte) (string, bool) {
 	return raw, true
 }
 
-func addCMapSequentialRange(out pdfToUnicodeMap, startHex, endHex, dstHex string) {
+func pdfCMapHexSourceToken(token pdfCMapToken) (string, bool) {
+	if token.Kind != "string" || token.Text == "" {
+		return "", false
+	}
+	return token.Text, true
+}
+
+func pdfCMapStringToken(token pdfCMapToken) ([]byte, bool) {
+	if token.Kind != "string" || len(token.Raw) == 0 {
+		return nil, false
+	}
+	return append([]byte(nil), token.Raw...), true
+}
+
+func addCMapSequentialRange(out pdfToUnicodeMap, startHex, endHex string, dst []byte) {
 	start, err1 := strconv.ParseInt(startHex, 16, 64)
 	end, err2 := strconv.ParseInt(endHex, 16, 64)
-	dst, err3 := strconv.ParseInt(dstHex, 16, 64)
-	if err1 != nil || err2 != nil || err3 != nil || end < start {
+	if err1 != nil || err2 != nil || end < start || len(dst) == 0 {
 		return
 	}
 	width := len(startHex)
 	for value := start; value <= end; value++ {
-		out[fmt.Sprintf("%0*X", width, value)] = decodeUTF16BECodepoint(dst + (value - start))
+		mapped := incrementUTF16BEBytes(dst, value-start)
+		out[fmt.Sprintf("%0*X", width, value)] = decodeUTF16BEBytes(mapped)
 	}
 }
 
-func addCMapArrayRange(out pdfToUnicodeMap, startHex, endHex string, fields [][]byte, startField int) int {
+func addCMapArrayRange(out pdfToUnicodeMap, startHex, endHex string, fields []pdfCMapToken, startField int) int {
 	start, err1 := strconv.ParseInt(startHex, 16, 64)
 	end, err2 := strconv.ParseInt(endHex, 16, 64)
 	if err1 != nil || err2 != nil || end < start {
@@ -711,24 +806,21 @@ func addCMapArrayRange(out pdfToUnicodeMap, startHex, endHex string, fields [][]
 	value := start
 	j := startField
 	for j < len(fields) && value <= end {
-		token, closed := trimCMapArrayToken(fields[j])
-		if token != nil {
-			if dstHex, ok := pdfHexToken(token); ok {
-				out[fmt.Sprintf("%0*X", width, value)] = decodeUTF16BEHex(dstHex)
-				value++
-			}
+		if fields[j].Text == "]" {
+			return j + 1
+		}
+		if dst, ok := pdfCMapStringToken(fields[j]); ok {
+			out[fmt.Sprintf("%0*X", width, value)] = decodeCMapDestinationBytes(dst)
+			value++
 		}
 		j++
-		if closed {
-			return j
-		}
 	}
 	return skipCMapArray(fields, j)
 }
 
-func skipCMapArray(fields [][]byte, start int) int {
+func skipCMapArray(fields []pdfCMapToken, start int) int {
 	for i := start; i < len(fields); i++ {
-		if bytes.Contains(fields[i], []byte("]")) {
+		if fields[i].Text == "]" {
 			return i + 1
 		}
 	}
@@ -749,15 +841,41 @@ func decodeUTF16BEHex(raw string) string {
 	if len(raw)%4 != 0 {
 		return ""
 	}
-	values := make([]uint16, 0, len(raw)/4)
-	for i := 0; i < len(raw); i += 4 {
-		v, err := strconv.ParseUint(raw[i:i+4], 16, 16)
-		if err != nil {
-			return ""
-		}
-		values = append(values, uint16(v))
+	bytes, ok := decodeHexBytes([]byte(raw))
+	if !ok {
+		return ""
+	}
+	return decodeUTF16BEBytes(bytes)
+}
+
+func decodeUTF16BEBytes(raw []byte) string {
+	if len(raw)%2 != 0 {
+		return ""
+	}
+	values := make([]uint16, 0, len(raw)/2)
+	for i := 0; i < len(raw); i += 2 {
+		values = append(values, uint16(raw[i])<<8|uint16(raw[i+1]))
 	}
 	return string(utf16.Decode(values))
+}
+
+func decodeCMapDestinationBytes(raw []byte) string {
+	if len(raw)%2 == 0 {
+		return decodeUTF16BEBytes(raw)
+	}
+	return string(raw)
+}
+
+func incrementUTF16BEBytes(raw []byte, delta int64) []byte {
+	out := append([]byte(nil), raw...)
+	if len(out) < 2 {
+		return out
+	}
+	value := int64(out[len(out)-2])<<8 | int64(out[len(out)-1])
+	value += delta
+	out[len(out)-2] = byte(value >> 8)
+	out[len(out)-1] = byte(value)
+	return out
 }
 
 func decodeUTF16BECodepoint(value int64) string {

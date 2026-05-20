@@ -682,6 +682,7 @@ func (p *pdfValueParser) consumeKeyword(keyword string) bool {
 func (g *pdfGraph) toTree(input []byte) *core.Tree {
 	tree := documentTree(input, g.Boundaries, g.Xref)
 	cmapContext := g.cmapContext()
+	streamIDs := make(map[pdfObjectID]core.NodeID)
 	if root, ok := tree.Node(tree.Root); ok {
 		value := root.Value.(map[string]any)
 		value["pages"] = g.pageCount()
@@ -699,7 +700,7 @@ func (g *pdfGraph) toTree(input []byte) *core.Tree {
 		if !ok || dictHasType(stream.Dict, "ObjStm") || dictHasType(stream.Dict, "XRef") {
 			continue
 		}
-		decoded, err := g.decodePDFGraphObjectStream(object.ID, stream)
+		_, err := g.decodePDFGraphObjectStream(object.ID, stream)
 		streamMeta := map[string]any{
 			"object_number":     object.ID.Number,
 			"object_generation": object.ID.Generation,
@@ -723,28 +724,172 @@ func (g *pdfGraph) toTree(input []byte) *core.Tree {
 			Span: streamSpan,
 			Meta: streamMeta,
 		})
+		streamIDs[object.ID] = streamID
 		tree.Nodes[tree.Root].Children = append(tree.Nodes[tree.Root].Children, streamID)
+	}
+	for _, context := range g.textShowStreamContexts(cmapContext) {
+		streamID, ok := streamIDs[context.object.ID]
+		if !ok {
+			continue
+		}
+		parseTextShow(context.decoded, 0, len(context.decoded), tree, streamID, context.textContext)
+	}
+	return tree
+}
+
+type pdfGraphTextShowStreamContext struct {
+	object      *pdfIndirectObject
+	stream      pdfStreamObject
+	decoded     []byte
+	textContext textShowContext
+}
+
+func (g *pdfGraph) textShowStreamContexts(cmapContext pdfCMapContext) []pdfGraphTextShowStreamContext {
+	contexts := make([]pdfGraphTextShowStreamContext, 0)
+	seenFallback := make(map[pdfObjectID]bool)
+	for _, object := range sortedPDFObjects(g.Objects) {
+		page, ok := object.Value.(pdfDict)
+		if !ok || !dictHasType(page, "Page") {
+			continue
+		}
+		resources, inherited, ok := g.pageResourcesWithInheritance(page)
+		if !ok {
+			continue
+		}
+		pageID := object.ID
+		for _, content := range g.pageContentStreamObjects(page) {
+			streamObject, ok := g.Objects[content.ID]
+			if !ok {
+				continue
+			}
+			decoded, err := g.decodePDFGraphObjectStream(content.ID, content.Stream)
+			if err != nil {
+				continue
+			}
+			contexts = append(contexts, pdfGraphTextShowStreamContext{
+				object:      streamObject,
+				stream:      content.Stream,
+				decoded:     decoded,
+				textContext: g.textShowContextForResources(content.Stream, decoded, cmapContext.fallback, resources, "page", &pageID, nil, inherited, 0),
+			})
+			seenFallback[content.ID] = true
+			g.appendInvokedFormTextShowContexts(decoded, resources, &pageID, 0, nil, cmapContext.fallback, &contexts, seenFallback)
+		}
+	}
+	for _, object := range sortedPDFObjects(g.Objects) {
+		stream, ok := object.Value.(pdfStreamObject)
+		if !ok || dictHasType(stream.Dict, "ObjStm") || dictHasType(stream.Dict, "XRef") || isPDFImageXObjectStreamDict(stream.Dict) {
+			continue
+		}
+		if seenFallback[object.ID] {
+			continue
+		}
+		decoded, err := g.decodePDFGraphObjectStream(object.ID, stream)
 		if err != nil {
 			continue
 		}
-		if isPDFImageXObjectStreamDict(stream.Dict) {
-			continue
-		}
-		parseTextShow(decoded, 0, len(decoded), tree, streamID, textShowContext{
-			sourceOffset:      stream.SourceStart,
-			streamSpan:        streamSpan,
-			streamFilter:      pdfGraphStreamFilterString(stream.Dict),
-			streamDecodeParms: g.pdfGraphDecodeParmsString(stream.Dict),
-			streamEncoded:     bytes.Clone(stream.Data),
-			decodedContent:    bytes.Clone(decoded),
-			toUnicode:         cmapContext.fallback,
-			fontToUnicode:     cmapContext.fontCMapsForStream(stream.SourceStart),
-			fontEncodings:     cmapContext.fontEncodingsForStream(stream.SourceStart),
-			fontMetrics:       cmapContext.fontMetricsForStream(stream.SourceStart),
-			cidMetrics:        cmapContext.cidMetricsForStream(stream.SourceStart),
+		contexts = append(contexts, pdfGraphTextShowStreamContext{
+			object:  object,
+			stream:  stream,
+			decoded: decoded,
+			textContext: g.textShowContextForResources(
+				stream,
+				decoded,
+				cmapContext.fallback,
+				nil,
+				"",
+				nil,
+				nil,
+				false,
+				0,
+			),
 		})
 	}
-	return tree
+	return contexts
+}
+
+func (g *pdfGraph) appendInvokedFormTextShowContexts(input []byte, resources pdfDict, pageID *pdfObjectID, depth int, visited map[pdfObjectID]bool, fallback *toUnicodeCMap, contexts *[]pdfGraphTextShowStreamContext, seenFallback map[pdfObjectID]bool) {
+	if depth >= maxPDFFormXObjectResourceDepth || len(input) == 0 || resources == nil {
+		return
+	}
+	xobjects, ok := g.resolvePDFDict(resources["XObject"])
+	if !ok {
+		return
+	}
+	for _, name := range pdfDirectDoXObjectNames(input) {
+		ref, ok := xobjects[name].(pdfRef)
+		if !ok {
+			continue
+		}
+		if visited != nil && visited[ref.ID] {
+			continue
+		}
+		object, ok := g.Objects[ref.ID]
+		if !ok {
+			continue
+		}
+		stream, ok := object.Value.(pdfStreamObject)
+		if !ok || !dictHasType(stream.Dict, "XObject") || !pdfDictHasSubtype(stream.Dict, "Form") || isPDFImageXObjectStreamDict(stream.Dict) {
+			continue
+		}
+		formResources := resources
+		inherited := true
+		if resolved, ok := g.resolvePDFDict(stream.Dict["Resources"]); ok {
+			formResources = resolved
+			inherited = false
+		}
+		decoded, err := g.decodePDFGraphObjectStream(ref.ID, stream)
+		if err != nil {
+			continue
+		}
+		formID := ref.ID
+		*contexts = append(*contexts, pdfGraphTextShowStreamContext{
+			object:      object,
+			stream:      stream,
+			decoded:     decoded,
+			textContext: g.textShowContextForResources(stream, decoded, fallback, formResources, "form_xobject", pageID, &formID, inherited, depth+1),
+		})
+		seenFallback[ref.ID] = true
+		nextVisited := clonePDFObjectIDSet(visited)
+		if nextVisited == nil {
+			nextVisited = make(map[pdfObjectID]bool)
+		}
+		nextVisited[ref.ID] = true
+		g.appendInvokedFormTextShowContexts(decoded, formResources, pageID, depth+1, nextVisited, fallback, contexts, seenFallback)
+	}
+}
+
+func (g *pdfGraph) textShowContextForResources(stream pdfStreamObject, decoded []byte, fallback *toUnicodeCMap, resources pdfDict, fontContext string, pageID, formID *pdfObjectID, inherited bool, formDepth int) textShowContext {
+	ctx := textShowContext{
+		sourceOffset:       stream.SourceStart,
+		streamSpan:         core.Span{Start: int64(stream.SourceStart), End: int64(stream.SourceEnd)},
+		streamFilter:       pdfGraphStreamFilterString(stream.Dict),
+		streamDecodeParms:  g.pdfGraphDecodeParmsString(stream.Dict),
+		streamEncoded:      bytes.Clone(stream.Data),
+		decodedContent:     bytes.Clone(decoded),
+		fontContext:        fontContext,
+		pageObject:         pageID,
+		formObject:         formID,
+		inheritedResources: inherited,
+		formDepth:          formDepth,
+		toUnicode:          fallback,
+	}
+	if resources != nil {
+		ctx.fontToUnicode = g.fontToUnicodeCMapsForResources(resources)
+		ctx.fontEncodings = g.fontEncodingsForResources(resources)
+		ctx.fontMetrics = g.fontMetricsForResources(resources)
+		ctx.cidMetrics = g.cidFontMetricsForResources(resources)
+	}
+	return ctx
+}
+
+func (g *pdfGraph) pageResourcesWithInheritance(page pdfDict) (pdfDict, bool, bool) {
+	if resourcesValue, ok := page["Resources"]; ok {
+		resources, ok := g.resolvePDFDict(resourcesValue)
+		return resources, false, ok
+	}
+	resources, ok := g.inheritedPageResources(page["Parent"])
+	return resources, true, ok
 }
 
 func (g *pdfGraph) pageCount() int {
@@ -950,27 +1095,16 @@ func (g *pdfGraph) textShowCandidatesWithCMap(text string, cmap *toUnicodeCMap) 
 
 func (g *pdfGraph) textShowCandidatesWithCMapContext(text string, cmapContext pdfCMapContext) ([]canonicalTextCandidate, error) {
 	candidates := make([]canonicalTextCandidate, 0)
-	for _, object := range sortedPDFObjects(g.Objects) {
-		stream, ok := object.Value.(pdfStreamObject)
-		if !ok || dictHasType(stream.Dict, "ObjStm") || dictHasType(stream.Dict, "XRef") {
-			continue
-		}
-		if isPDFImageXObjectStreamDict(stream.Dict) {
-			continue
-		}
-		decoded, err := g.decodePDFGraphObjectStream(object.ID, stream)
-		if err != nil {
-			continue
-		}
-		shows := parseCanonicalTextShows(decoded, cmapContext.fallback, cmapContext.fontCMapsForStream(stream.SourceStart), cmapContext.fontEncodingsForStream(stream.SourceStart))
+	for _, context := range g.textShowStreamContexts(cmapContext) {
+		shows := parseCanonicalTextShows(context.decoded, context.textContext.toUnicode, context.textContext.fontToUnicode, context.textContext.fontEncodings)
 		for _, show := range shows {
 			if text != "" && show.Text != text {
 				continue
 			}
 			candidates = append(candidates, canonicalTextCandidate{
-				Object:  object,
-				Stream:  stream,
-				Decoded: decoded,
+				Object:  context.object,
+				Stream:  context.stream,
+				Decoded: context.decoded,
 				Show:    show,
 			})
 		}

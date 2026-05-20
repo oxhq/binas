@@ -34,6 +34,43 @@ endcmap
 	}
 }
 
+func TestCMapParsesWhitespaceLiteralAndLigatureMappings(t *testing.T) {
+	cmap, ok := parseToUnicodeCMap([]byte(`
+begincmap
+% dictionaries in CMaps must not be parsed as mappings
+<< /Registry (Adobe) /Ordering (Identity) >>
+2 beginbfchar
+<00 01> <00 66 00 69>
+<0002> (\000f\000l)
+endbfchar
+2 beginbfrange
+<0003> <0004> <0041>
+<0005> <0006> [(X) <00 59>]
+endbfrange
+endcmap
+`))
+	if !ok {
+		t.Fatal("expected CMap to parse")
+	}
+	got, ok := cmap.DecodeHex([]byte("000100020003000400050006"))
+	if !ok {
+		t.Fatal("expected mapped text to decode")
+	}
+	if got != "fiflABXY" {
+		t.Fatalf("decoded text = %q, want fiflABXY", got)
+	}
+	encoded, maxCodeBytes, ok := cmap.EncodeHexWithMaxCodeBytes("fiflABXY")
+	if !ok {
+		t.Fatal("expected ligature and multi-byte mappings to reverse encode")
+	}
+	if encoded != "000100020003000400050006" {
+		t.Fatalf("encoded = %q, want 000100020003000400050006", encoded)
+	}
+	if maxCodeBytes != 2 {
+		t.Fatalf("maxCodeBytes = %d, want 2", maxCodeBytes)
+	}
+}
+
 func TestCMapSingleToUnicodeMapDecodesAndEditsHexTextShow(t *testing.T) {
 	content := []byte("BT\n<0102030405> Tj\nET\n")
 	input := testPDF(
@@ -279,6 +316,45 @@ func TestCMapCanonicalMultiByteReverseEncodingWithoutLayoutProofFailsClosed(t *t
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error = %q, want %q", err, want)
 		}
+	}
+}
+
+func TestCMapMultiByteReverseEncodingWithIdentityHWidthProofEdits(t *testing.T) {
+	content := []byte("BT\n/F1 12 Tf\n<0001> Tj\nET\n")
+	input := testPDF(
+		"<< /Type /Catalog >>",
+		"<< /Type /Page /Contents 4 0 R /Resources << /Font << /F1 3 0 R >> >> >>",
+		"<< /Type /Font /Subtype /Type0 /Encoding /Identity-H /DescendantFonts [6 0 R] /ToUnicode 5 0 R >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
+		testTwoCIDToUnicodeCMapStream(),
+		"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /CIDFixture /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /W [1 2 500] >>",
+	)
+
+	adapter := NewAdapter()
+	tree, err := adapter.Parse(input, core.ParseOptions{Strict: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := adapter.PlanEdit(tree, core.Match{Kind: KindTextShow, Text: "A"}, core.Mutation{Replace: "B"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Meta["layout_proof"] != layoutProofStatusWidthProven {
+		t.Fatalf("layout_proof = %v, want %s; meta=%+v", plan.Meta["layout_proof"], layoutProofStatusWidthProven, plan.Meta)
+	}
+	output, _, err := adapter.Apply(input, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(output, []byte("<0002> Tj")) {
+		t.Fatalf("new Identity-H operand missing:\n%s", output)
+	}
+	verification, err := adapter.Verify(output, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.ReparseOK || !verification.OldTextRemoved || !verification.NewSelectable || !verification.PageUnchanged {
+		t.Fatalf("verification failed: %+v", verification)
 	}
 }
 

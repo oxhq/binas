@@ -1652,6 +1652,83 @@ func TestCLIEditWritesVerifiedPDF(t *testing.T) {
 	}
 }
 
+func TestCLIEditSimpleFontPDFPreservesSelectableText(t *testing.T) {
+	path := writeSimpleFontDifferencesFixture(t)
+	out := filepath.Join(t.TempDir(), "simple-font-out.pdf")
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{
+			"edit", path,
+			"--format", "pdf",
+			"--kind", "pdf.content.text_show",
+			"--text", "\u20ac\u00c1",
+			"--replace", "\u00c1\u20ac",
+			"--verify", "reparse,old-gone,new-selectable,page-count",
+			"-o", out,
+			"--json",
+		})
+	})
+	assertCLISelectableEditResult(t, stdout)
+
+	written, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(written, []byte("<4142> Tj")) {
+		t.Fatal("old simple-font encoded operand remains")
+	}
+	if !bytes.Contains(written, []byte("<4241> Tj")) {
+		t.Fatalf("new simple-font encoded operand missing:\n%s", written)
+	}
+	oldQueryOut := captureStdout(t, func() error {
+		return run([]string{"query", out, "--format", "pdf", "--kind", "pdf.content.text_show", "--text", "\u20ac\u00c1", "--json"})
+	})
+	assertCLIQueryCount(t, oldQueryOut, 0)
+	newQueryOut := captureStdout(t, func() error {
+		return run([]string{"query", out, "--format", "pdf", "--kind", "pdf.content.text_show", "--text", "\u00c1\u20ac", "--json"})
+	})
+	assertCLIQueryCount(t, newQueryOut, 1)
+}
+
+func TestCLIEditType0CMapPDFPreservesSelectableText(t *testing.T) {
+	path := writeType0CMapFixture(t)
+	out := filepath.Join(t.TempDir(), "type0-cmap-out.pdf")
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{
+			"edit", path,
+			"--format", "pdf",
+			"--kind", "pdf.content.text_show",
+			"--text", "AB",
+			"--replace", "BA",
+			"--layout-mode", "preserve-width",
+			"--verify", "reparse,old-gone,new-selectable,page-count",
+			"-o", out,
+			"--json",
+		})
+	})
+	assertCLISelectableEditResult(t, stdout)
+
+	written, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(written, []byte("<00010002> Tj")) {
+		t.Fatal("old Type0/CMap encoded operand remains")
+	}
+	if !bytes.Contains(written, []byte("<00020001> Tj")) {
+		t.Fatalf("new Type0/CMap encoded operand missing:\n%s", written)
+	}
+	oldQueryOut := captureStdout(t, func() error {
+		return run([]string{"query", out, "--format", "pdf", "--kind", "pdf.content.text_show", "--text", "AB", "--json"})
+	})
+	assertCLIQueryCount(t, oldQueryOut, 0)
+	newQueryOut := captureStdout(t, func() error {
+		return run([]string{"query", out, "--format", "pdf", "--kind", "pdf.content.text_show", "--text", "BA", "--json"})
+	})
+	assertCLIQueryCount(t, newQueryOut, 1)
+}
+
 func TestCLIEditLayoutModePreserveWidthAllowsWidthProvenPlan(t *testing.T) {
 	path := writeLayoutProofFixture(t, "AB")
 	out := filepath.Join(t.TempDir(), "out.pdf")
@@ -1687,6 +1764,18 @@ func TestCLIEditLayoutModePreserveWidthAllowsWidthProvenPlan(t *testing.T) {
 	}
 	if result.Report.Meta["layout_mode"] != "preserve-width" || result.Report.Meta["layout_proof"] != "width_proven" {
 		t.Fatalf("report meta = %+v, want preserve-width width_proven", result.Report.Meta)
+	}
+	for key, want := range map[string]any{
+		"encoding":           "literal",
+		"encoding_path":      "text_show/literal",
+		"text_decode_source": "pdf_literal_string",
+		"font_id":            "F1",
+		"old_width_units":    float64(1210),
+		"new_width_units":    float64(1210),
+	} {
+		if result.Report.Meta[key] != want {
+			t.Fatalf("report meta[%q] = %v, want %v; meta=%+v", key, result.Report.Meta[key], want, result.Report.Meta)
+		}
 	}
 	if result.Report.Meta["width_delta_units"] != float64(0) {
 		t.Fatalf("width_delta_units = %v, want 0", result.Report.Meta["width_delta_units"])
@@ -2780,6 +2869,55 @@ func writeLayoutProofFixture(t *testing.T, text string) string {
 	return path
 }
 
+func writeSimpleFontDifferencesFixture(t *testing.T) string {
+	t.Helper()
+	content := []byte("BT\n/F1 12 Tf\n<4142> Tj\nET\n")
+	input := pdfFixture(
+		"<< /Type /Catalog >>",
+		"<< /Type /Page /Contents 4 0 R /Resources << /Font << /F1 3 0 R >> >> >>",
+		"<< /Type /Font /Subtype /Type1 /Encoding << /BaseEncoding /WinAnsiEncoding /Differences [65 /Euro /Aacute] >> >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
+	)
+	path := filepath.Join(t.TempDir(), "simple-font-differences.pdf")
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func writeType0CMapFixture(t *testing.T) string {
+	t.Helper()
+	content := []byte("BT\n/F1 12 Tf\n<00010002> Tj\nET\n")
+	input := pdfFixture(
+		"<< /Type /Catalog >>",
+		"<< /Type /Page /Contents 4 0 R /Resources << /Font << /F1 3 0 R >> >> >>",
+		"<< /Type /Font /Subtype /Type0 /Encoding /Identity-H /DescendantFonts [6 0 R] /ToUnicode 5 0 R >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
+		cliTwoCIDToUnicodeCMapStream(),
+		"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /CIDFixture /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /W [1 [500 610]] >>",
+	)
+	path := filepath.Join(t.TempDir(), "type0-cmap.pdf")
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func cliTwoCIDToUnicodeCMapStream() string {
+	cmap := []byte(`/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+2 beginbfchar
+<0001> <0041>
+<0002> <0042>
+endbfchar
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end`)
+	return fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(cmap)+1, cmap)
+}
+
 func writeSignedTextFixture(t *testing.T) string {
 	t.Helper()
 	content := []byte("BT\n(08\\05515\\0552024) Tj\nET\n")
@@ -3629,6 +3767,38 @@ func assertCanonicalCLIEditResult(t *testing.T, stdout string) {
 		t.Fatalf("nodes modified = %d, want 1", result.Report.NodesModified)
 	}
 	if !result.Verification.ReparseOK || !result.Verification.OldTextRemoved || !result.Verification.NewSelectable {
+		t.Fatalf("verification = %+v", result.Verification)
+	}
+}
+
+func assertCLISelectableEditResult(t *testing.T, stdout string) {
+	t.Helper()
+	var result struct {
+		Report struct {
+			Edit          string `json:"edit"`
+			FallbackUsed  bool   `json:"fallback_used"`
+			NodesModified int    `json:"nodes_modified"`
+		} `json:"report"`
+		Verification struct {
+			ReparseOK      bool `json:"reparse_ok"`
+			OldTextRemoved bool `json:"old_text_removed"`
+			NewSelectable  bool `json:"new_text_selectable"`
+			PageUnchanged  bool `json:"page_count_unchanged"`
+		} `json:"verification"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Report.Edit != "pdf.content_stream_text_rewrite" {
+		t.Fatalf("edit = %q, want surgical content stream rewrite", result.Report.Edit)
+	}
+	if result.Report.FallbackUsed {
+		t.Fatal("edit used fallback path")
+	}
+	if result.Report.NodesModified != 1 {
+		t.Fatalf("nodes modified = %d, want 1", result.Report.NodesModified)
+	}
+	if !result.Verification.ReparseOK || !result.Verification.OldTextRemoved || !result.Verification.NewSelectable || !result.Verification.PageUnchanged {
 		t.Fatalf("verification = %+v", result.Verification)
 	}
 }

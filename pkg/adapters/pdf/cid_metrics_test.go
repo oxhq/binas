@@ -147,6 +147,34 @@ func TestCIDFontWidthsUseDirectDWWhenWIsAbsent(t *testing.T) {
 	}
 }
 
+func TestCIDFontWidthsAttachMetadataForIdentityVType0CMap(t *testing.T) {
+	content := []byte("BT\n/F1 12 Tf\n<00010002> Tj\nET\n")
+	input := testPDF(
+		"<< /Type /Catalog >>",
+		"<< /Type /Page /Contents 4 0 R /Resources << /Font << /F1 3 0 R >> >> >>",
+		"<< /Type /Font /Subtype /Type0 /Encoding /Identity-V /DescendantFonts [6 0 R] /ToUnicode 5 0 R >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
+		testTwoCIDToUnicodeCMapStream(),
+		"<< /Type /Font /Subtype /CIDFontType0 /BaseFont /CIDFixture /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /W [1 [500 610]] >>",
+	)
+
+	tree, err := NewAdapter().Parse(input, core.ParseOptions{Strict: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	matches := tree.Query(core.Match{Kind: KindTextShow, Text: "AB"})
+	if len(matches) != 1 {
+		t.Fatalf("AB matches = %d, want 1", len(matches))
+	}
+	meta := matches[0].Meta
+	if meta["cid_encoding"] != "Identity-V" {
+		t.Fatalf("cid_encoding = %v, want Identity-V", meta["cid_encoding"])
+	}
+	if meta["width_units"] != 1110 {
+		t.Fatalf("width_units = %v, want 1110", meta["width_units"])
+	}
+}
+
 func TestPlanEditReportsReplacementWidthProofForType0CMap(t *testing.T) {
 	content := []byte("BT\n/F1 12 Tf\n<00010002> Tj\nET\n")
 	input := testPDF(

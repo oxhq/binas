@@ -99,7 +99,6 @@ func (Adapter) Parse(input []byte, opts core.ParseOptions) (*core.Tree, error) {
 			return tree, err
 		}
 	}
-
 	cmapContext := pdfCMapContextForInput(input, pdfGraphParseOptions{})
 	if err := parseStreams(input, tree, tree.Root, cmapContext); err != nil {
 		return nil, err
@@ -183,7 +182,7 @@ func (Adapter) PlanEdit(tree *core.Tree, selector core.Match, mutation core.Muta
 	if err != nil {
 		return nil, err
 	}
-	layoutProofMeta := textShowReplacementLayoutProofMetadata(target.Meta, newEncoded)
+	layoutProofMeta := textShowReplacementReportMetadata(target.Meta, textShowReplacementLayoutProofMetadata(target.Meta, newEncoded))
 	if err := rejectUnsupportedTextReplacementLayout(layoutProofMeta, replacementProof); err != nil {
 		return nil, err
 	}
@@ -546,6 +545,9 @@ func countPages(input []byte) int {
 }
 
 func parseStreams(input []byte, tree *core.Tree, root core.NodeID, cmapContext pdfCMapContext) error {
+	graph, graphErr := parsePDFGraphWithOptions(input, pdfGraphParseOptions{})
+	streamIDsBySourceStart := make(map[int]core.NodeID)
+	graphTextEligible := make(map[int]bool)
 	pos := 0
 	for {
 		stream, ok, err := findNextStream(input, pos)
@@ -553,7 +555,7 @@ func parseStreams(input []byte, tree *core.Tree, root core.NodeID, cmapContext p
 			return err
 		}
 		if !ok {
-			return nil
+			break
 		}
 		streamBytes := input[stream.dataStart:stream.dataEnd]
 		streamMeta := map[string]any{
@@ -609,26 +611,44 @@ func parseStreams(input []byte, tree *core.Tree, root core.NodeID, cmapContext p
 			Span: core.Span{Start: int64(stream.dataStart), End: int64(stream.dataEnd)},
 			Meta: streamMeta,
 		})
+		streamIDsBySourceStart[stream.dataStart] = streamID
 		tree.Nodes[root].Children = append(tree.Nodes[root].Children, streamID)
 		if stream.imageXObject {
 			pos = stream.endstreamAt + len("endstream")
 			continue
 		}
-		parseTextShow(decodedBytes, 0, len(decodedBytes), tree, streamID, textShowContext{
-			sourceOffset:      stream.dataStart,
-			streamSpan:        core.Span{Start: int64(stream.dataStart), End: int64(stream.dataEnd)},
-			streamFilter:      stream.filter,
-			streamDecodeParms: stream.decodeParms,
-			streamEncoded:     bytes.Clone(streamBytes),
-			decodedContent:    bytes.Clone(decodedBytes),
-			toUnicode:         cmapContext.fallback,
-			fontToUnicode:     cmapContext.fontCMapsForStream(stream.dataStart),
-			fontEncodings:     cmapContext.fontEncodingsForStream(stream.dataStart),
-			fontMetrics:       cmapContext.fontMetricsForStream(stream.dataStart),
-			cidMetrics:        cmapContext.cidMetricsForStream(stream.dataStart),
-		})
+		if graphErr == nil && graph != nil {
+			graphTextEligible[stream.dataStart] = true
+		} else {
+			parseTextShow(decodedBytes, 0, len(decodedBytes), tree, streamID, textShowContext{
+				sourceOffset:      stream.dataStart,
+				streamSpan:        core.Span{Start: int64(stream.dataStart), End: int64(stream.dataEnd)},
+				streamFilter:      stream.filter,
+				streamDecodeParms: stream.decodeParms,
+				streamEncoded:     bytes.Clone(streamBytes),
+				decodedContent:    bytes.Clone(decodedBytes),
+				toUnicode:         cmapContext.fallback,
+				fontToUnicode:     cmapContext.fontCMapsForStream(stream.dataStart),
+				fontEncodings:     cmapContext.fontEncodingsForStream(stream.dataStart),
+				fontMetrics:       cmapContext.fontMetricsForStream(stream.dataStart),
+				cidMetrics:        cmapContext.cidMetricsForStream(stream.dataStart),
+			})
+		}
 		pos = stream.endstreamAt + len("endstream")
 	}
+	if graphErr == nil && graph != nil {
+		for _, context := range graph.textShowStreamContexts(graph.cmapContext()) {
+			if !graphTextEligible[context.stream.SourceStart] {
+				continue
+			}
+			streamID, ok := streamIDsBySourceStart[context.stream.SourceStart]
+			if !ok {
+				continue
+			}
+			parseTextShow(context.decoded, 0, len(context.decoded), tree, streamID, context.textContext)
+		}
+	}
+	return nil
 }
 
 func enrichPDFStreamNodeMetadata(tree *core.Tree) {
@@ -1375,17 +1395,22 @@ func findArrayEnd(input []byte, start int) (int, bool) {
 }
 
 type textShowContext struct {
-	sourceOffset      int
-	streamSpan        core.Span
-	streamFilter      string
-	streamDecodeParms string
-	streamEncoded     []byte
-	decodedContent    []byte
-	toUnicode         *toUnicodeCMap
-	fontToUnicode     map[string]*toUnicodeCMap
-	fontEncodings     map[string]*pdfSimpleFontEncoding
-	fontMetrics       map[string]pdfSimpleFontMetrics
-	cidMetrics        map[string]pdfCIDFontMetrics
+	sourceOffset       int
+	streamSpan         core.Span
+	streamFilter       string
+	streamDecodeParms  string
+	streamEncoded      []byte
+	decodedContent     []byte
+	fontContext        string
+	pageObject         *pdfObjectID
+	formObject         *pdfObjectID
+	inheritedResources bool
+	formDepth          int
+	toUnicode          *toUnicodeCMap
+	fontToUnicode      map[string]*toUnicodeCMap
+	fontEncodings      map[string]*pdfSimpleFontEncoding
+	fontMetrics        map[string]pdfSimpleFontMetrics
+	cidMetrics         map[string]pdfCIDFontMetrics
 }
 
 func parseTextShow(input []byte, start, end int, tree *core.Tree, streamID core.NodeID, ctx textShowContext) {
@@ -1491,6 +1516,21 @@ func parseTextShow(input []byte, start, end int, tree *core.Tree, streamID core.
 			"encoded":  encoded,
 			"encoding": encoding,
 		}
+		if ctx.fontContext != "" {
+			meta["font_context"] = ctx.fontContext
+		}
+		if ctx.pageObject != nil {
+			meta["page_object_number"] = ctx.pageObject.Number
+			meta["page_object_generation"] = ctx.pageObject.Generation
+		}
+		if ctx.formObject != nil {
+			meta["form_object_number"] = ctx.formObject.Number
+			meta["form_object_generation"] = ctx.formObject.Generation
+			meta["form_depth"] = ctx.formDepth
+		}
+		if ctx.inheritedResources {
+			meta["inherited_resources"] = true
+		}
 		enrichTextShowTextStateMetadata(meta, textState.Snapshot())
 		if encoding == "hex-cmap" || encoding == "tj-array-cmap" {
 			meta["cmap"] = ctx.cmapForFont(activeFont)
@@ -1499,7 +1539,11 @@ func parseTextShow(input []byte, start, end int, tree *core.Tree, streamID core.
 			}
 		}
 		if encoding == "hex-font-encoding" || encoding == "literal-font-encoding" || encoding == "tj-array-font-encoding" {
-			meta["font_encoding"] = ctx.fontEncodingForFont(activeFont)
+			fontEncoding := ctx.fontEncodingForFont(activeFont)
+			meta["font_encoding"] = fontEncoding
+			if fontEncoding != nil {
+				meta["font_encoding_name"] = fontEncoding.name
+			}
 			if activeFont != "" {
 				meta["font"] = activeFont
 			}

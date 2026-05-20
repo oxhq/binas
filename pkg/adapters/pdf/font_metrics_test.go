@@ -147,3 +147,43 @@ func TestPlanEditFailsClosedWhenSimpleFontReplacementRequiresReflow(t *testing.T
 		}
 	}
 }
+
+func TestPlanEditAllowsProvenNarrowerSimpleFontReplacement(t *testing.T) {
+	content := []byte("BT\n/F1 12 Tf\n(BB) Tj\nET\n")
+	input := testPDF(
+		"<< /Type /Catalog >>",
+		"<< /Type /Page /Contents 4 0 R /Resources << /Font << /F1 3 0 R >> >> >>",
+		"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 65 /Widths [600 610] >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
+	)
+
+	adapter := NewAdapter()
+	tree, err := adapter.Parse(input, core.ParseOptions{Strict: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := adapter.PlanEdit(tree, core.Match{Kind: KindTextShow, Text: "BB"}, core.Mutation{Replace: "AA"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Meta["layout_proof"] != layoutProofStatusWidthNarrower {
+		t.Fatalf("plan layout_proof = %v, want %q; meta=%+v", plan.Meta["layout_proof"], layoutProofStatusWidthNarrower, plan.Meta)
+	}
+	if plan.Meta["old_width_units"] != 1220 || plan.Meta["new_width_units"] != 1200 || plan.Meta["width_delta_units"] != -20 {
+		t.Fatalf("plan width proof meta = %+v, want narrower replacement", plan.Meta)
+	}
+	output, report, err := adapter.Apply(input, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Meta["layout_proof"] != layoutProofStatusWidthNarrower {
+		t.Fatalf("report layout_proof = %v, want %q; meta=%+v", report.Meta["layout_proof"], layoutProofStatusWidthNarrower, report.Meta)
+	}
+	verification, err := adapter.Verify(output, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.ReparseOK || !verification.OldTextRemoved || !verification.NewSelectable {
+		t.Fatalf("verification = %+v, want narrower selectable replacement", verification)
+	}
+}
