@@ -7,6 +7,7 @@ type defaultAppearance struct {
 	FontSize         float64
 	FillGray         *float64
 	FillRGB          *[3]float64
+	TextMatrix       *[6]float64
 }
 
 type defaultAppearanceOperand struct {
@@ -110,6 +111,19 @@ func parseDefaultAppearance(input string) (defaultAppearance, bool) {
 					appearance.FillGray = nil
 				}
 			}
+		case "Tm":
+			if len(operands) < 6 {
+				return defaultAppearance{}, false
+			}
+			var matrix [6]float64
+			for j := 0; j < 6; j++ {
+				operand := operands[len(operands)-6+j]
+				if operand.kind != defaultAppearanceOperandNumber {
+					return defaultAppearance{}, false
+				}
+				matrix[j] = operand.number
+			}
+			appearance.TextMatrix = &matrix
 		}
 		operands = operands[:0]
 		i = tokenEnd

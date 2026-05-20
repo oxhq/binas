@@ -238,6 +238,11 @@ func formSet(args []string) error {
 		RegenerateAppearance: *regenerateAppearance,
 	})
 	if err != nil {
+		if *asJSON && *regenerateAppearance && isUnsupportedAppearanceError(err) {
+			if jsonErr := writeUnsupportedAppearanceErrorJSON(err); jsonErr != nil {
+				return jsonErr
+			}
+		}
 		return err
 	}
 	return writeFormSetResult(output, report, verification, *outputPath, *asJSON)
@@ -387,6 +392,11 @@ func annotSetContents(args []string) error {
 		RegenerateAppearance: *regenerateAppearance,
 	})
 	if err != nil {
+		if *asJSON && *regenerateAppearance && isUnsupportedAppearanceError(err) {
+			if jsonErr := writeUnsupportedAppearanceErrorJSON(err); jsonErr != nil {
+				return jsonErr
+			}
+		}
 		return err
 	}
 	if err := os.WriteFile(*outputPath, output, 0644); err != nil {
@@ -1366,6 +1376,24 @@ func writeJSON(v any) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(v)
+}
+
+func isUnsupportedAppearanceError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.HasPrefix(message, "unsupported AcroForm appearance regeneration") ||
+		strings.HasPrefix(message, "cannot regenerate annotation appearance")
+}
+
+func writeUnsupportedAppearanceErrorJSON(err error) error {
+	reason := err.Error()
+	return writeJSON(map[string]any{
+		"error":              reason,
+		"appearance_status":  "unsupported",
+		"unsupported_reason": reason,
+	})
 }
 
 func reorderFlags(args []string, boolFlags, valueFlags map[string]bool) []string {

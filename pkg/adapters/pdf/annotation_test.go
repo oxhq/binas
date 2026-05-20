@@ -136,6 +136,38 @@ func TestApplyAnnotationContentsEditCanRegenerateBasicTextAppearance(t *testing.
 	}
 }
 
+func TestApplyAnnotationContentsEditCanRegenerateTextAnnotationAppearance(t *testing.T) {
+	input := testPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Page /Annots [3 0 R] >>",
+		"<< /Type /Annot /Subtype /Text /Rect [10 20 110 48] /Contents (old sticky note) >>",
+	)
+
+	output, report, verification, err := ApplyAnnotationContentsEdit(input, 0, "fresh sticky note", AnnotationContentsEditOptions{
+		RegenerateAppearance: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.AppearanceRegenerated || !verification.AppearanceRegenerated {
+		t.Fatalf("appearance was not regenerated: report %+v verification %+v", report, verification)
+	}
+
+	stream := annotationCandidateNormalAppearanceStream(t, output, 0)
+	got := string(stream.Data)
+	for _, want := range []string{
+		"0 0 100 28 re W n",
+		"BT\n/Helv 10 Tf",
+		"0 0 0 rg",
+		"(fresh sticky note) Tj",
+		"ET\nQ",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("text annotation appearance missing %q in %q", want, got)
+		}
+	}
+}
+
 func TestApplyAnnotationContentsEditCanRegenerateSquareAppearance(t *testing.T) {
 	input := testPDF(
 		"<< /Type /Catalog /Pages 2 0 R >>",
@@ -166,6 +198,54 @@ func TestApplyAnnotationContentsEditCanRegenerateSquareAppearance(t *testing.T) 
 	}
 	if bbox := stream.Dict["BBox"].(pdfArray); len(bbox) != 4 || fmt.Sprint(bbox[2]) != "40" || fmt.Sprint(bbox[3]) != "25" {
 		t.Fatalf("square BBox = %+v, want width 40 height 25", bbox)
+	}
+}
+
+func TestApplyAnnotationContentsEditRegenerateAppearanceFailsClosedForUnsupportedAnnotationInputs(t *testing.T) {
+	tests := []struct {
+		name    string
+		annot   string
+		wantErr string
+	}{
+		{
+			name:    "rich text content",
+			annot:   "<< /Type /Annot /Subtype /FreeText /Rect [0 0 80 30] /Contents (old note) /RC (<b>old note</b>) >>",
+			wantErr: "cannot regenerate annotation appearance: annotation 0 has unsupported rich text content",
+		},
+		{
+			name:    "javascript action",
+			annot:   "<< /Type /Annot /Subtype /Text /Rect [0 0 80 30] /Contents (old note) /A << /S /JavaScript /JS (app.alert('x')) >> >>",
+			wantErr: "cannot regenerate annotation appearance: annotation 0 has unsupported JavaScript action",
+		},
+		{
+			name:    "additional actions",
+			annot:   "<< /Type /Annot /Subtype /Square /Rect [0 0 80 30] /Contents (old square) /AA << /E << /S /URI /URI (https://example.test) >> >> >>",
+			wantErr: "cannot regenerate annotation appearance: annotation 0 has unsupported additional actions",
+		},
+		{
+			name:    "unsupported subtype",
+			annot:   "<< /Type /Annot /Subtype /Popup /Rect [0 0 80 30] /Contents (old popup) >>",
+			wantErr: `cannot regenerate annotation appearance: unsupported annotation subtype "Popup"`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := testPDF(
+				"<< /Type /Catalog /Pages 2 0 R >>",
+				"<< /Type /Page /Annots [3 0 R] >>",
+				tt.annot,
+			)
+
+			_, _, _, err := ApplyAnnotationContentsEdit(input, 0, "new note", AnnotationContentsEditOptions{
+				RegenerateAppearance: true,
+			})
+			if err == nil {
+				t.Fatal("expected regenerate appearance to fail")
+			}
+			if got := err.Error(); got != tt.wantErr {
+				t.Fatalf("error = %q, want %q", got, tt.wantErr)
+			}
+		})
 	}
 }
 
@@ -516,6 +596,50 @@ func TestApplyAnnotationContentsEditRegenerateAppearanceFailsForUnsupportedSubty
 	}
 	if !strings.Contains(err.Error(), `unsupported annotation subtype "Popup"`) {
 		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestVerifyAnnotationContentsEditRejectsMismatchedRegeneratedAppearance(t *testing.T) {
+	input := testPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Page /Annots [3 0 R] >>",
+		"<< /Type /Annot /Subtype /FreeText /Rect [10 20 90 50] /Contents (old note) >>",
+	)
+
+	output, _, verification, err := ApplyAnnotationContentsEdit(input, 0, "fresh note", AnnotationContentsEditOptions{
+		RegenerateAppearance: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.AppearanceRegenerated {
+		t.Fatalf("verification = %+v", verification)
+	}
+
+	graph, err := parsePDFGraph(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates := graph.annotationCandidates()
+	stream, ok := annotationNormalAppearanceStream(graph, candidates[0].Dict)
+	if !ok {
+		t.Fatal("missing regenerated normal appearance stream")
+	}
+	stream.Data = []byte("q\nQ")
+	ap := candidates[0].Dict["AP"].(pdfDict)
+	ref := ap["N"].(pdfRef)
+	graph.Objects[ref.ID].Value = stream
+	tampered, err := writeCanonicalPDF(graph)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	verification, err = verifyAnnotationContentsEdit(tampered, 0, "fresh note", graph.pageCount(), false, true)
+	if err == nil {
+		t.Fatalf("expected mismatched appearance verification to fail: %+v", verification)
+	}
+	if got := err.Error(); got != "verification failed: annotation /AP /N appearance stream was not regenerated" {
+		t.Fatalf("error = %q", got)
 	}
 }
 

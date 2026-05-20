@@ -180,7 +180,7 @@ func TestApplyFormFieldEditSyncsParentValueToUnnamedWidgetKid(t *testing.T) {
 	}
 }
 
-func TestApplyFormFieldEditDoesNotSyncParentValueIntoComplexKidTree(t *testing.T) {
+func TestApplyFormFieldEditFailsClosedForComplexKidTreeSynchronization(t *testing.T) {
 	input := formTestPDF(
 		"<< /Type /Catalog /AcroForm 2 0 R >>",
 		"<< /Fields [3 0 R] >>",
@@ -189,31 +189,29 @@ func TestApplyFormFieldEditDoesNotSyncParentValueIntoComplexKidTree(t *testing.T
 		"<< /Subtype /Widget /V (Old Widget) /Parent 4 0 R >>",
 	)
 
-	output, _, verification, err := ApplyFormFieldEdit(input, "payer.address", "New Address")
-	if err != nil {
-		t.Fatal(err)
+	_, _, _, err := ApplyFormFieldEdit(input, "payer.address", "New Address")
+	if err == nil {
+		t.Fatal("expected complex child tree synchronization error")
 	}
-	if !verification.ReparseOK || !verification.FieldValueSet {
-		t.Fatalf("verification = %+v", verification)
+	if !strings.Contains(err.Error(), "complex child field tree has nested /Kids") {
+		t.Fatalf("error = %q", err)
 	}
+}
 
-	graph, err := parsePDFGraph(output)
-	if err != nil {
-		t.Fatal(err)
+func TestApplyFormFieldEditFailsClosedForMismatchedNamedWidgetKid(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /FT /Tx /T (payer.name) /V (Old Parent) /Kids [4 0 R] >>",
+		"<< /Subtype /Widget /T (other.name) /V (Old Widget) /Parent 3 0 R >>",
+	)
+
+	_, _, _, err := ApplyFormFieldEdit(input, "payer.name", "New Name")
+	if err == nil {
+		t.Fatal("expected mismatched child name synchronization error")
 	}
-	child, ok := graph.Objects[pdfObjectID{Number: 4, Generation: 0}].Value.(pdfDict)
-	if !ok {
-		t.Fatal("complex child object was not a dictionary")
-	}
-	widget, ok := graph.Objects[pdfObjectID{Number: 5, Generation: 0}].Value.(pdfDict)
-	if !ok {
-		t.Fatal("nested widget object was not a dictionary")
-	}
-	if got := child["V"]; got != pdfLiteralString("Old Complex Child") {
-		t.Fatalf("complex child /V = %#v, want unchanged", got)
-	}
-	if got := widget["V"]; got != pdfLiteralString("Old Widget") {
-		t.Fatalf("nested widget /V = %#v, want unchanged", got)
+	if !strings.Contains(err.Error(), `child field name "other.name" does not match "payer.name"`) {
+		t.Fatalf("error = %q", err)
 	}
 }
 
@@ -320,7 +318,40 @@ func TestApplyFormFieldEditUpdatesChoiceSelectedIndexForUniqueOption(t *testing.
 	}
 }
 
-func TestApplyFormFieldEditFailsClosedForMultiSelectChoiceArrayValue(t *testing.T) {
+func TestApplyFormFieldEditUpdatesMultiSelectChoiceArrayValue(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		fmt.Sprintf("<< /FT /Ch /T (payer.plan) /Ff %d /V [(basic)] /I [0] /Opt [(basic) [(pro) (Pro Plan)] (team)] >>", formFieldFlagChMultiSelect),
+	)
+
+	output, _, verification, err := ApplyFormFieldEdit(input, "payer.plan", `["Pro Plan","basic"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.ReparseOK || !verification.FieldValueSet {
+		t.Fatalf("verification = %+v", verification)
+	}
+
+	graph, err := parsePDFGraph(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	field, ok := graph.Objects[pdfObjectID{Number: 3, Generation: 0}].Value.(pdfDict)
+	if !ok {
+		t.Fatal("field object was not a dictionary")
+	}
+	values, ok := pdfTextArray(field["V"])
+	if !ok || !reflect.DeepEqual(values, []string{"basic", "pro"}) {
+		t.Fatalf("/V = %+v (ok %v), want [basic pro]", values, ok)
+	}
+	indexes, ok := dictIntArray(field, "I")
+	if !ok || !reflect.DeepEqual(indexes, []int{0, 1}) {
+		t.Fatalf("/I = %+v (ok %v), want [0 1]", indexes, ok)
+	}
+}
+
+func TestApplyFormFieldEditFailsClosedForMultiSelectChoiceScalarValue(t *testing.T) {
 	input := formTestPDF(
 		"<< /Type /Catalog /AcroForm 2 0 R >>",
 		"<< /Fields [3 0 R] >>",
@@ -331,7 +362,23 @@ func TestApplyFormFieldEditFailsClosedForMultiSelectChoiceArrayValue(t *testing.
 	if err == nil {
 		t.Fatal("expected multi-select fail-closed error")
 	}
-	if !strings.Contains(err.Error(), "multi-select fields require an array /V value") {
+	if !strings.Contains(err.Error(), "multi-select fields require a JSON array of string values") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestApplyFormFieldEditFailsClosedForAmbiguousMultiSelectOptionMapping(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		fmt.Sprintf("<< /FT /Ch /T (payer.plan) /Ff %d /V [(basic)] /I [0] /Opt [(basic) [(basic) (Basic Duplicate)]] >>", formFieldFlagChMultiSelect),
+	)
+
+	_, _, _, err := ApplyFormFieldEdit(input, "payer.plan", `["basic"]`)
+	if err == nil {
+		t.Fatal("expected ambiguous multi-select option error")
+	}
+	if !strings.Contains(err.Error(), `ambiguous or not present in direct /Opt options`) {
 		t.Fatalf("error = %q", err)
 	}
 }
@@ -349,6 +396,19 @@ func TestApplyFormFieldEditRegeneratesTextWidgetAppearance(t *testing.T) {
 	}
 	if !report.AppearanceRegenerated {
 		t.Fatalf("report did not record appearance regeneration: %+v", report)
+	}
+	if report.AppearanceGenerationStatus != "regenerated" {
+		t.Fatalf("appearance generation status = %q, want regenerated", report.AppearanceGenerationStatus)
+	}
+	if got := report.Meta["appearance_generation_status"]; got != "regenerated" {
+		t.Fatalf("report meta appearance_generation_status = %#v, want regenerated", got)
+	}
+	encodedReport, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(encodedReport, []byte(`"appearance_generation_status":"regenerated"`)) {
+		t.Fatalf("report JSON missing appearance generation status: %s", encodedReport)
 	}
 	if !verification.ReparseOK || !verification.AppearanceRegenerated {
 		t.Fatalf("verification = %+v", verification)
@@ -538,77 +598,124 @@ func TestApplyFormFieldEditRegeneratesTextWidgetAppearanceUsesFieldDefaultResour
 	}
 }
 
-func TestApplyFormFieldEditRegeneratesTextWidgetAppearanceFallsBackWhenDefaultResourceMissing(t *testing.T) {
+func TestApplyFormFieldEditRegeneratesTextWidgetAppearanceUsesInheritedFieldDefaultResource(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /T (payer) /DA (/F3 11 Tf 0 0.5 0 rg) /DR << /Font << /F3 5 0 R >> >> /Kids [4 0 R] >>",
+		"<< /FT /Tx /T (name) /V (Old Name) /Parent 3 0 R /Rect [0 0 160 24] >>",
+		"<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>",
+	)
+
+	output, _, verification, err := ApplyFormFieldEditWithOptions(input, "payer.name", "New Name", FormFieldEditOptions{RegenerateAppearance: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.AppearanceRegenerated {
+		t.Fatalf("verification = %+v", verification)
+	}
+
+	graph, err := parsePDFGraph(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	widget, ok := graph.Objects[pdfObjectID{Number: 4, Generation: 0}].Value.(pdfDict)
+	if !ok {
+		t.Fatal("widget object was not a dictionary")
+	}
+	stream := formTestNormalAppearanceStream(t, graph, widget)
+	for _, want := range [][]byte{
+		[]byte("/F3 11 Tf"),
+		[]byte("0 0.5 0 rg"),
+		[]byte("(New Name) Tj"),
+	} {
+		if !bytes.Contains(stream.Data, want) {
+			t.Fatalf("appearance stream missing inherited resource token %q:\n%s", want, stream.Data)
+		}
+	}
+	fonts := formTestAppearanceFontResources(t, stream)
+	if got := fonts["F3"]; got != (pdfRef{ID: pdfObjectID{Number: 5, Generation: 0}}) {
+		t.Fatalf("appearance /Resources /Font /F3 = %#v, want 5 0 R", got)
+	}
+}
+
+func TestApplyFormFieldEditRegeneratesTextWidgetAppearanceUsesDefaultTextMatrix(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /FT /Tx /T (payer.name) /V (Old Name) /DA (/Helv 9 Tf 0.2 g 1 0 0 1 4 7 Tm) /Rect [0 0 120 20] >>",
+	)
+
+	output, _, verification, err := ApplyFormFieldEditWithOptions(input, "payer.name", "New Name", FormFieldEditOptions{RegenerateAppearance: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.AppearanceRegenerated {
+		t.Fatalf("verification = %+v", verification)
+	}
+
+	graph, err := parsePDFGraph(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	field, ok := graph.Objects[pdfObjectID{Number: 3, Generation: 0}].Value.(pdfDict)
+	if !ok {
+		t.Fatal("field object was not a dictionary")
+	}
+	stream := formTestNormalAppearanceStream(t, graph, field)
+	if !bytes.Contains(stream.Data, []byte("1 0 0 1 4 7 Tm")) {
+		t.Fatalf("appearance stream did not honor default text matrix:\n%s", stream.Data)
+	}
+	if bytes.Contains(stream.Data, []byte("2 9 Td")) {
+		t.Fatalf("appearance stream kept fallback text offset despite Tm:\n%s", stream.Data)
+	}
+}
+
+func TestApplyFormFieldEditRegenerateAppearanceFailsClosedWhenDefaultResourceMissing(t *testing.T) {
 	input := formTestPDF(
 		"<< /Type /Catalog /AcroForm 2 0 R >>",
 		"<< /Fields [3 0 R] /DA (/F1 16 Tf 0.25 g) /DR << /Font << /Other << /Type /Font /Subtype /Type1 /BaseFont /Courier >> >> >> >>",
 		"<< /FT /Tx /T (payer.name) /V (Old Name) /Rect [0 0 160 28] >>",
 	)
 
-	output, _, verification, err := ApplyFormFieldEditWithOptions(input, "payer.name", "New Name", FormFieldEditOptions{RegenerateAppearance: true})
-	if err != nil {
-		t.Fatal(err)
+	_, _, _, err := ApplyFormFieldEditWithOptions(input, "payer.name", "New Name", FormFieldEditOptions{RegenerateAppearance: true})
+	if err == nil {
+		t.Fatal("expected unresolved default resource fail-closed error")
 	}
-	if !verification.AppearanceRegenerated {
-		t.Fatalf("verification = %+v", verification)
-	}
-
-	graph, err := parsePDFGraph(output)
-	if err != nil {
-		t.Fatal(err)
-	}
-	field, ok := graph.Objects[pdfObjectID{Number: 3, Generation: 0}].Value.(pdfDict)
-	if !ok {
-		t.Fatal("field object was not a dictionary")
-	}
-	stream := formTestNormalAppearanceStream(t, graph, field)
-	for _, want := range [][]byte{
-		[]byte("/Helv 16 Tf"),
-		[]byte("0.25 g"),
-		[]byte("(New Name) Tj"),
-	} {
-		if !bytes.Contains(stream.Data, want) {
-			t.Fatalf("appearance stream missing fallback/default appearance token %q:\n%s", want, stream.Data)
-		}
-	}
-	fonts := formTestAppearanceFontResources(t, stream)
-	if _, ok := fonts["Helv"]; !ok {
-		t.Fatalf("appearance resources did not keep Helvetica fallback: %#v", fonts)
-	}
-	if _, ok := fonts["F1"]; ok {
-		t.Fatalf("appearance resources included unresolved /F1: %#v", fonts)
+	if !strings.Contains(err.Error(), `default appearance font resource "F1" was not found in /DR`) {
+		t.Fatalf("error = %q", err)
 	}
 }
 
-func TestApplyFormFieldEditRegeneratesTextWidgetAppearanceFallsBackForMalformedDefaultAppearance(t *testing.T) {
+func TestApplyFormFieldEditRegenerateAppearanceFailsClosedForRichTextField(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		fmt.Sprintf("<< /FT /Tx /T (payer.name) /Ff %d /V (Old Name) /RV (<b>Old Name</b>) /Rect [0 0 120 20] >>", formFieldFlagTxRichText),
+	)
+
+	_, _, _, err := ApplyFormFieldEditWithOptions(input, "payer.name", "New Name", FormFieldEditOptions{RegenerateAppearance: true})
+	if err == nil {
+		t.Fatal("expected rich text fail-closed error")
+	}
+	if !strings.Contains(err.Error(), "rich text/default appearance cannot be regenerated safely") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestApplyFormFieldEditRegenerateAppearanceFailsClosedForMalformedDefaultAppearance(t *testing.T) {
 	input := formTestPDF(
 		"<< /Type /Catalog /AcroForm 2 0 R >>",
 		"<< /Fields [3 0 R] >>",
 		"<< /FT /Tx /T (payer.name) /V (Old Name) /DA (/Helv nope Tf 0.25 g) /Rect [0 0 120 20] >>",
 	)
 
-	output, _, verification, err := ApplyFormFieldEditWithOptions(input, "payer.name", "New Name", FormFieldEditOptions{RegenerateAppearance: true})
-	if err != nil {
-		t.Fatal(err)
+	_, _, _, err := ApplyFormFieldEditWithOptions(input, "payer.name", "New Name", FormFieldEditOptions{RegenerateAppearance: true})
+	if err == nil {
+		t.Fatal("expected malformed default appearance fail-closed error")
 	}
-	if !verification.AppearanceRegenerated {
-		t.Fatalf("verification = %+v", verification)
-	}
-
-	graph, err := parsePDFGraph(output)
-	if err != nil {
-		t.Fatal(err)
-	}
-	field, ok := graph.Objects[pdfObjectID{Number: 3, Generation: 0}].Value.(pdfDict)
-	if !ok {
-		t.Fatal("field object was not a dictionary")
-	}
-	stream := formTestNormalAppearanceStream(t, graph, field)
-	if !bytes.Contains(stream.Data, []byte("/Helv 10 Tf")) {
-		t.Fatalf("appearance stream did not keep Helvetica fallback:\n%s", stream.Data)
-	}
-	if bytes.Contains(stream.Data, []byte("0.25 g")) {
-		t.Fatalf("appearance stream used malformed default appearance color:\n%s", stream.Data)
+	if !strings.Contains(err.Error(), "default appearance could not be parsed safely") {
+		t.Fatalf("error = %q", err)
 	}
 }
 
@@ -745,6 +852,38 @@ func TestApplyFormFieldEditRegeneratesChoiceWidgetAppearanceUsesFieldDefaultAppe
 	}
 }
 
+func TestApplyFormFieldEditRegeneratesChoiceWidgetAppearanceUsesDisplayText(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /FT /Ch /T (payer.plan) /V (basic) /Opt [(Basic) [(pro) (Pro Plan)]] /Rect [0 0 120 24] >>",
+	)
+
+	output, _, verification, err := ApplyFormFieldEditWithOptions(input, "payer.plan", "pro", FormFieldEditOptions{RegenerateAppearance: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.ReparseOK || !verification.FieldValueSet || !verification.AppearanceRegenerated {
+		t.Fatalf("verification = %+v", verification)
+	}
+
+	graph, err := parsePDFGraph(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	field, ok := graph.Objects[pdfObjectID{Number: 3, Generation: 0}].Value.(pdfDict)
+	if !ok {
+		t.Fatal("field object was not a dictionary")
+	}
+	stream := formTestNormalAppearanceStream(t, graph, field)
+	if !bytes.Contains(stream.Data, []byte("(Pro Plan) Tj")) {
+		t.Fatalf("choice appearance stream did not draw display text:\n%s", stream.Data)
+	}
+	if bytes.Contains(stream.Data, []byte("(pro) Tj")) {
+		t.Fatalf("choice appearance stream drew export value instead of display text:\n%s", stream.Data)
+	}
+}
+
 func TestApplyFormFieldEditRegenerateAppearanceFailsClosedWithoutRect(t *testing.T) {
 	input := formTestPDF(
 		"<< /Type /Catalog /AcroForm 2 0 R >>",
@@ -761,19 +900,37 @@ func TestApplyFormFieldEditRegenerateAppearanceFailsClosedWithoutRect(t *testing
 	}
 }
 
-func TestApplyFormFieldEditRegenerateAppearanceFailsClosedForButton(t *testing.T) {
+func TestApplyFormFieldEditRegeneratesDirectCheckboxAppearanceFromProvenButtonStates(t *testing.T) {
 	input := formTestPDF(
 		"<< /Type /Catalog /AcroForm 2 0 R >>",
 		"<< /Fields [3 0 R] >>",
 		"<< /AP << /N << /Off <<>> /Yes <<>> >> >> /AS /Off /FT /Btn /T (payer.opt_in) /V /Off >>",
 	)
 
-	_, _, _, err := ApplyFormFieldEditWithOptions(input, "payer.opt_in", "true", FormFieldEditOptions{RegenerateAppearance: true})
-	if err == nil {
-		t.Fatal("expected unsupported button regeneration error")
+	output, report, verification, err := ApplyFormFieldEditWithOptions(input, "payer.opt_in", "true", FormFieldEditOptions{RegenerateAppearance: true})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(err.Error(), "unsupported AcroForm appearance regeneration for button fields") {
-		t.Fatalf("error = %q", err)
+	if !report.AppearanceRegenerated || report.AppearanceGenerationStatus != "regenerated" {
+		t.Fatalf("report = %+v, want regenerated button appearance status", report)
+	}
+	if !verification.ReparseOK || !verification.FieldValueSet || !verification.AppearanceRegenerated {
+		t.Fatalf("verification = %+v", verification)
+	}
+
+	graph, err := parsePDFGraph(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	field, ok := graph.Objects[pdfObjectID{Number: 3, Generation: 0}].Value.(pdfDict)
+	if !ok {
+		t.Fatal("field object was not a dictionary")
+	}
+	if got := field["V"]; got != pdfName("Yes") {
+		t.Fatalf("/V = %#v, want /Yes", got)
+	}
+	if got := field["AS"]; got != pdfName("Yes") {
+		t.Fatalf("/AS = %#v, want /Yes", got)
 	}
 }
 
@@ -1045,6 +1202,53 @@ func TestApplyFormFieldEditSelectsRadioWidgetKid(t *testing.T) {
 	}
 }
 
+func TestApplyFormFieldEditRegeneratesRadioWidgetAppearanceFromProvenButtonStates(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /FT /Btn /Kids [4 0 R 5 0 R] /T (payer.plan) /V /Off >>",
+		"<< /AP << /N << /Off <<>> /Basic <<>> >> >> /AS /Off /Parent 3 0 R /Subtype /Widget >>",
+		"<< /AP << /N << /Off <<>> /Pro <<>> >> >> /AS /Off /Parent 3 0 R /Subtype /Widget >>",
+	)
+
+	output, report, verification, err := ApplyFormFieldEditWithOptions(input, "payer.plan", "Pro", FormFieldEditOptions{RegenerateAppearance: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.AppearanceRegenerated || report.AppearanceGenerationStatus != "regenerated" {
+		t.Fatalf("report = %+v, want regenerated button appearance status", report)
+	}
+	if !verification.ReparseOK || !verification.FieldValueSet || !verification.AppearanceRegenerated {
+		t.Fatalf("verification = %+v", verification)
+	}
+
+	graph, err := parsePDFGraph(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	field, ok := graph.Objects[pdfObjectID{Number: 3, Generation: 0}].Value.(pdfDict)
+	if !ok {
+		t.Fatal("field object was not a dictionary")
+	}
+	firstWidget, ok := graph.Objects[pdfObjectID{Number: 4, Generation: 0}].Value.(pdfDict)
+	if !ok {
+		t.Fatal("first widget object was not a dictionary")
+	}
+	secondWidget, ok := graph.Objects[pdfObjectID{Number: 5, Generation: 0}].Value.(pdfDict)
+	if !ok {
+		t.Fatal("second widget object was not a dictionary")
+	}
+	if got := field["V"]; got != pdfName("Pro") {
+		t.Fatalf("field /V = %#v, want /Pro", got)
+	}
+	if got := firstWidget["AS"]; got != pdfName("Off") {
+		t.Fatalf("first widget /AS = %#v, want /Off", got)
+	}
+	if got := secondWidget["AS"]; got != pdfName("Pro") {
+		t.Fatalf("second widget /AS = %#v, want /Pro", got)
+	}
+}
+
 func TestApplyFormFieldEditClearsRadioWidgetKidsWithOff(t *testing.T) {
 	input := formTestPDF(
 		"<< /Type /Catalog /AcroForm 2 0 R >>",
@@ -1135,6 +1339,38 @@ func TestApplyFormFieldEditFailsClosedForAmbiguousCheckboxOnValue(t *testing.T) 
 		t.Fatal("expected ambiguous on-state error")
 	}
 	if !strings.Contains(err.Error(), "ambiguous button appearance states") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestApplyFormFieldEditFailsClosedForRichButtonAppearanceStates(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /AP << /N << /Off <<>> /Yes <<>> >> /D << /Off <<>> /Yes <<>> >> >> /AS /Off /FT /Btn /T (payer.opt_in) /V /Off >>",
+	)
+
+	_, _, _, err := ApplyFormFieldEditWithOptions(input, "payer.opt_in", "true", FormFieldEditOptions{RegenerateAppearance: true})
+	if err == nil {
+		t.Fatal("expected rich button appearance fail-closed error")
+	}
+	if !strings.Contains(err.Error(), "rich /AP states are not supported") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestApplyFormFieldEditFailsClosedForButtonAppearanceWithoutOffState(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /AP << /N << /Yes <<>> >> >> /AS /Yes /FT /Btn /T (payer.opt_in) /V /Yes >>",
+	)
+
+	_, _, _, err := ApplyFormFieldEditWithOptions(input, "payer.opt_in", "false", FormFieldEditOptions{RegenerateAppearance: true})
+	if err == nil {
+		t.Fatal("expected missing off-state error")
+	}
+	if !strings.Contains(err.Error(), "missing /Off appearance state") {
 		t.Fatalf("error = %q", err)
 	}
 }

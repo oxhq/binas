@@ -892,9 +892,10 @@ func TestCLIFormSetWritesVerifiedFieldUpdate(t *testing.T) {
 	})
 	var result struct {
 		Report struct {
-			Edit          string `json:"edit"`
-			NodesModified int    `json:"nodes_modified"`
-			OutputPath    string `json:"output_path"`
+			Edit             string `json:"edit"`
+			NodesModified    int    `json:"nodes_modified"`
+			OutputPath       string `json:"output_path"`
+			AppearanceStatus string `json:"appearance_status"`
 		} `json:"report"`
 		Verification struct {
 			ReparseOK bool `json:"reparse_ok"`
@@ -905,6 +906,9 @@ func TestCLIFormSetWritesVerifiedFieldUpdate(t *testing.T) {
 	}
 	if result.Report.Edit != "pdf.acroform_field_value_update" || result.Report.NodesModified != 1 || result.Report.OutputPath != out {
 		t.Fatalf("result = %+v", result)
+	}
+	if result.Report.AppearanceStatus != "preserved" {
+		t.Fatalf("appearance_status = %q, want preserved", result.Report.AppearanceStatus)
 	}
 	if !result.Verification.ReparseOK {
 		t.Fatalf("verification = %+v", result.Verification)
@@ -949,7 +953,8 @@ func TestCLIFormSetRegeneratesTextWidgetAppearance(t *testing.T) {
 	})
 	var result struct {
 		Report struct {
-			AppearanceRegenerated bool `json:"appearance_regenerated"`
+			AppearanceRegenerated bool   `json:"appearance_regenerated"`
+			AppearanceStatus      string `json:"appearance_status"`
 		} `json:"report"`
 		Verification struct {
 			ReparseOK             bool `json:"reparse_ok"`
@@ -962,6 +967,9 @@ func TestCLIFormSetRegeneratesTextWidgetAppearance(t *testing.T) {
 	if !result.Report.AppearanceRegenerated || !result.Verification.ReparseOK || !result.Verification.AppearanceRegenerated {
 		t.Fatalf("result = %+v", result)
 	}
+	if result.Report.AppearanceStatus != "regenerated" {
+		t.Fatalf("appearance_status = %q, want regenerated", result.Report.AppearanceStatus)
+	}
 	written, err := os.ReadFile(out)
 	if err != nil {
 		t.Fatal(err)
@@ -970,6 +978,173 @@ func TestCLIFormSetRegeneratesTextWidgetAppearance(t *testing.T) {
 		if !bytes.Contains(written, required) {
 			t.Fatalf("expected %q in regenerated output:\n%s", required, written)
 		}
+	}
+}
+
+func TestCLIFormSetUpdatesChoiceWithRegeneratedAppearance(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "choice-form.pdf")
+	input := pdfFixture(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /FT /Ch /T (payer.plan) /V (Basic) /Opt [(Basic) [(pro) (Pro Plan)]] /Rect [0 0 120 20] >>",
+	)
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "choice-form-out.pdf")
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{
+			"form", "set", path,
+			"--field", "payer.plan",
+			"--value", "Pro Plan",
+			"--regenerate-appearance",
+			"-o", out,
+			"--json",
+		})
+	})
+	var result struct {
+		Report struct {
+			AppearanceStatus      string `json:"appearance_status"`
+			AppearanceRegenerated bool   `json:"appearance_regenerated"`
+		} `json:"report"`
+		Verification struct {
+			FieldValueSet         bool `json:"field_value_set"`
+			AppearanceRegenerated bool `json:"appearance_regenerated"`
+		} `json:"verification"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Report.AppearanceStatus != "regenerated" || !result.Report.AppearanceRegenerated || !result.Verification.FieldValueSet || !result.Verification.AppearanceRegenerated {
+		t.Fatalf("result = %+v, want regenerated choice appearance and verified value", result)
+	}
+	written, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range [][]byte{[]byte("/V (pro)"), []byte("/I [1]"), []byte("(Pro Plan) Tj")} {
+		if !bytes.Contains(written, want) {
+			t.Fatalf("choice output missing %q:\n%s", want, written)
+		}
+	}
+}
+
+func TestCLIFormSetUpdatesCheckboxAndReportsPreservedAppearance(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "checkbox-form.pdf")
+	input := pdfFixture(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /FT /Btn /T (payer.accept) /V /Off /AS /Off /AP << /N << /Off <<>> /Yes <<>> >> >> >>",
+	)
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "checkbox-form-out.pdf")
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{"form", "set", path, "--field", "payer.accept", "--value", "true", "-o", out, "--json"})
+	})
+	var result struct {
+		Report struct {
+			AppearanceStatus      string `json:"appearance_status"`
+			AppearanceRegenerated bool   `json:"appearance_regenerated"`
+		} `json:"report"`
+		Verification struct {
+			FieldValueSet bool `json:"field_value_set"`
+		} `json:"verification"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Report.AppearanceStatus != "preserved" || result.Report.AppearanceRegenerated || !result.Verification.FieldValueSet {
+		t.Fatalf("result = %+v, want preserved checkbox appearance and verified value", result)
+	}
+	written, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range [][]byte{[]byte("/V /Yes"), []byte("/AS /Yes")} {
+		if !bytes.Contains(written, want) {
+			t.Fatalf("checkbox output missing %q:\n%s", want, written)
+		}
+	}
+}
+
+func TestCLIFormSetUpdatesRadioAndReportsPreservedAppearance(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "radio-form.pdf")
+	input := pdfFixture(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /FT /Btn /T (payer.plan) /V /Off /Kids [4 0 R 5 0 R] >>",
+		"<< /AP << /N << /Off <<>> /Basic <<>> >> >> /AS /Off /Parent 3 0 R >>",
+		"<< /AP << /N << /Off <<>> /Pro <<>> >> >> /AS /Off /Parent 3 0 R >>",
+	)
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "radio-form-out.pdf")
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{"form", "set", path, "--field", "payer.plan", "--value", "Pro", "-o", out, "--json"})
+	})
+	var result struct {
+		Report struct {
+			AppearanceStatus string `json:"appearance_status"`
+		} `json:"report"`
+		Verification struct {
+			FieldValueSet bool `json:"field_value_set"`
+		} `json:"verification"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Report.AppearanceStatus != "preserved" || !result.Verification.FieldValueSet {
+		t.Fatalf("result = %+v, want preserved radio appearance and verified value", result)
+	}
+	written, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range [][]byte{[]byte("/V /Pro"), []byte("/AS /Off"), []byte("/AS /Pro")} {
+		if !bytes.Contains(written, want) {
+			t.Fatalf("radio output missing %q:\n%s", want, written)
+		}
+	}
+}
+
+func TestCLIFormSetReportsUnsupportedRichWidgetAppearanceReasonAsJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rich-widget-regenerate-form.pdf")
+	input := pdfFixture(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /FT /Tx /Ff 33554432 /T (payer.name) /V (Old Name) /RV (<b>Old Name</b>) /Rect [0 0 120 20] >>",
+	)
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "rich-widget-regenerate-form-out.pdf")
+
+	stdout, err := captureStdoutAndError(t, func() error {
+		return run([]string{"form", "set", path, "--field", "payer.name", "--value", "New Name", "--regenerate-appearance", "-o", out, "--json"})
+	})
+	if err == nil {
+		t.Fatal("form set succeeded, want unsupported rich-widget appearance regeneration error")
+	}
+	wantReason := "unsupported AcroForm appearance regeneration: rich text/default appearance cannot be regenerated safely"
+	if err.Error() != wantReason {
+		t.Fatalf("error = %q, want %q", err.Error(), wantReason)
+	}
+	var result struct {
+		Error             string `json:"error"`
+		AppearanceStatus  string `json:"appearance_status"`
+		UnsupportedReason string `json:"unsupported_reason"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("json.Unmarshal(%q): %v", stdout, err)
+	}
+	if result.Error != wantReason || result.AppearanceStatus != "unsupported" || result.UnsupportedReason != wantReason {
+		t.Fatalf("unsupported JSON = %+v, want exact reason", result)
 	}
 }
 
@@ -1083,6 +1258,7 @@ func TestCLIAnnotSetContentsWritesVerifiedUpdate(t *testing.T) {
 			Edit                  string `json:"edit"`
 			AnnotationIndex       int    `json:"annotation_index"`
 			AppearanceRegenerated bool   `json:"appearance_regenerated"`
+			AppearanceStatus      string `json:"appearance_status"`
 			OutputPath            string `json:"output_path"`
 		} `json:"report"`
 		Verification struct {
@@ -1100,6 +1276,9 @@ func TestCLIAnnotSetContentsWritesVerifiedUpdate(t *testing.T) {
 	}
 	if result.Report.AppearanceRegenerated {
 		t.Fatalf("appearance regeneration should remain explicit false: %+v", result.Report)
+	}
+	if result.Report.AppearanceStatus != "preserved" {
+		t.Fatalf("appearance_status = %q, want preserved", result.Report.AppearanceStatus)
 	}
 	if !result.Verification.ReparseOK || !result.Verification.ContentsUpdated || !result.Verification.PageUnchanged || result.Verification.AppearanceRegenerated {
 		t.Fatalf("verification = %+v", result.Verification)
@@ -1236,9 +1415,10 @@ func TestCLIAnnotSetContentsCanRemoveAppearance(t *testing.T) {
 	})
 	var result struct {
 		Report struct {
-			AppearanceRegenerated bool `json:"appearance_regenerated"`
-			AppearanceInvalidated bool `json:"appearance_invalidated"`
-			AppearanceRemoved     bool `json:"appearance_removed"`
+			AppearanceRegenerated bool   `json:"appearance_regenerated"`
+			AppearanceInvalidated bool   `json:"appearance_invalidated"`
+			AppearanceRemoved     bool   `json:"appearance_removed"`
+			AppearanceStatus      string `json:"appearance_status"`
 		} `json:"report"`
 		Verification struct {
 			ReparseOK             bool `json:"reparse_ok"`
@@ -1252,6 +1432,9 @@ func TestCLIAnnotSetContentsCanRemoveAppearance(t *testing.T) {
 	}
 	if result.Report.AppearanceRegenerated || !result.Report.AppearanceInvalidated || !result.Report.AppearanceRemoved {
 		t.Fatalf("report = %+v", result.Report)
+	}
+	if result.Report.AppearanceStatus != "removed" {
+		t.Fatalf("appearance_status = %q, want removed", result.Report.AppearanceStatus)
 	}
 	if !result.Verification.ReparseOK || result.Verification.AppearanceRegenerated || !result.Verification.AppearanceInvalidated || !result.Verification.AppearanceRemoved {
 		t.Fatalf("verification = %+v", result.Verification)
@@ -1290,7 +1473,8 @@ func TestCLIAnnotSetContentsCanRegenerateAppearance(t *testing.T) {
 	})
 	var result struct {
 		Report struct {
-			AppearanceRegenerated bool `json:"appearance_regenerated"`
+			AppearanceRegenerated bool   `json:"appearance_regenerated"`
+			AppearanceStatus      string `json:"appearance_status"`
 		} `json:"report"`
 		Verification struct {
 			ReparseOK             bool `json:"reparse_ok"`
@@ -1302,6 +1486,9 @@ func TestCLIAnnotSetContentsCanRegenerateAppearance(t *testing.T) {
 	}
 	if !result.Report.AppearanceRegenerated {
 		t.Fatalf("report = %+v, want regenerated appearance", result.Report)
+	}
+	if result.Report.AppearanceStatus != "regenerated" {
+		t.Fatalf("appearance_status = %q, want regenerated", result.Report.AppearanceStatus)
 	}
 	if !result.Verification.ReparseOK || !result.Verification.AppearanceRegenerated {
 		t.Fatalf("verification = %+v", result.Verification)
@@ -1320,6 +1507,48 @@ func TestCLIAnnotSetContentsCanRegenerateAppearance(t *testing.T) {
 		if !bytes.Contains(written, want) {
 			t.Fatalf("written PDF missing %q:\n%s", want, written)
 		}
+	}
+}
+
+func TestCLIAnnotSetContentsReportsUnsupportedAppearanceReasonAsJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "annot-unsupported-regenerate.pdf")
+	input := pdfFixture(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Page /Annots [3 0 R] >>",
+		"<< /Type /Annot /Subtype /Stamp /Rect [0 0 80 20] /Contents (old note) >>",
+	)
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "annot-unsupported-regenerate-out.pdf")
+
+	stdout, err := captureStdoutAndError(t, func() error {
+		return run([]string{
+			"annot", "set-contents", path,
+			"--index", "0",
+			"--contents", "visible note",
+			"--regenerate-appearance",
+			"-o", out,
+			"--json",
+		})
+	})
+	if err == nil {
+		t.Fatal("annot set-contents succeeded, want unsupported appearance regeneration error")
+	}
+	wantReason := `cannot regenerate annotation appearance: unsupported annotation subtype "Stamp"`
+	if err.Error() != wantReason {
+		t.Fatalf("error = %q, want %q", err.Error(), wantReason)
+	}
+	var result struct {
+		Error             string `json:"error"`
+		AppearanceStatus  string `json:"appearance_status"`
+		UnsupportedReason string `json:"unsupported_reason"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("json.Unmarshal(%q): %v", stdout, err)
+	}
+	if result.Error != wantReason || result.AppearanceStatus != "unsupported" || result.UnsupportedReason != wantReason {
+		t.Fatalf("unsupported JSON = %+v, want exact reason", result)
 	}
 }
 

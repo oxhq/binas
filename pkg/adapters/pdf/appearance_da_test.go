@@ -35,6 +35,16 @@ func TestParseDefaultAppearanceExtractsRGBFill(t *testing.T) {
 	}
 }
 
+func TestParseDefaultAppearanceExtractsTextMatrix(t *testing.T) {
+	appearance, ok := parseDefaultAppearance("/F1 12 Tf 1 0 0 1 4 7 Tm")
+	if !ok {
+		t.Fatal("parseDefaultAppearance ok = false, want true")
+	}
+	if appearance.TextMatrix == nil || *appearance.TextMatrix != [6]float64{1, 0, 0, 1, 4, 7} {
+		t.Fatalf("text matrix = %v, want [1 0 0 1 4 7]", appearance.TextMatrix)
+	}
+}
+
 func TestParseDefaultAppearanceToleratesExtraOperators(t *testing.T) {
 	appearance, ok := parseDefaultAppearance("q 0.5 w /F1 12 Tf 1 0 0 rg Q")
 	if !ok {
@@ -50,6 +60,12 @@ func TestParseDefaultAppearanceToleratesExtraOperators(t *testing.T) {
 
 func TestParseDefaultAppearanceFailsClosedForMalformedFontSize(t *testing.T) {
 	if appearance, ok := parseDefaultAppearance("/Helv nope Tf 0 g"); ok {
+		t.Fatalf("parseDefaultAppearance ok = true with appearance %+v, want false", appearance)
+	}
+}
+
+func TestParseDefaultAppearanceFailsClosedForMalformedTextMatrix(t *testing.T) {
+	if appearance, ok := parseDefaultAppearance("/Helv 10 Tf 1 0 0 nope 4 7 Tm"); ok {
 		t.Fatalf("parseDefaultAppearance ok = true with appearance %+v, want false", appearance)
 	}
 }

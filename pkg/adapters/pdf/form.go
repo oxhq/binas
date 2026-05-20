@@ -1,6 +1,7 @@
 package pdf
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -39,7 +40,10 @@ type FormFieldEditOptions struct {
 
 type FormFieldEditReport struct {
 	core.Report
-	AppearanceRegenerated bool `json:"appearance_regenerated"`
+	AppearanceRegenerated       bool   `json:"appearance_regenerated"`
+	AppearanceStatus            string `json:"appearance_status"`
+	AppearanceGenerationStatus  string `json:"appearance_generation_status"`
+	AppearanceGenerationDetails string `json:"appearance_generation_details,omitempty"`
 }
 
 type FormFieldEditVerification struct {
@@ -101,28 +105,36 @@ func ApplyFormFieldEditWithOptions(input []byte, fieldName, value string, option
 		return nil, FormFieldEditReport{}, FormFieldEditVerification{}, fmt.Errorf("field %q matched %d dictionaries; pass --match-index N (zero-based, 0..%d) to choose one", fieldName, len(matches), len(matches)-1)
 	}
 	appearanceRegenerated := false
+	appearanceStatus := "not_requested"
+	appearanceDetails := "appearance regeneration was not requested"
 	if isButtonFormField(matches[index]) {
-		if options.RegenerateAppearance {
-			return nil, FormFieldEditReport{}, FormFieldEditVerification{}, errors.New("unsupported AcroForm appearance regeneration for button fields; button appearances require proven existing /AP states")
-		}
 		if err := applyButtonFormFieldEdit(graph, matches[index].dict, value); err != nil {
 			return nil, FormFieldEditReport{}, FormFieldEditVerification{}, err
 		}
+		if options.RegenerateAppearance {
+			appearanceRegenerated = true
+			appearanceStatus = "regenerated"
+			appearanceDetails = "selected proven button /AP state and synchronized /V and /AS"
+		}
 	} else if isChoiceFormField(matches[index]) {
-		if err := applyChoiceFormFieldEdit(graph, matches[index], value); err != nil {
+		appearanceValue, err := applyChoiceFormFieldEdit(graph, matches[index], value)
+		if err != nil {
 			return nil, FormFieldEditReport{}, FormFieldEditVerification{}, err
 		}
 		if options.RegenerateAppearance {
-			generated, err := regenerateTextChoiceFieldAppearances(graph, matches[index], value)
+			generated, err := regenerateTextChoiceFieldAppearances(graph, matches[index], appearanceValue)
 			if err != nil {
 				return nil, FormFieldEditReport{}, FormFieldEditVerification{}, err
 			}
 			appearanceRegenerated = generated > 0
+			appearanceStatus, appearanceDetails = formAppearanceGenerationReport(generated)
 		}
 	} else {
 		encodedValue := pdfLiteralString(encodeLiteralString(value))
 		matches[index].dict["V"] = encodedValue
-		synchronizeTextChoiceFormFieldValue(graph, matches[index], encodedValue)
+		if err := synchronizeTextChoiceFormFieldValue(graph, matches[index], encodedValue); err != nil {
+			return nil, FormFieldEditReport{}, FormFieldEditVerification{}, err
+		}
 		setNeedAppearances(graph)
 		if options.RegenerateAppearance {
 			generated, err := regenerateTextChoiceFieldAppearances(graph, matches[index], value)
@@ -130,6 +142,7 @@ func ApplyFormFieldEditWithOptions(input []byte, fieldName, value string, option
 				return nil, FormFieldEditReport{}, FormFieldEditVerification{}, err
 			}
 			appearanceRegenerated = generated > 0
+			appearanceStatus, appearanceDetails = formAppearanceGenerationReport(generated)
 		}
 	}
 	output, err := writeCanonicalPDF(graph)
@@ -148,9 +161,30 @@ func ApplyFormFieldEditWithOptions(input []byte, fieldName, value string, option
 			NodesModified: 1,
 			MatchIndex:    selected,
 			Invariants:    []core.Invariant{core.InvariantReparse, core.InvariantNoFallbackUsed},
+			Meta: map[string]any{
+				"appearance_generation_status":  appearanceStatus,
+				"appearance_generation_details": appearanceDetails,
+			},
 		},
-		AppearanceRegenerated: appearanceRegenerated,
+		AppearanceRegenerated:       appearanceRegenerated,
+		AppearanceStatus:            formAppearanceEditStatus(appearanceRegenerated),
+		AppearanceGenerationStatus:  appearanceStatus,
+		AppearanceGenerationDetails: appearanceDetails,
 	}, verification, nil
+}
+
+func formAppearanceEditStatus(regenerated bool) string {
+	if regenerated {
+		return "regenerated"
+	}
+	return "preserved"
+}
+
+func formAppearanceGenerationReport(generated int) (string, string) {
+	if generated > 0 {
+		return "regenerated", fmt.Sprintf("regenerated %d simple text/choice widget appearance stream(s)", generated)
+	}
+	return "not_generated", "no widget appearance stream was regenerated"
 }
 
 func isButtonFormField(match formFieldMatch) bool {
@@ -163,44 +197,101 @@ func isChoiceFormField(match formFieldMatch) bool {
 	return ok && string(ft) == "Ch"
 }
 
-func applyChoiceFormFieldEdit(graph *pdfGraph, match formFieldMatch, value string) error {
+func applyChoiceFormFieldEdit(graph *pdfGraph, match formFieldMatch, value string) (string, error) {
 	if match.multiSelectChoiceField() {
-		return errors.New("unsupported AcroForm choice field edit: multi-select fields require an array /V value, which form set cannot express")
+		return applyMultiSelectChoiceFormFieldEdit(graph, match, value)
 	}
 	options := formFieldChoiceOptionEntries(match.dict, "Ch")
-	selectedIndex, selectedExport, hasSelectedIndex := uniqueChoiceOptionSelection(options, value)
+	selected, hasSelectedIndex := uniqueChoiceOptionSelection(options, value)
 	if len(options) > 0 && !match.editableChoiceField() && !hasSelectedIndex {
-		return fmt.Errorf("unsupported AcroForm choice field value %q: not present in direct /Opt options", value)
+		return "", fmt.Errorf("unsupported AcroForm choice field value %q: not present in direct /Opt options", value)
 	}
 	if hasSelectedIndex {
-		match.dict["V"] = pdfLiteralString(encodeLiteralString(selectedExport))
-		match.dict["I"] = pdfArray{selectedIndex}
+		match.dict["V"] = pdfLiteralString(encodeLiteralString(selected.export))
+		match.dict["I"] = pdfArray{selected.index}
 	} else {
 		match.dict["V"] = pdfLiteralString(encodeLiteralString(value))
 		delete(match.dict, "I")
 	}
-	synchronizeTextChoiceFormFieldValue(graph, match, match.dict["V"])
+	if err := synchronizeTextChoiceFormFieldValue(graph, match, match.dict["V"]); err != nil {
+		return "", err
+	}
 	setNeedAppearances(graph)
+	if hasSelectedIndex {
+		return selected.display, nil
+	}
+	return value, nil
+}
+
+func applyMultiSelectChoiceFormFieldEdit(graph *pdfGraph, match formFieldMatch, value string) (string, error) {
+	var requested []string
+	if err := json.Unmarshal([]byte(value), &requested); err != nil {
+		return "", errors.New("unsupported AcroForm choice field edit: multi-select fields require a JSON array of string values")
+	}
+	if len(requested) == 0 {
+		return "", errors.New("unsupported AcroForm choice field edit: multi-select fields require at least one selected value")
+	}
+	options := formFieldChoiceOptionEntries(match.dict, "Ch")
+	if len(options) == 0 {
+		return "", errors.New("unsupported AcroForm choice field edit: multi-select fields require direct /Opt options to prove array /V values")
+	}
+	selectedOptions := make([]formFieldChoiceOption, 0, len(requested))
+	seenIndexes := make(map[int]bool, len(requested))
+	for _, item := range requested {
+		selected, ok := uniqueChoiceOptionSelection(options, item)
+		if !ok {
+			return "", fmt.Errorf("unsupported AcroForm choice field value %q: ambiguous or not present in direct /Opt options", item)
+		}
+		if seenIndexes[selected.index] {
+			return "", fmt.Errorf("unsupported AcroForm choice field value %q: duplicate multi-select option index %d", item, selected.index)
+		}
+		seenIndexes[selected.index] = true
+		selectedOptions = append(selectedOptions, selected)
+	}
+	sort.Slice(selectedOptions, func(i, j int) bool {
+		return selectedOptions[i].index < selectedOptions[j].index
+	})
+	valueArray := make(pdfArray, 0, len(selectedOptions))
+	indexArray := make(pdfArray, 0, len(selectedOptions))
+	displayValues := make([]string, 0, len(selectedOptions))
+	for _, selected := range selectedOptions {
+		valueArray = append(valueArray, pdfLiteralString(encodeLiteralString(selected.export)))
+		indexArray = append(indexArray, selected.index)
+		displayValues = append(displayValues, selected.display)
+	}
+	match.dict["V"] = valueArray
+	match.dict["I"] = indexArray
+	if err := synchronizeTextChoiceFormFieldValue(graph, match, valueArray); err != nil {
+		return "", err
+	}
+	setNeedAppearances(graph)
+	return strings.Join(displayValues, "\n"), nil
+}
+
+func synchronizeTextChoiceFormFieldValue(graph *pdfGraph, match formFieldMatch, value pdfValue) error {
+	if err := synchronizeTerminalKidValues(graph, match, value); err != nil {
+		return err
+	}
+	synchronizeSingleTerminalParentValue(graph, match, value)
 	return nil
 }
 
-func synchronizeTextChoiceFormFieldValue(graph *pdfGraph, match formFieldMatch, value pdfValue) {
-	synchronizeTerminalKidValues(graph, match, value)
-	synchronizeSingleTerminalParentValue(graph, match, value)
-}
-
-func synchronizeTerminalKidValues(graph *pdfGraph, match formFieldMatch, value pdfValue) {
+func synchronizeTerminalKidValues(graph *pdfGraph, match formFieldMatch, value pdfValue) error {
 	kids, ok := match.dict["Kids"].(pdfArray)
 	if !ok || len(kids) == 0 {
-		return
+		return nil
 	}
 	for _, kidValue := range kids {
 		kid, ok := resolvePDFDict(graph, kidValue)
-		if !ok || !safeTerminalValueSyncKid(match, kid) {
-			continue
+		if !ok {
+			return errors.New("unsupported AcroForm value synchronization: field kid is not a dictionary")
+		}
+		if err := safeTerminalValueSyncKid(match, kid); err != nil {
+			return err
 		}
 		kid["V"] = value
 	}
+	return nil
 }
 
 func synchronizeSingleTerminalParentValue(graph *pdfGraph, match formFieldMatch, value pdfValue) {
@@ -215,15 +306,21 @@ func synchronizeSingleTerminalParentValue(graph *pdfGraph, match formFieldMatch,
 	parent["V"] = value
 }
 
-func safeTerminalValueSyncKid(match formFieldMatch, kid pdfDict) bool {
+func safeTerminalValueSyncKid(match formFieldMatch, kid pdfDict) error {
 	if _, hasGrandkids := kid["Kids"]; hasGrandkids {
-		return false
+		return errors.New("unsupported AcroForm value synchronization: complex child field tree has nested /Kids")
 	}
 	name, hasName := pdfTextValue(kid["T"])
 	if !hasName {
-		return kid["Subtype"] == pdfName("Widget")
+		if kid["Subtype"] == pdfName("Widget") {
+			return nil
+		}
+		return errors.New("unsupported AcroForm value synchronization: unnamed field kid is not a widget")
 	}
-	return name == match.localName || name == match.fullName
+	if name == match.localName || name == match.fullName {
+		return nil
+	}
+	return fmt.Errorf("unsupported AcroForm value synchronization: child field name %q does not match %q", name, match.fullName)
 }
 
 func safeSingleTerminalParentValueSync(parent pdfDict, match formFieldMatch) bool {
@@ -243,6 +340,9 @@ func safeSingleTerminalParentValueSync(parent pdfDict, match formFieldMatch) boo
 }
 
 func regenerateTextChoiceFieldAppearances(graph *pdfGraph, match formFieldMatch, value string) (int, error) {
+	if formFieldHasRichAppearance(match) {
+		return 0, errors.New("unsupported AcroForm appearance regeneration: rich text/default appearance cannot be regenerated safely")
+	}
 	widgets, err := textChoiceAppearanceWidgets(graph, match)
 	if err != nil {
 		return 0, err
@@ -256,7 +356,11 @@ func regenerateTextChoiceFieldAppearances(graph *pdfGraph, match formFieldMatch,
 		if !ok {
 			return 0, errors.New("unsupported AcroForm appearance regeneration: widget /Rect is missing or not a direct numeric rectangle")
 		}
-		stream, err := textChoiceAppearanceStream(rect, value, textChoiceAppearanceStyle(graph, match, widget))
+		style, err := textChoiceAppearanceStyle(graph, match, widget)
+		if err != nil {
+			return 0, err
+		}
+		stream, err := textChoiceAppearanceStream(rect, value, style)
 		if err != nil {
 			return 0, err
 		}
@@ -266,6 +370,14 @@ func regenerateTextChoiceFieldAppearances(graph *pdfGraph, match formFieldMatch,
 		widget["AP"] = pdfDict{"N": pdfRef{ID: id}}
 	}
 	return len(widgets), nil
+}
+
+func formFieldHasRichAppearance(match formFieldMatch) bool {
+	if flags, ok := match.effectiveFlags(); ok && flags&formFieldFlagTxRichText != 0 {
+		return true
+	}
+	_, hasRichValue := match.dict["RV"]
+	return hasRichValue
 }
 
 func textChoiceAppearanceWidgets(graph *pdfGraph, match formFieldMatch) ([]pdfDict, error) {
@@ -346,6 +458,7 @@ type simpleAppearanceStyle struct {
 	FontSize          float64
 	FillGray          *float64
 	FillRGB           *[3]float64
+	TextMatrix        *[6]float64
 }
 
 func defaultSimpleAppearanceStyle() simpleAppearanceStyle {
@@ -379,11 +492,11 @@ func simpleAppearanceFontResource(style simpleAppearanceStyle) (string, pdfValue
 	return defaultStyle.FontResourceName, defaultStyle.FontResourceValue
 }
 
-func textChoiceAppearanceStyle(graph *pdfGraph, match formFieldMatch, widget pdfDict) simpleAppearanceStyle {
+func textChoiceAppearanceStyle(graph *pdfGraph, match formFieldMatch, widget pdfDict) (simpleAppearanceStyle, error) {
 	for _, candidate := range textChoiceDefaultAppearanceCandidates(graph, match, widget) {
 		appearance, ok := parseDefaultAppearance(candidate.defaultAppearance)
 		if !ok || appearance.FontSize <= 0 {
-			continue
+			return simpleAppearanceStyle{}, errors.New("unsupported AcroForm appearance regeneration: default appearance could not be parsed safely")
 		}
 		style := simpleAppearanceStyle{
 			FontResourceName:  "Helv",
@@ -391,14 +504,17 @@ func textChoiceAppearanceStyle(graph *pdfGraph, match formFieldMatch, widget pdf
 			FontSize:          appearance.FontSize,
 			FillGray:          appearance.FillGray,
 			FillRGB:           appearance.FillRGB,
+			TextMatrix:        appearance.TextMatrix,
 		}
 		if fontValue, ok := resolveDefaultAppearanceFontResource(graph, candidate.defaultResources, appearance.FontResourceName); ok {
 			style.FontResourceName = appearance.FontResourceName
 			style.FontResourceValue = fontValue
+		} else if appearance.FontResourceName != defaultSimpleAppearanceStyle().FontResourceName {
+			return simpleAppearanceStyle{}, fmt.Errorf("unsupported AcroForm appearance regeneration: default appearance font resource %q was not found in /DR", appearance.FontResourceName)
 		}
-		return style
+		return style, nil
 	}
-	return defaultSimpleAppearanceStyle()
+	return defaultSimpleAppearanceStyle(), nil
 }
 
 type textChoiceDefaultAppearanceCandidate struct {
@@ -511,11 +627,23 @@ func writeSimpleAppearanceTextWithStyle(data *strings.Builder, width, height flo
 	} else if style.FillRGB != nil {
 		fmt.Fprintf(data, "%s %s %s rg\n", pdfNumberToken(style.FillRGB[0]), pdfNumberToken(style.FillRGB[1]), pdfNumberToken(style.FillRGB[2]))
 	}
-	startY := height - simpleAppearanceInset - fontSize
-	if startY < simpleAppearanceInset {
-		startY = simpleAppearanceInset
+	if style.TextMatrix != nil {
+		matrix := *style.TextMatrix
+		fmt.Fprintf(data, "%s %s %s %s %s %s Tm\n",
+			pdfNumberToken(matrix[0]),
+			pdfNumberToken(matrix[1]),
+			pdfNumberToken(matrix[2]),
+			pdfNumberToken(matrix[3]),
+			pdfNumberToken(matrix[4]),
+			pdfNumberToken(matrix[5]),
+		)
+	} else {
+		startY := height - simpleAppearanceInset - fontSize
+		if startY < simpleAppearanceInset {
+			startY = simpleAppearanceInset
+		}
+		fmt.Fprintf(data, "%s %s Td\n", pdfNumberToken(simpleAppearanceInset), pdfNumberToken(startY))
 	}
-	fmt.Fprintf(data, "%s %s Td\n", pdfNumberToken(simpleAppearanceInset), pdfNumberToken(startY))
 	for i, line := range lines {
 		if i > 0 {
 			fmt.Fprintf(data, "0 -%s Td\n", pdfNumberToken(leading))
@@ -715,6 +843,11 @@ func buttonNormalAppearanceDict(value pdfValue) (pdfDict, error) {
 	if !ok {
 		return nil, errors.New("unsupported AcroForm button field: /AP is not a dictionary")
 	}
+	for key := range ap {
+		if key != "N" {
+			return nil, errors.New("unsupported AcroForm button field: rich /AP states are not supported")
+		}
+	}
 	normal, ok := ap["N"].(pdfDict)
 	if !ok {
 		return nil, errors.New("unsupported AcroForm button field: /AP /N is not a state dictionary")
@@ -829,13 +962,20 @@ func (match formFieldMatch) editableChoiceField() bool {
 }
 
 func (match formFieldMatch) multiSelectChoiceField() bool {
+	flags, ok := match.effectiveFlags()
+	return ok && flags&formFieldFlagChMultiSelect != 0
+}
+
+func (match formFieldMatch) effectiveFlags() (int, bool) {
 	flags := 0
 	if direct, ok := dictInt(match.dict, "Ff"); ok {
 		flags = direct
 	} else if match.hasFlags {
 		flags = match.inheritedFlags
+	} else {
+		return 0, false
 	}
-	return flags&formFieldFlagChMultiSelect != 0
+	return flags, true
 }
 
 type formFieldContext struct {
@@ -1222,19 +1362,17 @@ func formFieldChoiceOptionEntries(dict pdfDict, fieldType string) []formFieldCho
 	return out
 }
 
-func uniqueChoiceOptionSelection(options []formFieldChoiceOption, value string) (int, string, bool) {
-	selectedIndex := 0
-	selectedExport := ""
+func uniqueChoiceOptionSelection(options []formFieldChoiceOption, value string) (formFieldChoiceOption, bool) {
+	selected := formFieldChoiceOption{}
 	matches := 0
 	for _, option := range options {
 		if value != option.export && value != option.display {
 			continue
 		}
-		selectedIndex = option.index
-		selectedExport = option.export
+		selected = option
 		matches++
 	}
-	return selectedIndex, selectedExport, matches == 1
+	return selected, matches == 1
 }
 
 func formFieldChoiceSelectedIndexes(dict pdfDict, fieldType string) []int {
@@ -1439,11 +1577,15 @@ func verifyFormFieldEdit(output []byte, fieldName, value string, matchIndex *int
 	fieldValueSet := false
 	appearanceRegenerated := false
 	if index >= 0 && index < len(matches) {
-		if got := formFieldValue(matches[index].dict); got != nil && formFieldValueMatchesEdit(matches[index], *got, value) {
+		if got := formFieldValue(matches[index].dict); got != nil && formFieldValueMatchesEdit(graph, matches[index], *got, value) {
 			fieldValueSet = true
 		}
 		if expectAppearanceRegenerated {
-			appearanceRegenerated = formFieldHasRegeneratedNormalAppearance(graph, matches[index], value)
+			if isButtonFormField(matches[index]) {
+				appearanceRegenerated = formFieldButtonAppearanceMatchesEdit(graph, matches[index], value)
+			} else {
+				appearanceRegenerated = formFieldHasRegeneratedNormalAppearance(graph, matches[index], formFieldAppearanceValueForEdit(matches[index], value))
+			}
 		}
 	}
 	return FormFieldEditVerification{
@@ -1454,15 +1596,106 @@ func verifyFormFieldEdit(output []byte, fieldName, value string, matchIndex *int
 	}, nil
 }
 
-func formFieldValueMatchesEdit(match formFieldMatch, got string, value string) bool {
+func formFieldValueMatchesEdit(graph *pdfGraph, match formFieldMatch, got string, value string) bool {
+	if isButtonFormField(match) {
+		return formFieldButtonAppearanceMatchesEdit(graph, match, value)
+	}
 	if got == value {
 		return true
 	}
 	if !isChoiceFormField(match) {
 		return false
 	}
-	_, selectedExport, ok := uniqueChoiceOptionSelection(formFieldChoiceOptionEntries(match.dict, "Ch"), value)
-	return ok && got == selectedExport
+	if match.multiSelectChoiceField() {
+		return formFieldMultiSelectValueMatchesEdit(match, value)
+	}
+	selected, ok := uniqueChoiceOptionSelection(formFieldChoiceOptionEntries(match.dict, "Ch"), value)
+	return ok && got == selected.export
+}
+
+func formFieldAppearanceValueForEdit(match formFieldMatch, value string) string {
+	if !isChoiceFormField(match) {
+		return value
+	}
+	if match.multiSelectChoiceField() {
+		var requested []string
+		if err := json.Unmarshal([]byte(value), &requested); err != nil {
+			return value
+		}
+		options := formFieldChoiceOptionEntries(match.dict, "Ch")
+		selectedOptions := make([]formFieldChoiceOption, 0, len(requested))
+		for _, item := range requested {
+			selected, ok := uniqueChoiceOptionSelection(options, item)
+			if !ok {
+				return value
+			}
+			selectedOptions = append(selectedOptions, selected)
+		}
+		sort.Slice(selectedOptions, func(i, j int) bool {
+			return selectedOptions[i].index < selectedOptions[j].index
+		})
+		displayValues := make([]string, 0, len(selectedOptions))
+		for _, selected := range selectedOptions {
+			displayValues = append(displayValues, selected.display)
+		}
+		return strings.Join(displayValues, "\n")
+	}
+	selected, ok := uniqueChoiceOptionSelection(formFieldChoiceOptionEntries(match.dict, "Ch"), value)
+	if !ok {
+		return value
+	}
+	return selected.display
+}
+
+func formFieldMultiSelectValueMatchesEdit(match formFieldMatch, value string) bool {
+	var requested []string
+	if err := json.Unmarshal([]byte(value), &requested); err != nil {
+		return false
+	}
+	options := formFieldChoiceOptionEntries(match.dict, "Ch")
+	selectedExports := make([]string, 0, len(requested))
+	for _, item := range requested {
+		selected, ok := uniqueChoiceOptionSelection(options, item)
+		if !ok {
+			return false
+		}
+		selectedExports = append(selectedExports, selected.export)
+	}
+	sort.Strings(selectedExports)
+	gotExports, ok := pdfTextArray(match.dict["V"])
+	if !ok {
+		return false
+	}
+	sort.Strings(gotExports)
+	return reflectStringSlicesEqual(gotExports, selectedExports)
+}
+
+func pdfTextArray(value pdfValue) ([]string, bool) {
+	array, ok := value.(pdfArray)
+	if !ok {
+		return nil, false
+	}
+	out := make([]string, 0, len(array))
+	for _, item := range array {
+		text, ok := pdfDirectFormValueText(item)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, text)
+	}
+	return out, true
+}
+
+func reflectStringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func formNeedAppearancesSet(graph *pdfGraph) bool {
@@ -1536,7 +1769,11 @@ func formFieldAppearanceStreamMatchesRegeneratedContent(graph *pdfGraph, match f
 	if !ok {
 		return false
 	}
-	lines, err := simpleAppearanceTextLinesWithStyle(rect[2]-rect[0], rect[3]-rect[1], value, textChoiceAppearanceStyle(graph, match, widget))
+	style, err := textChoiceAppearanceStyle(graph, match, widget)
+	if err != nil {
+		return false
+	}
+	lines, err := simpleAppearanceTextLinesWithStyle(rect[2]-rect[0], rect[3]-rect[1], value, style)
 	if err != nil || len(lines) == 0 {
 		return false
 	}
@@ -1558,4 +1795,69 @@ func formFieldAppearanceHasFontResource(stream pdfStreamObject) bool {
 	}
 	fonts, ok := resources["Font"].(pdfDict)
 	return ok && len(fonts) > 0
+}
+
+func formFieldButtonAppearanceMatchesEdit(graph *pdfGraph, match formFieldMatch, value string) bool {
+	if ap, ok := match.dict["AP"]; ok {
+		normal, err := buttonNormalAppearanceDict(ap)
+		if err != nil {
+			return false
+		}
+		state, err := buttonAppearanceState(normal, value)
+		return err == nil && match.dict["V"] == pdfName(state) && match.dict["AS"] == pdfName(state)
+	}
+	kids, ok := match.dict["Kids"].(pdfArray)
+	if !ok || len(kids) == 0 {
+		return false
+	}
+	if graph == nil {
+		return false
+	}
+	if len(kids) == 1 {
+		widget, ok := resolvePDFDict(graph, kids[0])
+		if !ok {
+			return false
+		}
+		normal, err := buttonNormalAppearanceDict(widget["AP"])
+		if err != nil {
+			return false
+		}
+		state, err := buttonAppearanceState(normal, value)
+		return err == nil && match.dict["V"] == pdfName(state) && widget["AS"] == pdfName(state)
+	}
+	if value == "false" || value == "Off" {
+		if match.dict["V"] != pdfName("Off") {
+			return false
+		}
+		for _, kid := range kids {
+			widget, ok := resolvePDFDict(graph, kid)
+			if !ok || widget["AS"] != pdfName("Off") {
+				return false
+			}
+		}
+		return true
+	}
+	if value == "" || value == "true" || value == "On" || match.dict["V"] != pdfName(value) {
+		return false
+	}
+	selected := 0
+	for _, kid := range kids {
+		widget, ok := resolvePDFDict(graph, kid)
+		if !ok {
+			return false
+		}
+		normal, err := buttonNormalAppearanceDict(widget["AP"])
+		if err != nil {
+			return false
+		}
+		_, hasState := normal[value]
+		if hasState && widget["AS"] == pdfName(value) {
+			selected++
+			continue
+		}
+		if widget["AS"] != pdfName("Off") {
+			return false
+		}
+	}
+	return selected == 1
 }

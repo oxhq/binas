@@ -20,6 +20,7 @@ type AnnotationContentsEditReport struct {
 	AppearanceRegenerated bool   `json:"appearance_regenerated"`
 	AppearanceInvalidated bool   `json:"appearance_invalidated,omitempty"`
 	AppearanceRemoved     bool   `json:"appearance_removed,omitempty"`
+	AppearanceStatus      string `json:"appearance_status"`
 	AppearanceNote        string `json:"appearance_note"`
 }
 
@@ -199,6 +200,7 @@ func ApplyAnnotationContentsEdit(input []byte, index int, contents string, optio
 		AppearanceRegenerated: verification.AppearanceRegenerated,
 		AppearanceInvalidated: appearanceRemoved,
 		AppearanceRemoved:     appearanceRemoved,
+		AppearanceStatus:      annotationContentsEditAppearanceStatus(verification.AppearanceRegenerated, appearanceRemoved),
 		AppearanceNote:        annotationContentsEditAppearanceNote(verification.AppearanceRegenerated, appearanceRemoved),
 	}
 	if candidate.Object != nil {
@@ -226,8 +228,21 @@ func annotationContentsEditAppearanceNote(appearanceRegenerated, appearanceRemov
 	return "annotation /Contents was updated; appearance stream was left unchanged"
 }
 
+func annotationContentsEditAppearanceStatus(appearanceRegenerated, appearanceRemoved bool) string {
+	if appearanceRegenerated {
+		return "regenerated"
+	}
+	if appearanceRemoved {
+		return "removed"
+	}
+	return "preserved"
+}
+
 func buildBasicAnnotationAppearance(candidate annotationCandidate, contents string) (pdfStreamObject, error) {
 	subtype := annotationSubtype(candidate.Dict)
+	if err := validateBasicAnnotationAppearanceInputs(candidate.Dict, candidate.Index, subtype); err != nil {
+		return pdfStreamObject{}, err
+	}
 	rect := annotationRect(candidate.Dict)
 	if len(rect) != 4 || rect[2] <= rect[0] || rect[3] <= rect[1] {
 		return pdfStreamObject{}, fmt.Errorf("cannot regenerate annotation appearance: annotation %d has no usable /Rect", candidate.Index)
@@ -249,6 +264,31 @@ func buildBasicAnnotationAppearance(candidate annotationCandidate, contents stri
 		return basicTextMarkupAnnotationAppearanceStream(subtype, rect, width, height, annotationNumericArray(candidate.Dict, "C"), quadPoints), nil
 	default:
 		return pdfStreamObject{}, fmt.Errorf("cannot regenerate annotation appearance: unsupported annotation subtype %q", subtype)
+	}
+}
+
+func validateBasicAnnotationAppearanceInputs(dict pdfDict, annotationIndex int, subtype string) error {
+	if !supportedBasicAnnotationAppearanceSubtype(subtype) {
+		return fmt.Errorf("cannot regenerate annotation appearance: unsupported annotation subtype %q", subtype)
+	}
+	if _, ok := dict["AA"]; ok {
+		return fmt.Errorf("cannot regenerate annotation appearance: annotation %d has unsupported additional actions", annotationIndex)
+	}
+	if annotationHasJavaScriptAction(dict) {
+		return fmt.Errorf("cannot regenerate annotation appearance: annotation %d has unsupported JavaScript action", annotationIndex)
+	}
+	if annotationHasRichTextContent(dict) {
+		return fmt.Errorf("cannot regenerate annotation appearance: annotation %d has unsupported rich text content", annotationIndex)
+	}
+	return nil
+}
+
+func supportedBasicAnnotationAppearanceSubtype(subtype string) bool {
+	switch subtype {
+	case "Text", "FreeText", "Link", "Square", "Circle", "Highlight", "Underline", "StrikeOut":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -283,9 +323,6 @@ func basicAnnotationAppearanceStream(width, height float64, contents string) (pd
 func basicLinkAnnotationAppearanceStream(dict pdfDict, annotationIndex int, width, height float64) (pdfStreamObject, error) {
 	if _, ok := dict["BS"]; ok {
 		return pdfStreamObject{}, fmt.Errorf("cannot regenerate annotation appearance: annotation %d has unsupported /BS border style", annotationIndex)
-	}
-	if annotationHasJavaScriptAction(dict) {
-		return pdfStreamObject{}, fmt.Errorf("cannot regenerate annotation appearance: annotation %d has unsupported JavaScript action", annotationIndex)
 	}
 	borderWidth, err := annotationLinkBorderWidth(dict, annotationIndex)
 	if err != nil {
@@ -706,7 +743,7 @@ func verifyAnnotationContentsEdit(output []byte, index int, contents string, pag
 	}
 	appearanceRegenerated := false
 	if expectAppearanceRegenerated && index >= 0 && index < len(candidates) {
-		appearanceRegenerated = annotationHasNormalAppearanceStream(graph, candidates[index].Dict)
+		appearanceRegenerated = annotationNormalAppearanceMatchesRegeneratedContent(graph, candidates[index], contents)
 	}
 	if expectAppearanceRegenerated && !appearanceRegenerated {
 		return AnnotationContentsEditVerification{
@@ -729,27 +766,101 @@ func verifyAnnotationContentsEdit(output []byte, index int, contents string, pag
 }
 
 func annotationHasNormalAppearanceStream(graph *pdfGraph, dict pdfDict) bool {
+	_, ok := annotationNormalAppearanceStream(graph, dict)
+	return ok
+}
+
+func annotationNormalAppearanceStream(graph *pdfGraph, dict pdfDict) (pdfStreamObject, bool) {
 	ap, ok := dict["AP"].(pdfDict)
 	if !ok {
-		return false
+		return pdfStreamObject{}, false
 	}
 	switch normal := ap["N"].(type) {
 	case pdfStreamObject:
-		return annotationAppearanceStreamIsFormXObject(normal)
+		return normal, annotationAppearanceStreamIsFormXObject(normal)
 	case pdfRef:
 		object := graph.Objects[normal.ID]
 		if object == nil {
-			return false
+			return pdfStreamObject{}, false
 		}
 		stream, ok := object.Value.(pdfStreamObject)
-		return ok && annotationAppearanceStreamIsFormXObject(stream)
+		return stream, ok && annotationAppearanceStreamIsFormXObject(stream)
 	default:
-		return false
+		return pdfStreamObject{}, false
 	}
 }
 
 func annotationAppearanceStreamIsFormXObject(stream pdfStreamObject) bool {
 	return dictHasType(stream.Dict, "XObject") && annotationSubtype(stream.Dict) == "Form"
+}
+
+func annotationNormalAppearanceMatchesRegeneratedContent(graph *pdfGraph, candidate annotationCandidate, contents string) bool {
+	stream, ok := annotationNormalAppearanceStream(graph, candidate.Dict)
+	if !ok {
+		return false
+	}
+	expected, err := buildBasicAnnotationAppearance(candidate, contents)
+	if err != nil {
+		return false
+	}
+	return annotationAppearanceStreamEquivalent(stream, expected)
+}
+
+func annotationAppearanceStreamEquivalent(got, want pdfStreamObject) bool {
+	gotDict := clonePDFDict(got.Dict)
+	wantDict := clonePDFDict(want.Dict)
+	delete(gotDict, "Length")
+	delete(wantDict, "Length")
+	return annotationPDFValueEquivalent(gotDict, wantDict) && string(got.Data) == string(want.Data)
+}
+
+func annotationPDFValueEquivalent(got, want pdfValue) bool {
+	if gotNumber, gotOK := pdfNumericValue(got); gotOK {
+		wantNumber, wantOK := pdfNumericValue(want)
+		return wantOK && gotNumber == wantNumber
+	}
+	switch gotValue := got.(type) {
+	case pdfName:
+		wantValue, ok := want.(pdfName)
+		return ok && gotValue == wantValue
+	case pdfLiteralString:
+		wantValue, ok := want.(pdfLiteralString)
+		return ok && gotValue == wantValue
+	case pdfHexString:
+		wantValue, ok := want.(pdfHexString)
+		return ok && gotValue == wantValue
+	case bool:
+		wantValue, ok := want.(bool)
+		return ok && gotValue == wantValue
+	case pdfRef:
+		wantValue, ok := want.(pdfRef)
+		return ok && gotValue == wantValue
+	case pdfArray:
+		wantValue, ok := want.(pdfArray)
+		if !ok || len(gotValue) != len(wantValue) {
+			return false
+		}
+		for i := range gotValue {
+			if !annotationPDFValueEquivalent(gotValue[i], wantValue[i]) {
+				return false
+			}
+		}
+		return true
+	case pdfDict:
+		wantValue, ok := want.(pdfDict)
+		if !ok || len(gotValue) != len(wantValue) {
+			return false
+		}
+		for key, gotItem := range gotValue {
+			wantItem, ok := wantValue[key]
+			if !ok || !annotationPDFValueEquivalent(gotItem, wantItem) {
+				return false
+			}
+		}
+		return true
+	default:
+		return fmt.Sprintf("%T:%v", got, got) == fmt.Sprintf("%T:%v", want, want)
+	}
 }
 
 func isAnnotationDict(dict pdfDict) bool {
@@ -849,15 +960,17 @@ func annotationLinkColor(dict pdfDict, annotationIndex int) ([]float64, error) {
 }
 
 func annotationHasJavaScriptAction(dict pdfDict) bool {
-	if _, ok := dict["AA"]; ok {
-		return true
-	}
 	action, ok := dict["A"].(pdfDict)
 	if !ok {
 		return false
 	}
 	subtype, ok := action["S"].(pdfName)
 	return ok && subtype == "JavaScript"
+}
+
+func annotationHasRichTextContent(dict pdfDict) bool {
+	_, ok := dict["RC"]
+	return ok
 }
 
 func annotationNumericArray(dict pdfDict, key string) []float64 {
