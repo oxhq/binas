@@ -2,6 +2,7 @@ package pdf
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/oxhq/binas/pkg/core"
@@ -181,7 +182,7 @@ func TestPlanEditReportsReplacementWidthProofForType0CMap(t *testing.T) {
 	}
 }
 
-func TestPlanEditReportsReplacementWidthReflowRequiredForType0CMapTJArray(t *testing.T) {
+func TestPlanEditFailsClosedWhenType0CMapTJArrayReplacementRequiresReflow(t *testing.T) {
 	content := []byte("BT\n/F1 12 Tf\n[<0001> -20 <0001>] TJ\nET\n")
 	input := testPDF(
 		"<< /Type /Catalog >>",
@@ -197,22 +198,15 @@ func TestPlanEditReportsReplacementWidthReflowRequiredForType0CMapTJArray(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan, err := adapter.PlanEdit(tree, core.Match{Kind: KindTextShow, Text: "AA"}, core.Mutation{Replace: "BB"})
-	if err != nil {
-		t.Fatal(err)
+	_, err = adapter.PlanEdit(tree, core.Match{Kind: KindTextShow, Text: "AA"}, core.Mutation{Replace: "BB"})
+	if err == nil {
+		t.Fatal("expected replacement requiring reflow to fail closed")
 	}
-	if plan.Meta["layout_proof"] != layoutProofStatusReflowRequired {
-		t.Fatalf("plan layout_proof = %v, want %q; meta=%+v", plan.Meta["layout_proof"], layoutProofStatusReflowRequired, plan.Meta)
-	}
-	if plan.Meta["old_width_units"] != 1000 || plan.Meta["new_width_units"] != 1220 || plan.Meta["width_delta_units"] != 220 {
-		t.Fatalf("plan width proof meta = %+v, want delta 220", plan.Meta)
-	}
-	_, report, err := adapter.Apply(input, plan)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if report.Meta["layout_proof"] != layoutProofStatusReflowRequired {
-		t.Fatalf("report layout_proof = %v, want %q; meta=%+v", report.Meta["layout_proof"], layoutProofStatusReflowRequired, report.Meta)
+	got := err.Error()
+	for _, want := range []string{"layout_proof=reflow_required", "old_width_units=1000", "new_width_units=1220", "width_delta_units=220"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("error = %q, want metadata %q", got, want)
+		}
 	}
 }
 

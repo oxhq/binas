@@ -36,6 +36,9 @@ func TestApplyExplicitOverlayStampAddsSelectableOverlayAndReportsFallback(t *tes
 	if report.FallbackPolicy == nil || report.FallbackPolicy.Fallback != "overlay" || report.FallbackPolicy.Mode != "explicit" {
 		t.Fatalf("fallback policy = %+v, want overlay/explicit", report.FallbackPolicy)
 	}
+	if report.FallbackKind != "overlay" {
+		t.Fatalf("fallback_kind = %q, want overlay", report.FallbackKind)
+	}
 	if hasCoreInvariant(report.Invariants, core.InvariantNoFallbackUsed) {
 		t.Fatalf("overlay report must not claim %s: %+v", core.InvariantNoFallbackUsed, report.Invariants)
 	}
@@ -70,7 +73,7 @@ func TestApplyExplicitOverlayStampAddsSelectableOverlayAndReportsFallback(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(encoded, []byte(`"fallback_used":true`)) || !bytes.Contains(encoded, []byte(`"fallback_policy":{"fallback":"overlay","mode":"explicit"}`)) {
+	if !bytes.Contains(encoded, []byte(`"fallback_used":true`)) || !bytes.Contains(encoded, []byte(`"fallback_kind":"overlay"`)) || !bytes.Contains(encoded, []byte(`"fallback_policy":{"fallback":"overlay","mode":"explicit"}`)) {
 		t.Fatalf("report JSON missing explicit overlay fallback contract: %s", encoded)
 	}
 }

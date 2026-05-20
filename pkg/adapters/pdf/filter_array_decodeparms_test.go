@@ -1392,6 +1392,178 @@ func TestFlateDecodePNGDecodeParmsOmittedColumnsRGBRewriteReencodesPredictorRows
 	}
 }
 
+func TestFilterArrayDecodeParmsSupportedShapesSurgicalAndCanonicalRewrite(t *testing.T) {
+	cases := []struct {
+		name          string
+		filter        string
+		decodeParms   string
+		oldText       string
+		newText       string
+		decoded       []byte
+		assertEncoded func(t *testing.T, encoded []byte)
+	}{
+		{
+			name:        "single flate array with tiff predictor defaults",
+			filter:      "[/FlateDecode]",
+			decodeParms: "[<< /Predictor 2 >>]",
+			oldText:     "08-15-2024",
+			newText:     "May 5, 2026",
+			decoded:     []byte("BT\n(08\\05515\\0552024) Tj\nET\n"),
+			assertEncoded: func(t *testing.T, encoded []byte) {
+				t.Helper()
+				predicted, err := decodeFlateDecode(encoded)
+				if err != nil {
+					t.Fatal(err)
+				}
+				decoded, err := decodeTIFFPredictorRowsForTest(predicted, 1, 1)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Contains(decoded, []byte("(May 5, 2026) Tj")) {
+					t.Fatalf("decoded stream = %q", decoded)
+				}
+			},
+		},
+		{
+			name:        "ascii85 runlength flate array with png predictor",
+			filter:      "[/ASCII85Decode /RunLengthDecode /FlateDecode]",
+			decodeParms: "[null null << /Predictor 12 /Columns 1 /Colors 1 /BitsPerComponent 8 >>]",
+			oldText:     "08-15-2024",
+			newText:     "May 5, 2026",
+			decoded:     []byte("BT\n(08\\05515\\0552024) Tj\nET\n"),
+			assertEncoded: func(t *testing.T, encoded []byte) {
+				t.Helper()
+				ascii85Decoded, err := decodeASCII85Decode(encoded)
+				if err != nil {
+					t.Fatal(err)
+				}
+				runLengthDecoded, err := decodeRunLengthDecode(ascii85Decoded)
+				if err != nil {
+					t.Fatal(err)
+				}
+				predicted, err := decodeFlateDecode(runLengthDecoded)
+				if err != nil {
+					t.Fatal(err)
+				}
+				decoded, err := decodePNGOneByteRowsForTest(predicted)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Contains(decoded, []byte("(May 5, 2026) Tj")) {
+					t.Fatalf("decoded stream = %q", decoded)
+				}
+				if !hasOnlyPNGFilterNoneRowsForTest(predicted) {
+					t.Fatalf("encoded predictor rows were not PNG filter 0 one-byte rows: %v", predicted)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			encoded, err := encodeStreamFilterWithDecodeParms(tc.filter, tc.decodeParms, tc.decoded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			input := testPDF(
+				"<< /Type /Page >>",
+				fmt.Sprintf("<< /Length %d /Filter %s /DecodeParms %s >>\nstream\n%sendstream", len(encoded), tc.filter, tc.decodeParms, encoded),
+			)
+
+			adapter := NewAdapter()
+			tree, err := adapter.Parse(input, core.ParseOptions{Strict: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if matches := tree.Query(core.Match{Kind: KindTextShow, Text: tc.oldText}); len(matches) != 1 {
+				t.Fatalf("old selectable matches = %d, want 1", len(matches))
+			}
+			streams := tree.Query(core.Match{Kind: KindStream})
+			if len(streams) != 1 {
+				t.Fatalf("stream nodes = %d, want 1", len(streams))
+			}
+			if streams[0].Meta["decode_parms"] != tc.decodeParms {
+				t.Fatalf("surgical decode_parms = %q, want %q", streams[0].Meta["decode_parms"], tc.decodeParms)
+			}
+
+			plan, err := adapter.PlanEdit(tree, core.Match{Kind: KindTextShow, Text: tc.oldText}, core.Mutation{Replace: tc.newText})
+			if err != nil {
+				t.Fatal(err)
+			}
+			output, report, err := adapter.Apply(input, plan)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if report.FallbackUsed {
+				t.Fatal("unexpected fallback")
+			}
+			verification, err := adapter.Verify(output, plan)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !verification.ReparseOK || !verification.OldTextRemoved || !verification.NewSelectable || !verification.PageUnchanged {
+				t.Fatalf("verification failed: %+v", verification)
+			}
+			stream, ok, err := findNextStream(output, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok {
+				t.Fatal("missing stream")
+			}
+			if stream.lengthValue == len(encoded) {
+				t.Fatal("surgical encoded stream length was not updated")
+			}
+			tc.assertEncoded(t, output[stream.dataStart:stream.dataEnd])
+
+			canonical, _, canonicalVerification, err := EditCanonical(input, core.Match{Kind: KindTextShow, Text: tc.oldText}, core.Mutation{Replace: tc.newText}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !canonicalVerification.ReparseOK || !canonicalVerification.OldTextRemoved || !canonicalVerification.NewSelectable || !canonicalVerification.PageUnchanged {
+				t.Fatalf("canonical verification failed: %+v", canonicalVerification)
+			}
+			if bytes.Contains(canonical, []byte("/Filter")) || bytes.Contains(canonical, []byte("/DecodeParms")) {
+				t.Fatalf("canonical edited stream should be written decoded without filters:\n%s", canonical)
+			}
+			if !bytes.Contains(canonical, []byte("("+tc.newText+") Tj")) {
+				t.Fatalf("canonical output missing replacement:\n%s", canonical)
+			}
+		})
+	}
+}
+
+func TestCanonicalFilterArrayDecodeParmsMalformedFailsClosed(t *testing.T) {
+	encoded, err := encodeFlateDecode([]byte("BT\n(08\\05515\\0552024) Tj\nET\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := testPDF(
+		"<< /Type /Page >>",
+		fmt.Sprintf("<< /Length %d /Filter [/ASCII85Decode /FlateDecode] /DecodeParms [<< /Predictor 12 >> null] >>\nstream\n%sendstream", len(encoded), encoded),
+	)
+
+	tree, err := NewAdapter().Parse(input, core.ParseOptions{Strict: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	streams := tree.Query(core.Match{Kind: KindStream, Meta: map[string]any{
+		"unsupported": "unsupported stream: /DecodeParms for /ASCII85Decode must be null",
+	}})
+	if len(streams) != 1 {
+		t.Fatalf("unsupported stream matches = %d, want 1", len(streams))
+	}
+
+	_, _, _, err = EditCanonical(input, core.Match{Kind: KindTextShow, Text: "08-15-2024"}, core.Mutation{Replace: "May 5, 2026"}, nil)
+	if err == nil {
+		t.Fatal("expected canonical edit to fail closed")
+	}
+	if !strings.Contains(err.Error(), "unsupported stream: /DecodeParms for /ASCII85Decode must be null") &&
+		!strings.Contains(err.Error(), `no nodes match kind="pdf.content.text_show" text="08-15-2024"`) {
+		t.Fatalf("canonical edit error = %v, want DecodeParms refusal or no editable node", err)
+	}
+}
+
 func TestFlateDecodePNGDecodeParmsRGBRewriteFailsWhenDecodedLengthIsPartialRow(t *testing.T) {
 	decoded := []byte("BT\n(ABCDEF) Tj\nET\n")
 	const (

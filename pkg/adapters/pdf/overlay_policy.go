@@ -90,6 +90,11 @@ func WithNoFallbackPolicy(report core.Report) core.Report {
 func WithFallbackPolicy(report core.Report, policy OverlayPolicy) core.Report {
 	policy = policy.normalized()
 	report.FallbackUsed = policy.UsesFallback()
+	if report.FallbackUsed {
+		report.FallbackKind = string(policy.Fallback)
+	} else {
+		report.FallbackKind = ""
+	}
 	report.FallbackPolicy = &core.FallbackPolicy{
 		Fallback: string(policy.Fallback),
 		Mode:     string(policy.Mode),

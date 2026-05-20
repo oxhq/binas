@@ -3,6 +3,7 @@ package pdf
 import (
 	"bytes"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/oxhq/binas/pkg/core"
@@ -52,6 +53,9 @@ func TestFontEncodingWinAnsiDecodesAndEditsHighByteHexText(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected unrepresentable WinAnsi replacement to fail closed")
 	}
+	if !strings.Contains(err.Error(), "not representable by the font encoding") {
+		t.Fatalf("error = %q, want font encoding representability refusal", err)
+	}
 }
 
 func TestFontEncodingWinAnsiDecodesLiteralText(t *testing.T) {
@@ -73,6 +77,14 @@ func TestFontEncodingWinAnsiDecodesLiteralText(t *testing.T) {
 	}
 	if matches[0].Meta["encoding"] != "literal-font-encoding" {
 		t.Fatalf("encoding meta = %v, want literal-font-encoding", matches[0].Meta["encoding"])
+	}
+
+	_, err = adapter.PlanEdit(tree, core.Match{Kind: KindTextShow, Text: fmt.Sprint(matches[0].Value)}, core.Mutation{Replace: "A☃"})
+	if err == nil {
+		t.Fatal("expected unrepresentable WinAnsi literal replacement to fail closed")
+	}
+	if !strings.Contains(err.Error(), "not representable by the font encoding") {
+		t.Fatalf("error = %q, want font encoding representability refusal", err)
 	}
 }
 

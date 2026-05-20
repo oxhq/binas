@@ -599,6 +599,11 @@ func (m pdfToUnicodeMap) DecodeHex(encoded []byte) (string, bool) {
 }
 
 func (m pdfToUnicodeMap) EncodeHex(text string) (string, bool) {
+	encoded, _, ok := m.EncodeHexWithMaxCodeBytes(text)
+	return encoded, ok
+}
+
+func (m pdfToUnicodeMap) EncodeHexWithMaxCodeBytes(text string) (string, int, bool) {
 	keys := make([]string, 0, len(m))
 	for encoded := range m {
 		keys = append(keys, encoded)
@@ -622,22 +627,27 @@ func (m pdfToUnicodeMap) EncodeHex(text string) (string, bool) {
 	})
 
 	var out strings.Builder
+	maxCodeBytes := 0
 	for len(text) > 0 {
 		matched := false
 		for _, decoded := range decodedKeys {
 			if decoded == "" || !strings.HasPrefix(text, decoded) {
 				continue
 			}
-			out.WriteString(reverse[decoded])
+			encoded := reverse[decoded]
+			out.WriteString(encoded)
+			if codeBytes := len(encoded) / 2; codeBytes > maxCodeBytes {
+				maxCodeBytes = codeBytes
+			}
 			text = text[len(decoded):]
 			matched = true
 			break
 		}
 		if !matched {
-			return "", false
+			return "", 0, false
 		}
 	}
-	return out.String(), true
+	return out.String(), maxCodeBytes, true
 }
 
 func decodeHexBytes(encoded []byte) ([]byte, bool) {

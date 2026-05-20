@@ -1718,9 +1718,14 @@ func TestCLIEditLayoutModePreserveWidthRejectsReflowRequiredPlan(t *testing.T) {
 	if err == nil {
 		t.Fatal("edit succeeded, want preserve-width layout refusal")
 	}
-	want := "layout mode preserve-width refused: layout_proof=reflow_required (expected width_proven)"
-	if err.Error() != want {
-		t.Fatalf("error = %q, want %q", err, want)
+	for _, want := range []string{
+		"unsupported PDF text replacement",
+		"layout_proof=reflow_required",
+		"width_delta_units=20",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, want substring %q", err, want)
+		}
 	}
 	if _, statErr := os.Stat(out); !os.IsNotExist(statErr) {
 		t.Fatalf("output file exists after refused preserve-width edit: %v", statErr)
@@ -1794,6 +1799,70 @@ func TestCLIEditRejectsUnknownRewriteMode(t *testing.T) {
 	if err.Error() != want {
 		t.Fatalf("error = %q, want %q", err, want)
 	}
+}
+
+func TestCLIOverlayTextWritesExplicitFallbackJSON(t *testing.T) {
+	path := writeFixture(t)
+	out := filepath.Join(t.TempDir(), "overlay.pdf")
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{
+			"overlay", "text", path,
+			"--format", "pdf",
+			"--page-index", "0",
+			"--text", "APPROVED",
+			"--x", "72",
+			"--y", "144",
+			"-o", out,
+			"--json",
+		})
+	})
+	var result struct {
+		Operation string `json:"operation"`
+		Report    struct {
+			Edit           string `json:"edit"`
+			FallbackUsed   bool   `json:"fallback_used"`
+			FallbackKind   string `json:"fallback_kind"`
+			FallbackPolicy struct {
+				Fallback string `json:"fallback"`
+				Mode     string `json:"mode"`
+			} `json:"fallback_policy"`
+			NodesModified int    `json:"nodes_modified"`
+			OutputPath    string `json:"output_path"`
+			Meta          struct {
+				PageIndex int    `json:"page_index"`
+				Operation string `json:"operation"`
+			} `json:"meta"`
+		} `json:"report"`
+		Verification struct {
+			ReparseOK     bool `json:"reparse_ok"`
+			NewSelectable bool `json:"new_text_selectable"`
+			PageUnchanged bool `json:"page_count_unchanged"`
+		} `json:"verification"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Operation != "pdf.overlay_explicit_stamp" || result.Report.Edit != "pdf.overlay_explicit_stamp" {
+		t.Fatalf("operation = %q report edit = %q, want explicit overlay stamp", result.Operation, result.Report.Edit)
+	}
+	if !result.Report.FallbackUsed || result.Report.FallbackKind != "overlay" || result.Report.FallbackPolicy.Fallback != "overlay" || result.Report.FallbackPolicy.Mode != "explicit" {
+		t.Fatalf("fallback = used %v policy %+v, want overlay/explicit", result.Report.FallbackUsed, result.Report.FallbackPolicy)
+	}
+	if result.Report.Meta.Operation != "overlay_stamp" || result.Report.Meta.PageIndex != 0 {
+		t.Fatalf("meta = %+v, want overlay operation metadata", result.Report.Meta)
+	}
+	if result.Report.NodesModified != 1 || result.Report.OutputPath != out {
+		t.Fatalf("report = %+v, want one modified node and output path", result.Report)
+	}
+	if !result.Verification.ReparseOK || !result.Verification.NewSelectable || !result.Verification.PageUnchanged {
+		t.Fatalf("verification = %+v, want reparse/selectable/page unchanged", result.Verification)
+	}
+
+	queryOut := captureStdout(t, func() error {
+		return run([]string{"query", out, "--format", "pdf", "--kind", "pdf.content.text_show", "--text", "APPROVED", "--json"})
+	})
+	assertCLIQueryCount(t, queryOut, 1)
 }
 
 func TestCLIEditPreserveStructureTableXrefUsesAdapterWriterMode(t *testing.T) {

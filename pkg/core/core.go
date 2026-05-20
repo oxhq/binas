@@ -163,6 +163,7 @@ type Report struct {
 	Format         string          `json:"format"`
 	Edit           string          `json:"edit,omitempty"`
 	FallbackUsed   bool            `json:"fallback_used"`
+	FallbackKind   string          `json:"fallback_kind,omitempty"`
 	FallbackPolicy *FallbackPolicy `json:"fallback_policy,omitempty"`
 	NodesModified  int             `json:"nodes_modified"`
 	MatchIndex     *int            `json:"match_index,omitempty"`

@@ -179,11 +179,14 @@ func (Adapter) PlanEdit(tree *core.Tree, selector core.Match, mutation core.Muta
 	if !ok || oldEncoded == "" {
 		return nil, errors.New("matched text node has no editable encoded span")
 	}
-	newEncoded, err := encodeTextShowReplacement(target, mutation.Replace)
+	newEncoded, replacementProof, err := encodeTextShowReplacement(target, mutation.Replace)
 	if err != nil {
 		return nil, err
 	}
 	layoutProofMeta := textShowReplacementLayoutProofMetadata(target.Meta, newEncoded)
+	if err := rejectUnsupportedTextReplacementLayout(layoutProofMeta, replacementProof); err != nil {
+		return nil, err
+	}
 	if filter, _ := target.Meta["stream_filter"].(string); !isPassthroughPDFStreamFilter(filter) {
 		decodeParms, _ := target.Meta["stream_decode_parms"].(string)
 		streamBytes, ok := target.Meta["stream_encoded"].([]byte)
@@ -1542,61 +1545,68 @@ func (ctx textShowContext) fontEncodingForFont(font string) *pdfSimpleFontEncodi
 	return nil
 }
 
-func encodeTextShowReplacement(target core.Node, replacement string) (string, error) {
+func encodeTextShowReplacement(target core.Node, replacement string) (string, textReplacementEncodingProof, error) {
 	encoding, _ := target.Meta["encoding"].(string)
 	switch encoding {
 	case "", "literal":
-		return encodeLiteralString(replacement), nil
+		return encodeLiteralString(replacement), textReplacementEncodingProof{}, nil
 	case "tj-array":
-		return "[(" + encodeLiteralString(replacement) + ")]", nil
+		return "[(" + encodeLiteralString(replacement) + ")]", textReplacementEncodingProof{}, nil
 	case "tj-array-cmap":
 		cmap, _ := target.Meta["cmap"].(*toUnicodeCMap)
-		encoded, ok := cmap.EncodeHex(replacement)
-		if !ok {
-			return "", errors.New("replacement for ToUnicode TJ array text is not representable by the CMap")
+		if cmap == nil {
+			return "", textReplacementEncodingProof{}, errors.New("matched text node has no ToUnicode CMap")
 		}
-		return "[<" + encoded + ">]", nil
+		encoded, maxCodeBytes, ok := cmap.EncodeHexWithMaxCodeBytes(replacement)
+		if !ok {
+			return "", textReplacementEncodingProof{}, errors.New("replacement for ToUnicode TJ array text is not representable by the CMap")
+		}
+		return "[<" + encoded + ">]", textReplacementEncodingProof{CMapReverseEncoded: true, MaxCMapCodeBytes: maxCodeBytes}, nil
 	case "tj-array-font-encoding":
 		fontEncoding, _ := target.Meta["font_encoding"].(*pdfSimpleFontEncoding)
 		if fontEncoding == nil {
-			return "", errors.New("matched text node has no simple font encoding")
+			return "", textReplacementEncodingProof{}, errors.New("matched text node has no simple font encoding")
 		}
 		encoded, ok := fontEncoding.EncodeHex(replacement)
 		if !ok {
-			return "", errors.New("replacement for simple font encoded TJ array text is not representable by the font encoding")
+			return "", textReplacementEncodingProof{}, errors.New("replacement for simple font encoded TJ array text is not representable by the font encoding")
 		}
-		return "[<" + encoded + ">]", nil
+		return "[<" + encoded + ">]", textReplacementEncodingProof{}, nil
 	case "hex":
-		return encodeHexTextString(replacement)
+		encoded, err := encodeHexTextString(replacement)
+		return encoded, textReplacementEncodingProof{}, err
 	case "hex-cmap":
 		cmap, _ := target.Meta["cmap"].(*toUnicodeCMap)
-		encoded, ok := cmap.EncodeHex(replacement)
-		if !ok {
-			return "", errors.New("replacement for ToUnicode hex text show operand is not representable by the CMap")
+		if cmap == nil {
+			return "", textReplacementEncodingProof{}, errors.New("matched text node has no ToUnicode CMap")
 		}
-		return encoded, nil
+		encoded, maxCodeBytes, ok := cmap.EncodeHexWithMaxCodeBytes(replacement)
+		if !ok {
+			return "", textReplacementEncodingProof{}, errors.New("replacement for ToUnicode hex text show operand is not representable by the CMap")
+		}
+		return encoded, textReplacementEncodingProof{CMapReverseEncoded: true, MaxCMapCodeBytes: maxCodeBytes}, nil
 	case "hex-font-encoding":
 		fontEncoding, _ := target.Meta["font_encoding"].(*pdfSimpleFontEncoding)
 		if fontEncoding == nil {
-			return "", errors.New("matched text node has no simple font encoding")
+			return "", textReplacementEncodingProof{}, errors.New("matched text node has no simple font encoding")
 		}
 		encoded, ok := fontEncoding.EncodeHex(replacement)
 		if !ok {
-			return "", errors.New("replacement for simple font encoded hex text show operand is not representable by the font encoding")
+			return "", textReplacementEncodingProof{}, errors.New("replacement for simple font encoded hex text show operand is not representable by the font encoding")
 		}
-		return encoded, nil
+		return encoded, textReplacementEncodingProof{}, nil
 	case "literal-font-encoding":
 		fontEncoding, _ := target.Meta["font_encoding"].(*pdfSimpleFontEncoding)
 		if fontEncoding == nil {
-			return "", errors.New("matched text node has no simple font encoding")
+			return "", textReplacementEncodingProof{}, errors.New("matched text node has no simple font encoding")
 		}
 		encoded, ok := fontEncoding.EncodeBytes(replacement)
 		if !ok {
-			return "", errors.New("replacement for simple font encoded literal text show operand is not representable by the font encoding")
+			return "", textReplacementEncodingProof{}, errors.New("replacement for simple font encoded literal text show operand is not representable by the font encoding")
 		}
-		return encodeLiteralBytes(encoded), nil
+		return encodeLiteralBytes(encoded), textReplacementEncodingProof{}, nil
 	default:
-		return "", fmt.Errorf("unsupported text show operand encoding %q", encoding)
+		return "", textReplacementEncodingProof{}, fmt.Errorf("unsupported text show operand encoding %q", encoding)
 	}
 }
 

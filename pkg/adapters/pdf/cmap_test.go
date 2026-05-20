@@ -3,6 +3,7 @@ package pdf
 import (
 	"bytes"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/oxhq/binas/pkg/core"
@@ -75,6 +76,14 @@ func TestCMapSingleToUnicodeMapDecodesAndEditsHexTextShow(t *testing.T) {
 	}
 	if !verification.ReparseOK || !verification.OldTextRemoved || !verification.NewSelectable || !verification.PageUnchanged {
 		t.Fatalf("verification failed: %+v", verification)
+	}
+
+	_, err = adapter.PlanEdit(tree, core.Match{Kind: KindTextShow, Text: "HELLO"}, core.Mutation{Replace: "HELLO!"})
+	if err == nil {
+		t.Fatal("expected unrepresentable CMap replacement to fail closed")
+	}
+	if !strings.Contains(err.Error(), "not representable by the CMap") {
+		t.Fatalf("error = %q, want CMap representability refusal", err)
 	}
 }
 
@@ -203,6 +212,73 @@ func TestCMapEncodeHexUsesLongestDecodedTextMapping(t *testing.T) {
 	}
 	if encoded != "0104" {
 		t.Fatalf("encoded = %q, want longest mapping 0104", encoded)
+	}
+}
+
+func TestCMapEncodeHexReportsMaxCodeBytes(t *testing.T) {
+	cmap := pdfToUnicodeMap{
+		"0001": "A",
+		"02":   "B",
+	}
+	encoded, maxCodeBytes, ok := cmap.EncodeHexWithMaxCodeBytes("AB")
+	if !ok {
+		t.Fatal("expected mapped text to encode")
+	}
+	if encoded != "000102" {
+		t.Fatalf("encoded = %q, want 000102", encoded)
+	}
+	if maxCodeBytes != 2 {
+		t.Fatalf("maxCodeBytes = %d, want 2", maxCodeBytes)
+	}
+}
+
+func TestCMapMultiByteReverseEncodingWithoutLayoutProofFailsClosed(t *testing.T) {
+	content := []byte("BT\n/F1 12 Tf\n<0001> Tj\nET\n")
+	input := testPDF(
+		"<< /Type /Catalog >>",
+		"<< /Type /Page /Contents 4 0 R /Resources << /Font << /F1 3 0 R >> >> >>",
+		"<< /Type /Font /Subtype /Type0 /Encoding /Identity-H /ToUnicode 5 0 R >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
+		testTwoCIDToUnicodeCMapStream(),
+	)
+
+	adapter := NewAdapter()
+	tree, err := adapter.Parse(input, core.ParseOptions{Strict: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if matches := tree.Query(core.Match{Kind: KindTextShow, Text: "A"}); len(matches) != 1 {
+		t.Fatalf("A matches = %d, want 1", len(matches))
+	}
+	_, err = adapter.PlanEdit(tree, core.Match{Kind: KindTextShow, Text: "A"}, core.Mutation{Replace: "B"})
+	if err == nil {
+		t.Fatal("expected unsupported multi-byte CMap reverse encoding to fail closed")
+	}
+	for _, want := range []string{"multi-byte CMap reverse encoding", "layout_proof=unknown", "max_cmap_code_bytes=2"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, want %q", err, want)
+		}
+	}
+}
+
+func TestCMapCanonicalMultiByteReverseEncodingWithoutLayoutProofFailsClosed(t *testing.T) {
+	content := []byte("BT\n/F1 12 Tf\n<0001> Tj\nET\n")
+	input := testPDF(
+		"<< /Type /Catalog >>",
+		"<< /Type /Page /Contents 4 0 R /Resources << /Font << /F1 3 0 R >> >> >>",
+		"<< /Type /Font /Subtype /Type0 /Encoding /Identity-H /ToUnicode 5 0 R >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
+		testTwoCIDToUnicodeCMapStream(),
+	)
+
+	_, _, _, err := ApplyCanonicalEdit(input, core.Match{Kind: KindTextShow, Text: "A"}, core.Mutation{Replace: "B"}, nil)
+	if err == nil {
+		t.Fatal("expected canonical multi-byte CMap reverse encoding to fail closed")
+	}
+	for _, want := range []string{"multi-byte CMap reverse encoding", "layout_proof=unknown", "max_cmap_code_bytes=2"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, want %q", err, want)
+		}
 	}
 }
 

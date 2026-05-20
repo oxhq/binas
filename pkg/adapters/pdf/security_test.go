@@ -64,6 +64,65 @@ func TestSecurityPasswordOptionFailsUnsupportedEncryptionAlgorithmWithMetadata(t
 	}
 }
 
+func TestSecurityMetadataReportsAESV3CryptFiltersWithoutSecrets(t *testing.T) {
+	zero32 := strings.Repeat("00", 32)
+	input := testPDF(
+		"<< /Type /Catalog /Encrypt 2 0 R >>",
+		fmt.Sprintf("<< /Filter /Standard /V 5 /R 6 /Length 256 /O <%s> /U <%s> /P -4 /StmF /StdCF /StrF /StdCF /EFF /StdCF /CF << /StdCF << /CFM /AESV3 /Length 256 /AuthEvent /DocOpen >> >> >>", zero32, zero32),
+	)
+
+	metadata := SecurityMetadataForInput(input)
+	if !metadata.Encrypted || metadata.Encryption == nil {
+		t.Fatalf("security metadata = %+v, want encrypted metadata", metadata)
+	}
+	encryption := metadata.Encryption
+	if encryption.V == nil || *encryption.V != 5 || encryption.R == nil || *encryption.R != 6 || encryption.Length == nil || *encryption.Length != 256 {
+		t.Fatalf("encryption metadata = %+v, want V=5 R=6 Length=256", encryption)
+	}
+	if encryption.StreamFilter != "StdCF" || encryption.StringFilter != "StdCF" || encryption.EmbeddedFileFilter != "StdCF" {
+		t.Fatalf("crypt filter selectors = StmF %q StrF %q EFF %q, want StdCF", encryption.StreamFilter, encryption.StringFilter, encryption.EmbeddedFileFilter)
+	}
+	if len(encryption.CryptFilters) != 1 {
+		t.Fatalf("crypt filters = %+v, want one StdCF entry", encryption.CryptFilters)
+	}
+	filter := encryption.CryptFilters[0]
+	if filter.Name != "StdCF" || filter.CFM != "AESV3" || filter.AuthEvent != "DocOpen" || filter.Length == nil || *filter.Length != 256 {
+		t.Fatalf("crypt filter metadata = %+v, want StdCF AESV3 DocOpen Length=256", filter)
+	}
+
+	err := CheckSecurity(input, SecurityOptions{Password: "secret"})
+	if !errors.Is(err, ErrEncryptedPDFUnsupportedAlgorithm) {
+		t.Fatalf("CheckSecurity() error = %v, want ErrEncryptedPDFUnsupportedAlgorithm", err)
+	}
+	if got := err.Error(); strings.Contains(got, "secret") || !strings.Contains(got, "CF.StdCF(CFM=AESV3") {
+		t.Fatalf("error = %q, want AESV3 metadata without password leakage", got)
+	}
+}
+
+func TestSecurityMetadataReportsPublicKeyEncryptionBoundary(t *testing.T) {
+	input := testPDF(
+		"<< /Type /Catalog /Encrypt 2 0 R >>",
+		"<< /Filter /Adobe.PubSec /SubFilter /adbe.pkcs7.s5 /V 4 /R 4 /Length 128 /Recipients [<01020304>] >>",
+	)
+
+	metadata := SecurityMetadataForInput(input)
+	if !metadata.Encrypted || metadata.Encryption == nil {
+		t.Fatalf("security metadata = %+v, want encrypted metadata", metadata)
+	}
+	encryption := metadata.Encryption
+	if encryption.Filter != "Adobe.PubSec" || encryption.SubFilter != "adbe.pkcs7.s5" {
+		t.Fatalf("encryption metadata = %+v, want public-key filter/subfilter", encryption)
+	}
+
+	err := CheckSecurity(input, SecurityOptions{Password: "unused"})
+	if !errors.Is(err, ErrEncryptedPDFUnsupportedAlgorithm) {
+		t.Fatalf("CheckSecurity() error = %v, want ErrEncryptedPDFUnsupportedAlgorithm", err)
+	}
+	if got := err.Error(); strings.Contains(got, "01020304") || !strings.Contains(got, "Filter=Adobe.PubSec") || !strings.Contains(got, "SubFilter=adbe.pkcs7.s5") {
+		t.Fatalf("error = %q, want public-key metadata without recipient bytes", got)
+	}
+}
+
 func TestSecurityPasswordOptionAcceptsSupportedStandardRC4(t *testing.T) {
 	input := standardEncryptedTextFixture(t, "08-15-2024")
 

@@ -237,6 +237,8 @@ func buildBasicAnnotationAppearance(candidate annotationCandidate, contents stri
 	switch subtype {
 	case "Text", "FreeText":
 		return basicAnnotationAppearanceStream(width, height, contents)
+	case "Link":
+		return basicLinkAnnotationAppearanceStream(candidate.Dict, candidate.Index, width, height)
 	case "Square", "Circle":
 		return basicShapeAnnotationAppearanceStream(subtype, width, height, annotationNumericArray(candidate.Dict, "C")), nil
 	case "Highlight", "Underline", "StrikeOut":
@@ -273,6 +275,48 @@ func basicAnnotationAppearanceStream(width, height float64, contents string) (pd
 					},
 				},
 			},
+		},
+		Data: []byte(data.String()),
+	}, nil
+}
+
+func basicLinkAnnotationAppearanceStream(dict pdfDict, annotationIndex int, width, height float64) (pdfStreamObject, error) {
+	if _, ok := dict["BS"]; ok {
+		return pdfStreamObject{}, fmt.Errorf("cannot regenerate annotation appearance: annotation %d has unsupported /BS border style", annotationIndex)
+	}
+	if annotationHasJavaScriptAction(dict) {
+		return pdfStreamObject{}, fmt.Errorf("cannot regenerate annotation appearance: annotation %d has unsupported JavaScript action", annotationIndex)
+	}
+	borderWidth, err := annotationLinkBorderWidth(dict, annotationIndex)
+	if err != nil {
+		return pdfStreamObject{}, err
+	}
+	color, err := annotationLinkColor(dict, annotationIndex)
+	if err != nil {
+		return pdfStreamObject{}, err
+	}
+
+	var data strings.Builder
+	data.WriteString("q\n")
+	if borderWidth > 0 {
+		fmt.Fprintf(&data, "%s w\n", pdfNumberToken(borderWidth))
+		writeBasicAnnotationStrokeColor(&data, color)
+		inset := borderWidth / 2
+		rectWidth := width - borderWidth
+		rectHeight := height - borderWidth
+		if rectWidth <= 0 || rectHeight <= 0 {
+			return pdfStreamObject{}, fmt.Errorf("cannot regenerate annotation appearance: annotation %d has /Border width larger than /Rect", annotationIndex)
+		}
+		fmt.Fprintf(&data, "%s %s %s %s re S\n", pdfNumberToken(inset), pdfNumberToken(inset), pdfNumberToken(rectWidth), pdfNumberToken(rectHeight))
+	}
+	data.WriteString("Q")
+
+	return pdfStreamObject{
+		Dict: pdfDict{
+			"Type":     pdfName("XObject"),
+			"Subtype":  pdfName("Form"),
+			"FormType": 1,
+			"BBox":     pdfArray{0, 0, width, height},
 		},
 		Data: []byte(data.String()),
 	}, nil
@@ -777,20 +821,71 @@ func annotationRect(dict pdfDict) []float64 {
 	return rect
 }
 
+func annotationLinkBorderWidth(dict pdfDict, annotationIndex int) (float64, error) {
+	value, ok := dict["Border"]
+	if !ok {
+		return 1, nil
+	}
+	border, ok := annotationDirectNumericArrayValue(value)
+	if !ok || len(border) != 3 {
+		return 0, fmt.Errorf("cannot regenerate annotation appearance: annotation %d has unsupported /Border", annotationIndex)
+	}
+	if border[2] < 0 {
+		return 0, fmt.Errorf("cannot regenerate annotation appearance: annotation %d has negative /Border width", annotationIndex)
+	}
+	return border[2], nil
+}
+
+func annotationLinkColor(dict pdfDict, annotationIndex int) ([]float64, error) {
+	value, ok := dict["C"]
+	if !ok {
+		return nil, nil
+	}
+	color, ok := annotationDirectNumericArrayValue(value)
+	if !ok || (len(color) != 1 && len(color) != 3) {
+		return nil, fmt.Errorf("cannot regenerate annotation appearance: annotation %d has unsupported /C color", annotationIndex)
+	}
+	return color, nil
+}
+
+func annotationHasJavaScriptAction(dict pdfDict) bool {
+	if _, ok := dict["AA"]; ok {
+		return true
+	}
+	action, ok := dict["A"].(pdfDict)
+	if !ok {
+		return false
+	}
+	subtype, ok := action["S"].(pdfName)
+	return ok && subtype == "JavaScript"
+}
+
 func annotationNumericArray(dict pdfDict, key string) []float64 {
 	value, ok := dict[key].(pdfArray)
-	if !ok || len(value) == 0 {
+	if !ok {
 		return nil
 	}
-	numbers := make([]float64, 0, len(value))
-	for _, item := range value {
+	numbers, ok := annotationDirectNumericArrayValue(value)
+	if !ok || len(numbers) == 0 {
+		return nil
+	}
+	return numbers
+}
+
+func annotationDirectNumericArrayValue(value pdfValue) ([]float64, bool) {
+	array, ok := value.(pdfArray)
+	if !ok {
+		return nil, false
+	}
+	numbers := make([]float64, 0, len(array))
+	for _, item := range array {
 		number, ok := pdfNumericValue(item)
 		if !ok {
-			return nil
+			return nil, false
 		}
 		numbers = append(numbers, number)
 	}
-	return numbers
+	return numbers, true
 }
 
 func annotationQuadPointsCount(dict pdfDict) int {

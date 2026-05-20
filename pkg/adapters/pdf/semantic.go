@@ -43,6 +43,13 @@ type XFAPacketListOptions struct {
 	Selector XFASelector
 }
 
+type XFADatasetField struct {
+	PacketIndex int    `json:"packet_index"`
+	Label       string `json:"label,omitempty"`
+	Path        string `json:"path"`
+	Value       string `json:"value"`
+}
+
 type XFAReplaceOptions struct {
 	MatchIndex *int
 	Selector   XFASelector

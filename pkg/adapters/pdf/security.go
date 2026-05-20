@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -35,16 +36,27 @@ type SecurityMetadata struct {
 }
 
 type EncryptionMetadata struct {
-	Present          bool   `json:"present"`
-	Filter           string `json:"filter,omitempty"`
-	V                *int   `json:"v,omitempty"`
-	R                *int   `json:"r,omitempty"`
-	Length           *int   `json:"length,omitempty"`
-	EncryptMetadata  *bool  `json:"encrypt_metadata,omitempty"`
-	SubFilter        string `json:"sub_filter,omitempty"`
-	ObjectNumber     *int   `json:"object_number,omitempty"`
-	ObjectGeneration *int   `json:"object_generation,omitempty"`
-	DictionaryParsed bool   `json:"dictionary_parsed"`
+	Present            bool                    `json:"present"`
+	Filter             string                  `json:"filter,omitempty"`
+	V                  *int                    `json:"v,omitempty"`
+	R                  *int                    `json:"r,omitempty"`
+	Length             *int                    `json:"length,omitempty"`
+	EncryptMetadata    *bool                   `json:"encrypt_metadata,omitempty"`
+	SubFilter          string                  `json:"sub_filter,omitempty"`
+	StreamFilter       string                  `json:"stream_filter,omitempty"`
+	StringFilter       string                  `json:"string_filter,omitempty"`
+	EmbeddedFileFilter string                  `json:"embedded_file_filter,omitempty"`
+	CryptFilters       []EncryptionCryptFilter `json:"crypt_filters,omitempty"`
+	ObjectNumber       *int                    `json:"object_number,omitempty"`
+	ObjectGeneration   *int                    `json:"object_generation,omitempty"`
+	DictionaryParsed   bool                    `json:"dictionary_parsed"`
+}
+
+type EncryptionCryptFilter struct {
+	Name      string `json:"name"`
+	CFM       string `json:"cfm,omitempty"`
+	AuthEvent string `json:"auth_event,omitempty"`
+	Length    *int   `json:"length,omitempty"`
 }
 
 type SignatureMetadata struct {
@@ -259,6 +271,18 @@ func applyEncryptionDictMetadata(metadata *EncryptionMetadata, dict pdfDict) {
 	if value, ok := dict["EncryptMetadata"].(bool); ok {
 		metadata.EncryptMetadata = &value
 	}
+	if name, ok := dictPDFName(dict, "StmF"); ok {
+		metadata.StreamFilter = name
+	}
+	if name, ok := dictPDFName(dict, "StrF"); ok {
+		metadata.StringFilter = name
+	}
+	if name, ok := dictPDFName(dict, "EFF"); ok {
+		metadata.EmbeddedFileFilter = name
+	}
+	if cf, ok := dict["CF"].(pdfDict); ok {
+		metadata.CryptFilters = encryptionCryptFilterMetadata(cf)
+	}
 }
 
 func dictPDFName(dict pdfDict, key string) (string, bool) {
@@ -289,10 +313,68 @@ func (m EncryptionMetadata) summaryParts() []string {
 	if m.SubFilter != "" {
 		parts = append(parts, "SubFilter="+m.SubFilter)
 	}
+	if m.StreamFilter != "" {
+		parts = append(parts, "StmF="+m.StreamFilter)
+	}
+	if m.StringFilter != "" {
+		parts = append(parts, "StrF="+m.StringFilter)
+	}
+	if m.EmbeddedFileFilter != "" {
+		parts = append(parts, "EFF="+m.EmbeddedFileFilter)
+	}
+	for _, filter := range m.CryptFilters {
+		if filter.Name == "" {
+			continue
+		}
+		label := "CF." + filter.Name
+		values := make([]string, 0, 3)
+		if filter.CFM != "" {
+			values = append(values, "CFM="+filter.CFM)
+		}
+		if filter.AuthEvent != "" {
+			values = append(values, "AuthEvent="+filter.AuthEvent)
+		}
+		if filter.Length != nil {
+			values = append(values, fmt.Sprintf("Length=%d", *filter.Length))
+		}
+		if len(values) > 0 {
+			parts = append(parts, label+"("+strings.Join(values, ",")+")")
+		} else {
+			parts = append(parts, label)
+		}
+	}
 	if m.ObjectNumber != nil && m.ObjectGeneration != nil {
 		parts = append(parts, fmt.Sprintf("Object=%d %d R", *m.ObjectNumber, *m.ObjectGeneration))
 	}
 	return parts
+}
+
+func encryptionCryptFilterMetadata(cf pdfDict) []EncryptionCryptFilter {
+	if len(cf) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(cf))
+	for name := range cf {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	filters := make([]EncryptionCryptFilter, 0, len(names))
+	for _, name := range names {
+		filter := EncryptionCryptFilter{Name: name}
+		if dict, ok := cf[name].(pdfDict); ok {
+			if cfm, ok := dictPDFName(dict, "CFM"); ok {
+				filter.CFM = cfm
+			}
+			if authEvent, ok := dictPDFName(dict, "AuthEvent"); ok {
+				filter.AuthEvent = authEvent
+			}
+			if length, ok := dictInt(dict, "Length"); ok {
+				filter.Length = &length
+			}
+		}
+		filters = append(filters, filter)
+	}
+	return filters
 }
 
 type signatureByteRange struct {

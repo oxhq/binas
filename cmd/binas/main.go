@@ -22,7 +22,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("expected command: inspect, query, edit, form, annot, xfa, validate")
+		return errors.New("expected command: inspect, query, edit, overlay, form, annot, xfa, validate")
 	}
 	switch args[0] {
 	case "inspect":
@@ -31,6 +31,8 @@ func run(args []string) error {
 		return query(args[1:])
 	case "edit":
 		return edit(args[1:])
+	case "overlay":
+		return overlay(args[1:])
 	case "form":
 		return form(args[1:])
 	case "annot":
@@ -42,6 +44,74 @@ func run(args []string) error {
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func overlay(args []string) error {
+	if len(args) == 0 {
+		return errors.New("expected overlay command: text")
+	}
+	switch args[0] {
+	case "text":
+		return overlayText(args[1:])
+	default:
+		return fmt.Errorf("unknown overlay command %q", args[0])
+	}
+}
+
+func overlayText(args []string) error {
+	fs := flag.NewFlagSet("overlay text", flag.ContinueOnError)
+	format := fs.String("format", "pdf", "input format")
+	pageIndex := fs.Int("page-index", 0, "zero-based page index")
+	text := fs.String("text", "", "overlay text")
+	x := fs.Float64("x", 0, "overlay x position")
+	y := fs.Float64("y", 0, "overlay y position")
+	fontSize := fs.Float64("font-size", 12, "overlay font size")
+	outputPath := fs.String("o", "", "output file")
+	asJSON := fs.Bool("json", false, "write JSON")
+	if err := fs.Parse(reorderFlags(args, map[string]bool{"json": true}, map[string]bool{"format": true, "page-index": true, "text": true, "x": true, "y": true, "font-size": true, "o": true})); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("overlay text requires one input file")
+	}
+	if strings.ToLower(*format) != "pdf" {
+		return fmt.Errorf("overlay text is unsupported for format %q", *format)
+	}
+	if *text == "" {
+		return errors.New("overlay text requires --text")
+	}
+	if *outputPath == "" {
+		return errors.New("overlay text requires -o")
+	}
+	input, err := os.ReadFile(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	output, report, verification, err := pdf.ApplyExplicitOverlayStamp(input, pdf.ExplicitOverlayStampOptions{
+		PageIndex: *pageIndex,
+		Text:      *text,
+		X:         *x,
+		Y:         *y,
+		FontSize:  *fontSize,
+	})
+	if err != nil {
+		return err
+	}
+	return writeOverlayTextResult(output, report, verification, *outputPath, *asJSON)
+}
+
+func writeOverlayTextResult(output []byte, report core.Report, verification core.Verification, outputPath string, asJSON bool) error {
+	if err := os.WriteFile(outputPath, output, 0644); err != nil {
+		return err
+	}
+	report.OutputPath = outputPath
+	report.Verification = &verification
+	result := map[string]any{"operation": report.Edit, "report": report, "verification": verification}
+	if asJSON {
+		return writeJSON(result)
+	}
+	fmt.Println("overlaid", strconv.Quote(outputPath))
+	return nil
 }
 
 func form(args []string) error {

@@ -207,6 +207,89 @@ func TestApplyAnnotationContentsEditCanRegenerateCircleAppearance(t *testing.T) 
 	}
 }
 
+func TestApplyAnnotationContentsEditCanRegenerateLinkBorderAppearance(t *testing.T) {
+	input := testPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Page /Annots [3 0 R] >>",
+		"<< /Type /Annot /Subtype /Link /Rect [10 20 50 40] /Contents (old link) /Border [0 0 2.5] /C [0 0 1] /A << /S /URI /URI (https://example.test) >> >>",
+	)
+
+	output, report, verification, err := ApplyAnnotationContentsEdit(input, 0, "fresh link", AnnotationContentsEditOptions{
+		RegenerateAppearance: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !report.AppearanceRegenerated || report.AppearanceInvalidated || report.AppearanceRemoved {
+		t.Fatalf("appearance report = regenerated %v invalidated %v removed %v note %q", report.AppearanceRegenerated, report.AppearanceInvalidated, report.AppearanceRemoved, report.AppearanceNote)
+	}
+	if !verification.ReparseOK || !verification.ContentsUpdated || !verification.PageUnchanged || !verification.AppearanceRegenerated || verification.AppearanceInvalidated || verification.AppearanceRemoved {
+		t.Fatalf("verification = %+v", verification)
+	}
+
+	stream := annotationCandidateNormalAppearanceStream(t, output, 0)
+	got := string(stream.Data)
+	for _, want := range []string{
+		"2.5 w",
+		"0 0 1 RG",
+		"1.25 1.25 37.5 17.5 re S",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("link appearance missing %q in %q", want, got)
+		}
+	}
+	if bbox := stream.Dict["BBox"].(pdfArray); len(bbox) != 4 || fmt.Sprint(bbox[2]) != "40" || fmt.Sprint(bbox[3]) != "20" {
+		t.Fatalf("link BBox = %+v, want width 40 height 20", bbox)
+	}
+	if !bytes.Contains(output, []byte("/A << /S /URI /URI (https://example.test) >>")) {
+		t.Fatalf("link URI action was not preserved:\n%s", output)
+	}
+}
+
+func TestApplyAnnotationContentsEditRegenerateLinkAppearanceFailsClosedForUnsupportedVisualInputs(t *testing.T) {
+	tests := []struct {
+		name    string
+		annot   string
+		wantErr string
+	}{
+		{
+			name:    "border style dictionary",
+			annot:   "<< /Type /Annot /Subtype /Link /Rect [0 0 20 10] /Contents (old link) /Border [0 0 1] /BS << /W 1 /S /D >> >>",
+			wantErr: "unsupported /BS",
+		},
+		{
+			name:    "dashed border array",
+			annot:   "<< /Type /Annot /Subtype /Link /Rect [0 0 20 10] /Contents (old link) /Border [0 0 1 [3]] >>",
+			wantErr: "unsupported /Border",
+		},
+		{
+			name:    "javascript action",
+			annot:   "<< /Type /Annot /Subtype /Link /Rect [0 0 20 10] /Contents (old link) /Border [0 0 1] /A << /S /JavaScript /JS (app.alert('x')) >> >>",
+			wantErr: "unsupported JavaScript action",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := testPDF(
+				"<< /Type /Catalog /Pages 2 0 R >>",
+				"<< /Type /Page /Annots [3 0 R] >>",
+				tt.annot,
+			)
+
+			_, _, _, err := ApplyAnnotationContentsEdit(input, 0, "fresh link", AnnotationContentsEditOptions{
+				RegenerateAppearance: true,
+			})
+			if err == nil {
+				t.Fatal("expected regenerate appearance to fail")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %q, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestApplyAnnotationContentsEditCanRegenerateHighlightAppearance(t *testing.T) {
 	input := testPDF(
 		"<< /Type /Catalog /Pages 2 0 R >>",

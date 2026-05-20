@@ -2,6 +2,7 @@ package pdf
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/oxhq/binas/pkg/core"
@@ -122,7 +123,7 @@ func TestPlanEditReportsReplacementWidthProofForSimpleFont(t *testing.T) {
 	}
 }
 
-func TestPlanEditReportsReplacementWidthReflowRequiredForSimpleFont(t *testing.T) {
+func TestPlanEditFailsClosedWhenSimpleFontReplacementRequiresReflow(t *testing.T) {
 	content := []byte("BT\n/F1 12 Tf\n(AA) Tj\nET\n")
 	input := testPDF(
 		"<< /Type /Catalog >>",
@@ -135,14 +136,14 @@ func TestPlanEditReportsReplacementWidthReflowRequiredForSimpleFont(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan, err := NewAdapter().PlanEdit(tree, core.Match{Kind: KindTextShow, Text: "AA"}, core.Mutation{Replace: "BB"})
-	if err != nil {
-		t.Fatal(err)
+	_, err = NewAdapter().PlanEdit(tree, core.Match{Kind: KindTextShow, Text: "AA"}, core.Mutation{Replace: "BB"})
+	if err == nil {
+		t.Fatal("expected replacement requiring reflow to fail closed")
 	}
-	if plan.Meta["layout_proof"] != layoutProofStatusReflowRequired {
-		t.Fatalf("plan layout_proof = %v, want %q; meta=%+v", plan.Meta["layout_proof"], layoutProofStatusReflowRequired, plan.Meta)
-	}
-	if plan.Meta["old_width_units"] != 1200 || plan.Meta["new_width_units"] != 1220 || plan.Meta["width_delta_units"] != 20 {
-		t.Fatalf("plan width proof meta = %+v, want delta 20", plan.Meta)
+	got := err.Error()
+	for _, want := range []string{"layout_proof=reflow_required", "old_width_units=1200", "new_width_units=1220", "width_delta_units=20"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("error = %q, want metadata %q", got, want)
+		}
 	}
 }

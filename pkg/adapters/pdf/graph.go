@@ -1104,9 +1104,15 @@ func encodeCanonicalTextReplacement(show parsedTextShow, replacement string) (st
 	case "tj-array":
 		return "[(" + encodeLiteralString(replacement) + ")]", nil
 	case "tj-array-cmap":
-		encoded, ok := show.CMap.EncodeHex(replacement)
+		if show.CMap == nil {
+			return "", errors.New("matched text show has no ToUnicode CMap")
+		}
+		encoded, maxCodeBytes, ok := show.CMap.EncodeHexWithMaxCodeBytes(replacement)
 		if !ok {
 			return "", errors.New("replacement for ToUnicode TJ array text is not representable by the CMap")
+		}
+		if err := rejectUnsupportedTextReplacementLayout(nil, textReplacementEncodingProof{CMapReverseEncoded: true, MaxCMapCodeBytes: maxCodeBytes}); err != nil {
+			return "", err
 		}
 		return "[<" + encoded + ">]", nil
 	case "tj-array-font-encoding":
@@ -1121,9 +1127,15 @@ func encodeCanonicalTextReplacement(show parsedTextShow, replacement string) (st
 	case "hex":
 		return encodeHexTextString(replacement)
 	case "hex-cmap":
-		encoded, ok := show.CMap.EncodeHex(replacement)
+		if show.CMap == nil {
+			return "", errors.New("matched text show has no ToUnicode CMap")
+		}
+		encoded, maxCodeBytes, ok := show.CMap.EncodeHexWithMaxCodeBytes(replacement)
 		if !ok {
 			return "", errors.New("replacement for ToUnicode hex text show operand is not representable by the CMap")
+		}
+		if err := rejectUnsupportedTextReplacementLayout(nil, textReplacementEncodingProof{CMapReverseEncoded: true, MaxCMapCodeBytes: maxCodeBytes}); err != nil {
+			return "", err
 		}
 		return encoded, nil
 	case "hex-font-encoding":
