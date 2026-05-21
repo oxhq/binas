@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/oxhq/binas/pkg/core"
@@ -331,6 +332,57 @@ func TestCorpusDecodeParmsPredictor12BitsPerComponent16Rewrite(t *testing.T) {
 	assertCorpusTextMatches(t, reparsed, "WXYZ", 1)
 }
 
+func TestCorpusP3DecodeParmsDirectDictionaryRewrite(t *testing.T) {
+	p3AssertDecodeParmsRewrite(t, p3DecodeParmsRewriteFixture{
+		name:        "p3-decodeparms-direct-dictionary.pdf",
+		filter:      "FlateDecode",
+		decodeParms: "<< /Predictor 12 /Columns 1 >>",
+		filterChain: []string{"FlateDecode"},
+	})
+}
+
+func TestCorpusP3DecodeParmsFilterArrayRewrite(t *testing.T) {
+	p3AssertDecodeParmsRewrite(t, p3DecodeParmsRewriteFixture{
+		name:        "p3-decodeparms-filter-array.pdf",
+		filter:      "[/ASCIIHexDecode /FlateDecode]",
+		decodeParms: "[null << /Predictor 12 /Columns 1 >>]",
+		filterChain: []string{"ASCIIHexDecode", "FlateDecode"},
+	})
+}
+
+func TestCorpusP3MalformedUnsupportedDecodeParmsFailsClosed(t *testing.T) {
+	input := readCorpusPDF(t, "p3-decodeparms-malformed-unsupported.pdf")
+	adapter := NewAdapter()
+
+	tree, err := adapter.Parse(input, core.ParseOptions{Strict: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	streams := tree.Query(core.Match{Kind: KindStream})
+	if len(streams) != 1 {
+		t.Fatalf("stream nodes = %d, want 1", len(streams))
+	}
+	meta := streams[0].Meta
+	if meta["filter"] != "[/FlateDecode /FlateDecode]" {
+		t.Fatalf("filter = %v, want filter array; meta=%+v", meta["filter"], meta)
+	}
+	if meta["decode_parms"] != "<< /Predictor 1 >>" {
+		t.Fatalf("decode_parms = %v, want malformed direct dictionary; meta=%+v", meta["decode_parms"], meta)
+	}
+	assertStringSliceMeta(t, meta, "filter_chain", []string{"FlateDecode", "FlateDecode"})
+	if got := meta["unsupported"]; got != "unsupported stream: direct /DecodeParms dictionary requires a single /Filter" {
+		t.Fatalf("unsupported metadata = %q, want malformed DecodeParms reason; meta=%+v", got, meta)
+	}
+	if _, ok := meta["decoded_length"]; ok {
+		t.Fatalf("decoded_length present for malformed unsupported DecodeParms stream: %+v", meta)
+	}
+	assertCorpusTextMatches(t, tree, "08-15-2024", 0)
+
+	if _, err := adapter.PlanEdit(tree, core.Match{Kind: KindTextShow, Text: "08-15-2024"}, core.Mutation{Replace: "05-04-2026"}); err == nil {
+		t.Fatal("expected malformed unsupported DecodeParms target edit to fail closed")
+	}
+}
+
 func TestCorpusP2ImageOnlyFiltersPassThroughWhileSupportedContentEdits(t *testing.T) {
 	input := readCorpusPDF(t, "p2-image-only-filters-supported-content.pdf")
 	adapter := NewAdapter()
@@ -655,6 +707,111 @@ func assertCorpusTextMatches(t *testing.T, tree *core.Tree, text string, want in
 	got := tree.Query(core.Match{Kind: KindTextShow, Text: text})
 	if len(got) != want {
 		t.Fatalf("%q matches = %d, want %d", text, len(got), want)
+	}
+}
+
+type p3DecodeParmsRewriteFixture struct {
+	name        string
+	filter      string
+	decodeParms string
+	filterChain []string
+}
+
+func p3AssertDecodeParmsRewrite(t *testing.T, fixture p3DecodeParmsRewriteFixture) {
+	t.Helper()
+	const (
+		oldText = "08-15-2024"
+		newText = "05-04-2026"
+	)
+	decoded := []byte("BT\n(08\\05515\\0552024) Tj\nET\n")
+	input := readCorpusPDF(t, fixture.name)
+	adapter := NewAdapter()
+
+	tree, err := adapter.Parse(input, core.ParseOptions{Strict: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	streams := tree.Query(core.Match{Kind: KindStream})
+	if len(streams) != 1 {
+		t.Fatalf("stream nodes = %d, want 1", len(streams))
+	}
+	p3AssertSupportedDecodeParmsStreamMetadata(t, streams[0].Meta, fixture, len(decoded))
+	assertCorpusTextMatches(t, tree, oldText, 1)
+
+	plan, err := adapter.PlanEdit(tree, core.Match{Kind: KindTextShow, Text: oldText}, core.Mutation{Replace: newText})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, report, err := adapter.Apply(input, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.FallbackUsed {
+		t.Fatal("unexpected fallback")
+	}
+	verification, err := adapter.Verify(output, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.ReparseOK || !verification.OldTextRemoved || !verification.NewSelectable || !verification.PageUnchanged {
+		t.Fatalf("verification failed: %+v", verification)
+	}
+
+	reparsed, err := adapter.Parse(output, core.ParseOptions{Strict: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertCorpusTextMatches(t, reparsed, newText, 1)
+	assertCorpusTextMatches(t, reparsed, oldText, 0)
+
+	stream, ok, err := findNextStream(output, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("missing rewritten stream")
+	}
+	if stream.lengthIndirect {
+		t.Fatal("stream length unexpectedly became indirect")
+	}
+	if stream.lengthValue != stream.dataEnd-stream.dataStart {
+		t.Fatalf("stream length = %d, want %d", stream.lengthValue, stream.dataEnd-stream.dataStart)
+	}
+	updatedDecoded, err := decodeStreamFilterWithDecodeParms(fixture.filter, fixture.decodeParms, output[stream.dataStart:stream.dataEnd])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(updatedDecoded, []byte(encodeLiteralString(oldText))) || !bytes.Contains(updatedDecoded, []byte("("+encodeLiteralString(newText)+") Tj")) {
+		t.Fatalf("decoded rewritten stream = %q", updatedDecoded)
+	}
+}
+
+func p3AssertSupportedDecodeParmsStreamMetadata(t *testing.T, meta map[string]any, fixture p3DecodeParmsRewriteFixture, wantDecodedLength int) {
+	t.Helper()
+	if meta["filter"] != fixture.filter {
+		t.Fatalf("filter = %v, want %q; meta=%+v", meta["filter"], fixture.filter, meta)
+	}
+	if meta["decode_parms"] != fixture.decodeParms {
+		t.Fatalf("decode_parms = %v, want %q; meta=%+v", meta["decode_parms"], fixture.decodeParms, meta)
+	}
+	if meta["filter_capability"] != string(pdfStreamFilterCapabilityEditableReversible) {
+		t.Fatalf("filter_capability = %v, want %q; meta=%+v", meta["filter_capability"], pdfStreamFilterCapabilityEditableReversible, meta)
+	}
+	if meta["filter_editable"] != true || meta["filter_pass_through"] != false || meta["filter_target"] != true {
+		t.Fatalf("filter metadata = editable:%v pass_through:%v target:%v, want true/false/true; meta=%+v", meta["filter_editable"], meta["filter_pass_through"], meta["filter_target"], meta)
+	}
+	if meta["decoded_length"] != wantDecodedLength {
+		t.Fatalf("decoded_length = %v, want %d; meta=%+v", meta["decoded_length"], wantDecodedLength, meta)
+	}
+	if encodedLength, ok := meta["encoded_length"].(int); !ok || encodedLength <= 0 {
+		t.Fatalf("encoded_length = %v, want positive int; meta=%+v", meta["encoded_length"], meta)
+	}
+	if got, ok := meta["unsupported"]; ok {
+		t.Fatalf("unsupported metadata present for supported DecodeParms stream: %v; meta=%+v", got, meta)
+	}
+	assertStringSliceMeta(t, meta, "filter_chain", fixture.filterChain)
+	if strings.TrimSpace(fixture.decodeParms) == "" {
+		t.Fatal("P3 DecodeParms fixture must assert an explicit DecodeParms shape")
 	}
 }
 

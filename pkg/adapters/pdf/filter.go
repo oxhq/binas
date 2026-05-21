@@ -6,6 +6,7 @@ import (
 	"encoding/ascii85"
 	"fmt"
 	"io"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -623,6 +624,11 @@ func parsePDFStreamDecodeParms(filters []string, decodeParms string) ([]pdfStrea
 			if !isSupportedReversiblePDFStreamFilter(filters[0]) && !isImagePassThroughPDFStreamFilter(filters[0]) {
 				return nil, fmt.Errorf("unsupported PDF stream filter %q", filters[0])
 			}
+			if isImagePassThroughPDFStreamFilter(filters[0]) {
+				if err := rejectUnsupportedDecodeParmsDictionaryKeys(filters[0], decodeParms); err != nil {
+					return nil, err
+				}
+			}
 			return nil, fmt.Errorf("unsupported stream: /DecodeParms for /%s must be null", filters[0])
 		}
 		return params, nil
@@ -646,24 +652,29 @@ func parsePDFStreamDecodeParms(filters []string, decodeParms string) ([]pdfStrea
 			case pdfFilterCrypt:
 				crypt, err := parseCryptDecodeParmsDictionary(value)
 				if err != nil {
-					return nil, err
+					return nil, pdfDecodeParmsArrayEntryError(i, filters[i], err)
 				}
 				params[i].crypt = &crypt
 			case pdfFilterFlateDecode:
 				flate, err := parseFlateDecodeParmsDictionary(value)
 				if err != nil {
-					return nil, err
+					return nil, pdfDecodeParmsArrayEntryError(i, filters[i], err)
 				}
 				params[i].flate = &flate
 			case pdfFilterLZWDecode:
 				lzw, err := parseLZWDecodeParmsDictionary(value)
 				if err != nil {
-					return nil, err
+					return nil, pdfDecodeParmsArrayEntryError(i, filters[i], err)
 				}
 				params[i].lzw = &lzw
 			default:
 				if !isSupportedReversiblePDFStreamFilter(filters[i]) && !isImagePassThroughPDFStreamFilter(filters[i]) {
 					return nil, fmt.Errorf("unsupported PDF stream filter %q", strings.Join(filters, " "))
+				}
+				if isImagePassThroughPDFStreamFilter(filters[i]) {
+					if err := rejectUnsupportedDecodeParmsDictionaryKeys(filters[i], value); err != nil {
+						return nil, pdfDecodeParmsArrayEntryError(i, filters[i], err)
+					}
 				}
 				return nil, fmt.Errorf("unsupported stream: /DecodeParms for /%s must be null", filters[i])
 			}
@@ -671,6 +682,11 @@ func parsePDFStreamDecodeParms(filters []string, decodeParms string) ([]pdfStrea
 		return params, nil
 	}
 	return nil, fmt.Errorf("unsupported stream: /DecodeParms must be a dictionary, array, or null")
+}
+
+func pdfDecodeParmsArrayEntryError(index int, filter string, err error) error {
+	message := strings.TrimPrefix(err.Error(), "unsupported stream: ")
+	return fmt.Errorf("unsupported stream: /DecodeParms array entry %d for /%s: %s", index, filter, message)
 }
 
 func pdfCryptFilterName(params *pdfCryptDecodeParms) string {
@@ -697,11 +713,19 @@ func parseCryptDecodeParmsDictionary(value string) (pdfCryptDecodeParms, error) 
 	}
 	for name := range dict {
 		if name != "Name" {
-			return pdfCryptDecodeParms{}, fmt.Errorf("unsupported stream: /DecodeParms /Crypt key /%s is not supported", name)
+			return pdfCryptDecodeParms{}, fmt.Errorf("unsupported stream: /DecodeParms for /Crypt key /%s is not supported", name)
 		}
 	}
-	name, ok := dictPDFName(dict, "Name")
-	if !ok || name == "" {
+	nameObject, ok := dict["Name"]
+	if !ok {
+		return pdfCryptDecodeParms{name: "Identity"}, nil
+	}
+	nameValue, ok := nameObject.(pdfName)
+	if !ok {
+		return pdfCryptDecodeParms{}, fmt.Errorf("unsupported stream: /DecodeParms /Crypt /Name must be a name")
+	}
+	name := string(nameValue)
+	if name == "" {
 		name = "Identity"
 	}
 	return pdfCryptDecodeParms{name: name}, nil
@@ -924,21 +948,32 @@ func parseFlateDecodeParmsPredictorGeometry(dict []byte, predictor int, label st
 }
 
 func decodeParmsDictionaryNames(dict []byte) []string {
-	var names []string
-	for i := 2; i < len(dict)-2; i++ {
-		if dict[i] != '/' {
-			continue
-		}
-		j := i + 1
-		for j < len(dict)-2 && !isPDFSpace(dict[j]) && !isPDFDelimiter(dict[j]) {
-			j++
-		}
-		if j > i+1 {
-			names = append(names, string(dict[i+1:j]))
-		}
-		i = j
+	parser := pdfValueParser{input: bytes.TrimSpace(dict)}
+	parsed, err := parser.parseValue()
+	if err != nil {
+		return nil
 	}
+	parser.skipSpaceAndComments()
+	if parser.i != len(parser.input) {
+		return nil
+	}
+	parsedDict, ok := parsed.(pdfDict)
+	if !ok {
+		return nil
+	}
+	names := make([]string, 0, len(parsedDict))
+	for name := range parsedDict {
+		names = append(names, name)
+	}
+	sort.Strings(names)
 	return names
+}
+
+func rejectUnsupportedDecodeParmsDictionaryKeys(filter, value string) error {
+	for _, name := range decodeParmsDictionaryNames([]byte(strings.TrimSpace(value))) {
+		return fmt.Errorf("unsupported stream: /DecodeParms for /%s key /%s is not supported", filter, name)
+	}
+	return nil
 }
 
 func decodeParmsInteger(dict []byte, name string) (int, bool, error) {
@@ -962,6 +997,9 @@ func decodeParmsInteger(dict []byte, name string) (int, bool, error) {
 			return 0, true, fmt.Errorf("unsupported stream: /DecodeParms /%s must be a direct integer", name)
 		}
 		start := i
+		if ref, _, ok := parseDirectPDFRefEnd(dict, start); ok {
+			return 0, true, fmt.Errorf("unsupported stream: /DecodeParms /%s must be a direct integer (got reference %d %d R)", name, ref.ID.Number, ref.ID.Generation)
+		}
 		if dict[i] == '-' || dict[i] == '+' {
 			i++
 		}
@@ -970,9 +1008,6 @@ func decodeParmsInteger(dict []byte, name string) (int, bool, error) {
 		}
 		for i < len(dict) && isPDFDigit(dict[i]) {
 			i++
-		}
-		if _, _, ok := parseDirectPDFRefEnd(dict, start); ok {
-			return 0, true, fmt.Errorf("unsupported stream: /DecodeParms /%s must be a direct integer", name)
 		}
 		value, err := strconv.Atoi(string(dict[start:i]))
 		if err != nil {

@@ -897,6 +897,10 @@ func streamFilterReportFor(streams []core.Node) *streamFilterReport {
 	}
 	report := streamFilterReport{Total: len(streams)}
 	for _, stream := range streams {
+		if stream.Meta["unsupported"] != nil && metaBool(stream.Meta, "filter_target") {
+			report.UnsupportedTargets++
+			continue
+		}
 		if metaBool(stream.Meta, "filter_editable") && metaBool(stream.Meta, "filter_target") {
 			report.EditableTargets++
 		}
@@ -958,7 +962,7 @@ func unsupportedTargetStreamNodes(tree *core.Tree) []core.Node {
 	streams := streamNodes(tree)
 	unsupported := make([]core.Node, 0)
 	for _, stream := range streams {
-		if !metaBool(stream.Meta, "filter_editable") && metaBool(stream.Meta, "filter_target") {
+		if metaBool(stream.Meta, "filter_target") && (stream.Meta["unsupported"] != nil || !metaBool(stream.Meta, "filter_editable")) {
 			unsupported = append(unsupported, stream)
 		}
 	}

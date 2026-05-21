@@ -1400,8 +1400,62 @@ func TestFilterArrayDecodeParmsSupportedShapesSurgicalAndCanonicalRewrite(t *tes
 		oldText       string
 		newText       string
 		decoded       []byte
-		assertEncoded func(t *testing.T, encoded []byte)
+		assertEncoded func(t *testing.T, encoded []byte, newText string)
 	}{
+		{
+			name:        "direct flate decode parms predictor one",
+			filter:      "/FlateDecode",
+			decodeParms: "<< /Predictor 1 /Columns 4 /Colors 3 /BitsPerComponent 16 >>",
+			oldText:     "08-15-2024",
+			newText:     "May 5, 2026",
+			decoded:     []byte("BT\n(08\\05515\\0552024) Tj\nET\n"),
+			assertEncoded: func(t *testing.T, encoded []byte, newText string) {
+				t.Helper()
+				decoded, err := decodeStreamFilterWithDecodeParms("/FlateDecode", "<< /Predictor 1 /Columns 4 /Colors 3 /BitsPerComponent 16 >>", encoded)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Contains(decoded, []byte("("+newText+") Tj")) {
+					t.Fatalf("decoded stream = %q", decoded)
+				}
+			},
+		},
+		{
+			name:        "filter array decode parms null alignment",
+			filter:      "[/ASCIIHexDecode /FlateDecode]",
+			decodeParms: "[null << /Predictor 1 /Columns 4 /Colors 3 /BitsPerComponent 16 >>]",
+			oldText:     "08-15-2024",
+			newText:     "May 5, 2026",
+			decoded:     []byte("BT\n(08\\05515\\0552024) Tj\nET\n"),
+			assertEncoded: func(t *testing.T, encoded []byte, newText string) {
+				t.Helper()
+				decoded, err := decodeStreamFilterWithDecodeParms("[/ASCIIHexDecode /FlateDecode]", "[null << /Predictor 1 /Columns 4 /Colors 3 /BitsPerComponent 16 >>]", encoded)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Contains(decoded, []byte("("+newText+") Tj")) {
+					t.Fatalf("decoded stream = %q", decoded)
+				}
+			},
+		},
+		{
+			name:        "lzw decode parms predictor one",
+			filter:      "/LZWDecode",
+			decodeParms: "<< /EarlyChange 0 /Predictor 1 /Columns 4 /Colors 3 /BitsPerComponent 16 >>",
+			oldText:     "08-15-2024",
+			newText:     "May 5, 2026",
+			decoded:     []byte("BT\n(08\\05515\\0552024) Tj\nET\n"),
+			assertEncoded: func(t *testing.T, encoded []byte, newText string) {
+				t.Helper()
+				decoded, err := decodeStreamFilterWithDecodeParms("/LZWDecode", "<< /EarlyChange 0 /Predictor 1 /Columns 4 /Colors 3 /BitsPerComponent 16 >>", encoded)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Contains(decoded, []byte("("+newText+") Tj")) {
+					t.Fatalf("decoded stream = %q", decoded)
+				}
+			},
+		},
 		{
 			name:        "single flate array with tiff predictor defaults",
 			filter:      "[/FlateDecode]",
@@ -1409,7 +1463,7 @@ func TestFilterArrayDecodeParmsSupportedShapesSurgicalAndCanonicalRewrite(t *tes
 			oldText:     "08-15-2024",
 			newText:     "May 5, 2026",
 			decoded:     []byte("BT\n(08\\05515\\0552024) Tj\nET\n"),
-			assertEncoded: func(t *testing.T, encoded []byte) {
+			assertEncoded: func(t *testing.T, encoded []byte, newText string) {
 				t.Helper()
 				predicted, err := decodeFlateDecode(encoded)
 				if err != nil {
@@ -1419,7 +1473,7 @@ func TestFilterArrayDecodeParmsSupportedShapesSurgicalAndCanonicalRewrite(t *tes
 				if err != nil {
 					t.Fatal(err)
 				}
-				if !bytes.Contains(decoded, []byte("(May 5, 2026) Tj")) {
+				if !bytes.Contains(decoded, []byte("("+newText+") Tj")) {
 					t.Fatalf("decoded stream = %q", decoded)
 				}
 			},
@@ -1431,7 +1485,7 @@ func TestFilterArrayDecodeParmsSupportedShapesSurgicalAndCanonicalRewrite(t *tes
 			oldText:     "08-15-2024",
 			newText:     "May 5, 2026",
 			decoded:     []byte("BT\n(08\\05515\\0552024) Tj\nET\n"),
-			assertEncoded: func(t *testing.T, encoded []byte) {
+			assertEncoded: func(t *testing.T, encoded []byte, newText string) {
 				t.Helper()
 				ascii85Decoded, err := decodeASCII85Decode(encoded)
 				if err != nil {
@@ -1449,11 +1503,29 @@ func TestFilterArrayDecodeParmsSupportedShapesSurgicalAndCanonicalRewrite(t *tes
 				if err != nil {
 					t.Fatal(err)
 				}
-				if !bytes.Contains(decoded, []byte("(May 5, 2026) Tj")) {
+				if !bytes.Contains(decoded, []byte("("+newText+") Tj")) {
 					t.Fatalf("decoded stream = %q", decoded)
 				}
 				if !hasOnlyPNGFilterNoneRowsForTest(predicted) {
 					t.Fatalf("encoded predictor rows were not PNG filter 0 one-byte rows: %v", predicted)
+				}
+			},
+		},
+		{
+			name:        "filter array all null decode parms",
+			filter:      "[/ASCIIHexDecode /FlateDecode]",
+			decodeParms: "[null null]",
+			oldText:     "08-15-2024",
+			newText:     "May 5, 2026",
+			decoded:     []byte("BT\n(08\\05515\\0552024) Tj\nET\n"),
+			assertEncoded: func(t *testing.T, encoded []byte, newText string) {
+				t.Helper()
+				decoded, err := decodeStreamFilterWithDecodeParms("[/ASCIIHexDecode /FlateDecode]", "[null null]", encoded)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Contains(decoded, []byte("("+newText+") Tj")) {
+					t.Fatalf("decoded stream = %q", decoded)
 				}
 			},
 		},
@@ -1504,6 +1576,7 @@ func TestFilterArrayDecodeParmsSupportedShapesSurgicalAndCanonicalRewrite(t *tes
 			if !verification.ReparseOK || !verification.OldTextRemoved || !verification.NewSelectable || !verification.PageUnchanged {
 				t.Fatalf("verification failed: %+v", verification)
 			}
+			assertDecodeParmsEditReparseLengthAndXref(t, adapter, output, tc.oldText, tc.newText)
 			stream, ok, err := findNextStream(output, 0)
 			if err != nil {
 				t.Fatal(err)
@@ -1514,15 +1587,16 @@ func TestFilterArrayDecodeParmsSupportedShapesSurgicalAndCanonicalRewrite(t *tes
 			if stream.lengthValue == len(encoded) {
 				t.Fatal("surgical encoded stream length was not updated")
 			}
-			tc.assertEncoded(t, output[stream.dataStart:stream.dataEnd])
+			tc.assertEncoded(t, output[stream.dataStart:stream.dataEnd], tc.newText)
 
-			canonical, _, canonicalVerification, err := EditCanonical(input, core.Match{Kind: KindTextShow, Text: tc.oldText}, core.Mutation{Replace: tc.newText}, nil)
+			canonical, _, canonicalVerification, err := ApplyCanonicalEdit(input, core.Match{Kind: KindTextShow, Text: tc.oldText}, core.Mutation{Replace: tc.newText}, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if !canonicalVerification.ReparseOK || !canonicalVerification.OldTextRemoved || !canonicalVerification.NewSelectable || !canonicalVerification.PageUnchanged {
 				t.Fatalf("canonical verification failed: %+v", canonicalVerification)
 			}
+			assertDecodeParmsEditReparseLengthAndXref(t, adapter, canonical, tc.oldText, tc.newText)
 			if bytes.Contains(canonical, []byte("/Filter")) || bytes.Contains(canonical, []byte("/DecodeParms")) {
 				t.Fatalf("canonical edited stream should be written decoded without filters:\n%s", canonical)
 			}
@@ -1530,6 +1604,37 @@ func TestFilterArrayDecodeParmsSupportedShapesSurgicalAndCanonicalRewrite(t *tes
 				t.Fatalf("canonical output missing replacement:\n%s", canonical)
 			}
 		})
+	}
+}
+
+func assertDecodeParmsEditReparseLengthAndXref(t *testing.T, adapter Adapter, output []byte, oldText, newText string) {
+	t.Helper()
+
+	reparsed, err := adapter.Parse(output, core.ParseOptions{Strict: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldMatches := reparsed.Query(core.Match{Kind: KindTextShow, Text: oldText}); len(oldMatches) != 0 {
+		t.Fatalf("old selectable matches after reparse = %d, want 0", len(oldMatches))
+	}
+	if newMatches := reparsed.Query(core.Match{Kind: KindTextShow, Text: newText}); len(newMatches) != 1 {
+		t.Fatalf("new selectable matches after reparse = %d, want 1", len(newMatches))
+	}
+	stream, ok, err := findNextStream(output, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("missing stream")
+	}
+	if stream.lengthIndirect {
+		t.Fatal("stream length unexpectedly became indirect")
+	}
+	if stream.lengthValue != stream.dataEnd-stream.dataStart {
+		t.Fatalf("stream length = %d, want %d", stream.lengthValue, stream.dataEnd-stream.dataStart)
+	}
+	if !bytes.Contains(output, []byte("xref\n0 3\n")) {
+		t.Fatalf("xref table was not rebuilt:\n%s", output)
 	}
 }
 

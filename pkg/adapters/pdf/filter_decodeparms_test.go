@@ -75,6 +75,96 @@ func TestFilterFlateDecodePredictor1DecodeParmsDefaultGeometryRoundTrip(t *testi
 	}
 }
 
+func TestFilterDecodeParmsSupportedPredictorMatrixRoundTrip(t *testing.T) {
+	input := []byte("BT\n(08\\05515\\0552024) Tj\nET\nBT\n(08\\05515\\0552024) Tj\nET\n")
+	cases := []struct {
+		name        string
+		filter      string
+		decodeParms string
+	}{
+		{name: "flate no decode parms", filter: "/FlateDecode"},
+		{name: "flate null decode parms", filter: "/FlateDecode", decodeParms: "null"},
+		{name: "flate predictor 1 direct dictionary", filter: "/FlateDecode", decodeParms: "<< /Predictor 1 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "flate tiff predictor 2 direct dictionary", filter: "/FlateDecode", decodeParms: "<< /Predictor 2 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "flate png predictor 10 direct dictionary", filter: "/FlateDecode", decodeParms: "<< /Predictor 10 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "flate png predictor 11 direct dictionary", filter: "/FlateDecode", decodeParms: "<< /Predictor 11 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "flate png predictor 12 direct dictionary", filter: "/FlateDecode", decodeParms: "<< /Predictor 12 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "flate png predictor 13 direct dictionary", filter: "/FlateDecode", decodeParms: "<< /Predictor 13 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "flate png predictor 14 direct dictionary", filter: "/FlateDecode", decodeParms: "<< /Predictor 14 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "flate png predictor 15 direct dictionary", filter: "/FlateDecode", decodeParms: "<< /Predictor 15 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "lzw no decode parms", filter: "/LZWDecode"},
+		{name: "lzw null decode parms", filter: "/LZWDecode", decodeParms: "null"},
+		{name: "lzw early change 0 direct dictionary", filter: "/LZWDecode", decodeParms: "<< /EarlyChange 0 >>"},
+		{name: "lzw early change 1 direct dictionary", filter: "/LZWDecode", decodeParms: "<< /EarlyChange 1 >>"},
+		{name: "lzw predictor 1 direct dictionary", filter: "/LZWDecode", decodeParms: "<< /EarlyChange 1 /Predictor 1 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "lzw tiff predictor 2 direct dictionary", filter: "/LZWDecode", decodeParms: "<< /EarlyChange 1 /Predictor 2 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "lzw png predictor 10 direct dictionary", filter: "/LZWDecode", decodeParms: "<< /EarlyChange 1 /Predictor 10 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "lzw png predictor 11 direct dictionary", filter: "/LZWDecode", decodeParms: "<< /EarlyChange 1 /Predictor 11 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "lzw png predictor 12 direct dictionary", filter: "/LZWDecode", decodeParms: "<< /EarlyChange 1 /Predictor 12 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "lzw png predictor 13 direct dictionary", filter: "/LZWDecode", decodeParms: "<< /EarlyChange 1 /Predictor 13 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "lzw png predictor 14 direct dictionary", filter: "/LZWDecode", decodeParms: "<< /EarlyChange 1 /Predictor 14 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "lzw png predictor 15 direct dictionary", filter: "/LZWDecode", decodeParms: "<< /EarlyChange 1 /Predictor 15 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			encoded, err := encodeStreamFilterWithDecodeParms(tc.filter, tc.decodeParms, input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoded, err := decodeStreamFilterWithDecodeParms(tc.filter, tc.decodeParms, encoded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(decoded, input) {
+				t.Fatalf("decoded stream = %q, want %q", decoded, input)
+			}
+		})
+	}
+}
+
+func TestFilterDecodeParmsSupportedPredictorMatrixRewriteReencodesLengthAndXref(t *testing.T) {
+	decoded := []byte("BT\n(08\\05515\\0552024) Tj\nET\n")
+	cases := []struct {
+		name        string
+		filter      string
+		decodeParms string
+	}{
+		{name: "flate predictor 1 direct dictionary", filter: "/FlateDecode", decodeParms: "<< /Predictor 1 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "flate tiff predictor 2 direct dictionary", filter: "/FlateDecode", decodeParms: "<< /Predictor 2 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "flate png predictor 10 direct dictionary", filter: "/FlateDecode", decodeParms: "<< /Predictor 10 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "flate png predictor 11 direct dictionary", filter: "/FlateDecode", decodeParms: "<< /Predictor 11 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "flate png predictor 12 direct dictionary", filter: "/FlateDecode", decodeParms: "<< /Predictor 12 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "flate png predictor 13 direct dictionary", filter: "/FlateDecode", decodeParms: "<< /Predictor 13 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "flate png predictor 14 direct dictionary", filter: "/FlateDecode", decodeParms: "<< /Predictor 14 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "flate png predictor 15 direct dictionary", filter: "/FlateDecode", decodeParms: "<< /Predictor 15 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "lzw early change 1 direct dictionary", filter: "/LZWDecode", decodeParms: "<< /EarlyChange 1 >>"},
+		{name: "lzw predictor 1 direct dictionary", filter: "/LZWDecode", decodeParms: "<< /EarlyChange 1 /Predictor 1 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "lzw tiff predictor 2 direct dictionary", filter: "/LZWDecode", decodeParms: "<< /EarlyChange 1 /Predictor 2 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "lzw png predictor 10 direct dictionary", filter: "/LZWDecode", decodeParms: "<< /EarlyChange 1 /Predictor 10 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "lzw png predictor 11 direct dictionary", filter: "/LZWDecode", decodeParms: "<< /EarlyChange 1 /Predictor 11 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "lzw png predictor 12 direct dictionary", filter: "/LZWDecode", decodeParms: "<< /EarlyChange 1 /Predictor 12 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "lzw png predictor 13 direct dictionary", filter: "/LZWDecode", decodeParms: "<< /EarlyChange 1 /Predictor 13 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "lzw png predictor 14 direct dictionary", filter: "/LZWDecode", decodeParms: "<< /EarlyChange 1 /Predictor 14 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+		{name: "lzw png predictor 15 direct dictionary", filter: "/LZWDecode", decodeParms: "<< /EarlyChange 1 /Predictor 15 /Columns 1 /Colors 1 /BitsPerComponent 8 >>"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			encoded, err := encodeStreamFilterWithDecodeParms(tc.filter, tc.decodeParms, decoded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			input := testPDF(
+				"<< /Type /Page >>",
+				fmt.Sprintf("<< /Length %d /Filter %s /DecodeParms %s >>\nstream\n%sendstream", len(encoded), tc.filter, tc.decodeParms, encoded),
+			)
+
+			assertLZWRewrite(t, input, encoded, tc.filter, tc.decodeParms)
+		})
+	}
+}
+
 func TestFilterFlateDecodePredictor1NonDefaultGeometryRewriteReencodesLengthAndXref(t *testing.T) {
 	decoded := []byte("BT\n(08\\05515\\0552024) Tj\nET\n")
 	decodeParms := "<< /Predictor 1 /Columns 4 /Colors 3 /BitsPerComponent 16 >>"
@@ -353,6 +443,36 @@ func TestDecodeParmsMalformedShapesFailClosed(t *testing.T) {
 			want:        "unsupported stream: /DecodeParms PNG predictors require /BitsPerComponent >= 1",
 		},
 		{
+			name:        "png predictor zero columns identifies key",
+			filter:      "/FlateDecode",
+			decodeParms: "<< /Predictor 12 /Columns 0 /Colors 1 /BitsPerComponent 8 >>",
+			want:        "unsupported stream: /DecodeParms PNG predictors require /Columns >= 1",
+		},
+		{
+			name:        "nested dictionary under predictor identifies predictor not nested names",
+			filter:      "/FlateDecode",
+			decodeParms: "<< /Predictor << /Foo 1 >> /Columns 1 >>",
+			want:        "unsupported stream: /DecodeParms /Predictor must be a direct integer",
+		},
+		{
+			name:        "crypt name wrong value type identifies key",
+			filter:      "/Crypt",
+			decodeParms: "<< /Name 12 >>",
+			want:        "unsupported stream: /DecodeParms /Crypt /Name must be a name",
+		},
+		{
+			name:        "lzw scalar indirect reference identifies key and ref",
+			filter:      "/LZWDecode",
+			decodeParms: "<< /EarlyChange 3 0 R >>",
+			want:        "unsupported stream: /DecodeParms /EarlyChange must be a direct integer (got reference 3 0 R)",
+		},
+		{
+			name:        "array entry error identifies position",
+			filter:      "[/ASCIIHexDecode /FlateDecode]",
+			decodeParms: "[null << /Predictor 1 /EarlyChange 0 >>]",
+			want:        "unsupported stream: /DecodeParms array entry 1 for /FlateDecode: /DecodeParms for /FlateDecode key /EarlyChange is not supported",
+		},
+		{
 			name:        "lzw png predictor negative columns identifies key",
 			filter:      "/LZWDecode",
 			decodeParms: "<< /Predictor 12 /Columns -1 /Colors 1 /BitsPerComponent 8 >>",
@@ -403,6 +523,24 @@ func TestDecodeParmsRejectsUnsupportedKeysByFilter(t *testing.T) {
 			decodeParms: "<< /Predictor 1 /Columns 1 /Strategy 0 >>",
 			want:        "unsupported stream: /DecodeParms for /LZWDecode key /Strategy is not supported",
 		},
+		{
+			name:        "crypt rejects predictor key",
+			filter:      "/Crypt",
+			decodeParms: "<< /Predictor 1 >>",
+			want:        "unsupported stream: /DecodeParms for /Crypt key /Predictor is not supported",
+		},
+		{
+			name:        "dct rejects color transform key",
+			filter:      "/DCTDecode",
+			decodeParms: "<< /ColorTransform 1 >>",
+			want:        "unsupported stream: /DecodeParms for /DCTDecode key /ColorTransform is not supported",
+		},
+		{
+			name:        "ccitt rejects k key in array",
+			filter:      "[/CCITTFaxDecode]",
+			decodeParms: "[<< /K -1 >>]",
+			want:        "unsupported stream: /DecodeParms array entry 0 for /CCITTFaxDecode: /DecodeParms for /CCITTFaxDecode key /K is not supported",
+		},
 	}
 
 	for _, tc := range cases {
@@ -429,25 +567,25 @@ func TestDecodeParmsImagePassThroughFiltersRequireNullWhenPresent(t *testing.T) 
 			name:        "dct direct dictionary rejected",
 			filter:      "/DCTDecode",
 			decodeParms: "<< /ColorTransform 1 >>",
-			want:        "unsupported stream: /DecodeParms for /DCTDecode must be null",
+			want:        "unsupported stream: /DecodeParms for /DCTDecode key /ColorTransform is not supported",
 		},
 		{
 			name:        "jpx direct dictionary rejected",
 			filter:      "/JPXDecode",
 			decodeParms: "<< /AnyKey 1 >>",
-			want:        "unsupported stream: /DecodeParms for /JPXDecode must be null",
+			want:        "unsupported stream: /DecodeParms for /JPXDecode key /AnyKey is not supported",
 		},
 		{
 			name:        "ccitt array dictionary rejected",
 			filter:      "[/CCITTFaxDecode]",
 			decodeParms: "[<< /K -1 >>]",
-			want:        "unsupported stream: /DecodeParms for /CCITTFaxDecode must be null",
+			want:        "unsupported stream: /DecodeParms array entry 0 for /CCITTFaxDecode: /DecodeParms for /CCITTFaxDecode key /K is not supported",
 		},
 		{
 			name:        "jbig2 mixed array dictionary rejected",
 			filter:      "[/JBIG2Decode /FlateDecode]",
 			decodeParms: "[<< /JBIG2Globals 3 0 R >> null]",
-			want:        "unsupported stream: /DecodeParms for /JBIG2Decode must be null",
+			want:        "unsupported stream: /DecodeParms array entry 0 for /JBIG2Decode: /DecodeParms for /JBIG2Decode key /JBIG2Globals is not supported",
 		},
 	}
 

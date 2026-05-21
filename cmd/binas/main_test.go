@@ -2950,6 +2950,23 @@ func TestCLIEditASCII85FlateFilterArrayWritesVerifiedPDF(t *testing.T) {
 func TestCLIEditFlateDecodeParmsPredictor12WritesVerifiedPDF(t *testing.T) {
 	path := writeFlateDecodeParmsPredictor12Fixture(t)
 	out := filepath.Join(t.TempDir(), "out.pdf")
+	const decodeParms = "<< /Predictor 12 /Columns 1 >>"
+
+	inspectOut := captureStdout(t, func() error {
+		return run([]string{"inspect", path, "--format", "pdf", "--json"})
+	})
+	var inspect struct {
+		Streams       []coreNodeJSON         `json:"streams"`
+		StreamFilters streamFilterReportJSON `json:"stream_filters"`
+	}
+	if err := json.Unmarshal([]byte(inspectOut), &inspect); err != nil {
+		t.Fatal(err)
+	}
+	assertCLIStreamFilterSummary(t, inspect.StreamFilters, 1, 1, 0, 0)
+	streamMeta := requireCLIStreamMeta(t, inspect.Streams, "decode_parms", decodeParms)
+	if streamMeta["filter_capability"] != "editable_reversible" || streamMeta["filter_editable"] != true || streamMeta["filter_target"] != true || streamMeta["unsupported"] != nil {
+		t.Fatalf("DecodeParms stream metadata = %+v, want editable reversible target with no unsupported reason", streamMeta)
+	}
 
 	stdout := captureStdout(t, func() error {
 		return run([]string{
@@ -2991,6 +3008,23 @@ func TestCLIEditFlateDecodeParmsPredictor12WritesVerifiedPDF(t *testing.T) {
 		t.Fatalf("verification = %+v", result.Verification)
 	}
 
+	validateOut := captureStdout(t, func() error {
+		return run([]string{"validate", out, "--format", "pdf", "--json"})
+	})
+	var validation struct {
+		Valid         bool                   `json:"valid"`
+		Streams       []coreNodeJSON         `json:"streams"`
+		StreamFilters streamFilterReportJSON `json:"stream_filters"`
+	}
+	if err := json.Unmarshal([]byte(validateOut), &validation); err != nil {
+		t.Fatal(err)
+	}
+	if !validation.Valid {
+		t.Fatal("edited DecodeParms output is not valid")
+	}
+	assertCLIStreamFilterSummary(t, validation.StreamFilters, 1, 1, 0, 0)
+	requireCLIStreamMeta(t, validation.Streams, "decode_parms", decodeParms)
+
 	oldQueryOut := captureStdout(t, func() error {
 		return run([]string{"query", out, "--format", "pdf", "--kind", "pdf.content.text_show", "--text", "08-15-2024", "--json"})
 	})
@@ -3000,6 +3034,70 @@ func TestCLIEditFlateDecodeParmsPredictor12WritesVerifiedPDF(t *testing.T) {
 		return run([]string{"query", out, "--format", "pdf", "--kind", "pdf.content.text_show", "--text", "May 5, 2026", "--json"})
 	})
 	assertCLIQueryCount(t, newQueryOut, 1)
+}
+
+func TestCLIUnsupportedDecodeParmsJSONReportsExactReasonAndNoOutput(t *testing.T) {
+	path := writeUnsupportedDecodeParmsTargetFixture(t)
+	out := filepath.Join(t.TempDir(), "out.pdf")
+	const wantReason = "unsupported stream: /DecodeParms /Predictor 9 is not supported"
+
+	validateOut := captureStdout(t, func() error {
+		return run([]string{"validate", path, "--format", "pdf", "--json"})
+	})
+	var validation struct {
+		Valid         bool                   `json:"valid"`
+		Streams       []coreNodeJSON         `json:"streams"`
+		StreamFilters streamFilterReportJSON `json:"stream_filters"`
+	}
+	if err := json.Unmarshal([]byte(validateOut), &validation); err != nil {
+		t.Fatal(err)
+	}
+	if !validation.Valid {
+		t.Fatalf("validation valid = false, want true parse with explicit unsupported DecodeParms metadata")
+	}
+	assertCLIStreamFilterSummary(t, validation.StreamFilters, 1, 0, 0, 1)
+	unsupportedMeta := requireCLIStreamMeta(t, validation.Streams, "unsupported", wantReason)
+	if unsupportedMeta["filter"] != "FlateDecode" || unsupportedMeta["decode_parms"] != "<< /Predictor 9 /Columns 1 >>" || unsupportedMeta["filter_target"] != true {
+		t.Fatalf("unsupported DecodeParms metadata = %+v, want exact reason on Flate target", unsupportedMeta)
+	}
+
+	stdout, err := captureStdoutAndError(t, func() error {
+		return run([]string{
+			"edit", path,
+			"--format", "pdf",
+			"--kind", "pdf.content.text_show",
+			"--text", "08-15-2024",
+			"--replace", "May 5, 2026",
+			"-o", out,
+			"--json",
+		})
+	})
+	if err == nil {
+		t.Fatal("edit succeeded, want unsupported DecodeParms boundary error")
+	}
+	if !strings.Contains(err.Error(), wantReason) {
+		t.Fatalf("error = %q, want unsupported DecodeParms reason", err)
+	}
+	var result struct {
+		Error              string                 `json:"error"`
+		EditStatus         string                 `json:"edit_status"`
+		FallbackUsed       bool                   `json:"fallback_used"`
+		UnsupportedStreams []coreNodeJSON         `json:"unsupported_streams"`
+		StreamFilters      streamFilterReportJSON `json:"stream_filters"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.EditStatus != "unsupported" || result.FallbackUsed || len(result.UnsupportedStreams) != 1 {
+		t.Fatalf("edit error JSON = %+v, want unsupported/no-fallback with one stream", result)
+	}
+	if !strings.Contains(result.Error, wantReason) || result.UnsupportedStreams[0].Meta["unsupported"] != wantReason {
+		t.Fatalf("unsupported JSON = %+v, want exact DecodeParms reason", result)
+	}
+	assertCLIStreamFilterSummary(t, result.StreamFilters, 1, 0, 0, 1)
+	if _, statErr := os.Stat(out); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("output stat error = %v, want no output file", statErr)
+	}
 }
 
 func TestCLIEditFlateDecodeParmsPredictor12Columns4WritesVerifiedPDF(t *testing.T) {
@@ -3917,6 +4015,21 @@ func writeFlateDecodeParmsPredictor12Fixture(t *testing.T) string {
 		fmt.Sprintf("<< /Length %d /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 1 >> >>\nstream\n%sendstream", len(encoded), encoded),
 	)
 	path := filepath.Join(t.TempDir(), "flate-decodeparms-predictor12.pdf")
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func writeUnsupportedDecodeParmsTargetFixture(t *testing.T) string {
+	t.Helper()
+	decoded := []byte("BT\n(08\\05515\\0552024) Tj\nET\n")
+	encoded := cliFlate(t, decoded)
+	input := pdfFixture(
+		"<< /Type /Page >>",
+		fmt.Sprintf("<< /Length %d /Filter /FlateDecode /DecodeParms << /Predictor 9 /Columns 1 >> >>\nstream\n%sendstream", len(encoded), encoded),
+	)
+	path := filepath.Join(t.TempDir(), "unsupported-decodeparms.pdf")
 	if err := os.WriteFile(path, input, 0644); err != nil {
 		t.Fatal(err)
 	}
