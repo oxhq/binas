@@ -22,7 +22,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("expected command: inspect, query, edit, overlay, form, annot, xfa, validate")
+		return errors.New("expected command: inspect, query, edit, overlay, form, annot, xfa, signature, validate")
 	}
 	switch args[0] {
 	case "inspect":
@@ -39,11 +39,50 @@ func run(args []string) error {
 		return annot(args[1:])
 	case "xfa":
 		return xfa(args[1:])
+	case "signature":
+		return signature(args[1:])
 	case "validate":
 		return validate(args[1:])
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func signature(args []string) error {
+	if len(args) == 0 {
+		return errors.New("expected signature command: inspect")
+	}
+	switch args[0] {
+	case "inspect":
+		return signatureInspect(args[1:])
+	default:
+		return fmt.Errorf("unknown signature command %q", args[0])
+	}
+}
+
+func signatureInspect(args []string) error {
+	fs := flag.NewFlagSet("signature inspect", flag.ContinueOnError)
+	format := fs.String("format", "pdf", "input format")
+	asJSON := fs.Bool("json", false, "write JSON")
+	if err := fs.Parse(reorderFlags(args, map[string]bool{"json": true}, map[string]bool{"format": true})); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("signature inspect requires one input file")
+	}
+	if strings.ToLower(*format) != "pdf" {
+		return fmt.Errorf("signature inspect is unsupported for format %q", *format)
+	}
+	input, err := os.ReadFile(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	signature := pdf.SecurityMetadataForInput(input).Signature
+	if *asJSON {
+		return writeJSON(signature)
+	}
+	fmt.Printf("signature present=%t byte_range_count=%d cryptographic_validation_status=%s\n", signature.Present, signature.ByteRangeCount, signature.CryptographicValidationStatus)
+	return nil
 }
 
 func overlay(args []string) error {

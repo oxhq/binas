@@ -204,6 +204,19 @@ func TestSecurityMetadataIncludesDirectSignatureDictionaryMetadata(t *testing.T)
 	if signature.ByteRangeCount != 2 {
 		t.Fatalf("ByteRangeCount = %d, want 2", signature.ByteRangeCount)
 	}
+	if signature.ByteRangeTotalRanges != 2 {
+		t.Fatalf("ByteRangeTotalRanges = %d, want 2", signature.ByteRangeTotalRanges)
+	}
+	if signature.ByteRangeCoveredBytes != 40 {
+		t.Fatalf("ByteRangeCoveredBytes = %d, want 40", signature.ByteRangeCoveredBytes)
+	}
+	data, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(data); !strings.Contains(got, `"byte_range_total_ranges":2`) || !strings.Contains(got, `"byte_range_covered_bytes":40`) {
+		t.Fatalf("security JSON = %s, want byte range summary fields", got)
+	}
 	if signature.ContentsByteLength == nil || *signature.ContentsByteLength != 3 {
 		t.Fatalf("ContentsByteLength = %v, want 3", signature.ContentsByteLength)
 	}

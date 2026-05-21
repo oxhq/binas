@@ -2438,6 +2438,52 @@ func TestCLIEditSignedPDFDefaultsToRefuseSignatureInvalidation(t *testing.T) {
 	}
 }
 
+func TestCLISignatureInspectReportsExistingSignatureMetadataAsJSON(t *testing.T) {
+	path := writeSignedTextFixture(t)
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{"signature", "inspect", path, "--format", "pdf", "--json"})
+	})
+	var result struct {
+		Present                       bool   `json:"present"`
+		ByteRangeCount                int    `json:"byte_range_count"`
+		ContentsByteLength            *int   `json:"contents_byte_length"`
+		Filter                        string `json:"filter"`
+		SubFilter                     string `json:"sub_filter"`
+		CryptographicValidation       bool   `json:"cryptographic_validation"`
+		CryptographicValidationStatus string `json:"cryptographic_validation_status"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.Present || result.ByteRangeCount != 2 {
+		t.Fatalf("signature metadata = %+v, want present with two byte ranges", result)
+	}
+	if result.ContentsByteLength == nil || *result.ContentsByteLength != 1 {
+		t.Fatalf("contents byte length = %v, want 1", result.ContentsByteLength)
+	}
+	if result.Filter != "Adobe.PPKLite" || result.SubFilter != "adbe.pkcs7.detached" {
+		t.Fatalf("signature filter metadata = %+v", result)
+	}
+	if result.CryptographicValidation || result.CryptographicValidationStatus != "not_performed" {
+		t.Fatalf("cryptographic validation = %t/%q, want false/not_performed", result.CryptographicValidation, result.CryptographicValidationStatus)
+	}
+}
+
+func TestCLISignatureInspectRejectsUnsupportedFormat(t *testing.T) {
+	path := writeSignedTextFixture(t)
+
+	_, err := captureStdoutAndError(t, func() error {
+		return run([]string{"signature", "inspect", path, "--format", "png", "--json"})
+	})
+	if err == nil {
+		t.Fatal("signature inspect succeeded, want unsupported format error")
+	}
+	if err.Error() != `signature inspect is unsupported for format "png"` {
+		t.Fatalf("error = %q", err)
+	}
+}
+
 func TestCLIEditSignedPDFAllowsExplicitCanonicalSignatureInvalidation(t *testing.T) {
 	path := writeSignedTextFixture(t)
 	out := filepath.Join(t.TempDir(), "out.pdf")

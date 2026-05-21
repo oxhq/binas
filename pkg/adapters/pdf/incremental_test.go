@@ -250,6 +250,46 @@ func TestApplyIncrementalTextEditPreservingSignaturesReportsByteRangeProof(t *te
 	}
 }
 
+func TestApplyIncrementalTextEditPreservingSignaturesUnsupportedSubFilterDoesNotClaimValidation(t *testing.T) {
+	input := signedTextPDFWithSignatureDictionary(
+		"08-15-2024",
+		"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /ETSI.RFC3161 /ByteRange [0 10 20 30] /Contents <01020f> >>",
+	)
+
+	output, _, verification, preservation, err := ApplyIncrementalTextEditPreservingSignatures(
+		input,
+		core.Match{Kind: KindTextShow, Text: "08-15-2024"},
+		core.Mutation{Replace: "May 5, 2026"},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("ApplyIncrementalTextEditPreservingSignatures: %v", err)
+	}
+	if output == nil || !bytes.HasPrefix(output, input) {
+		t.Fatal("output should preserve original signed bytes as a prefix")
+	}
+	if !verification.ReparseOK || !verification.OldTextRemoved || !verification.NewSelectable || !verification.PageUnchanged {
+		t.Fatalf("verification = %+v", verification)
+	}
+	if !preservation.ByteRangeProof || preservation.ByteRangesChecked != 2 || !preservation.SignedByteRangesUnchanged {
+		t.Fatalf("byte range preservation = %+v", preservation)
+	}
+	if preservation.CryptographicValidation {
+		t.Fatalf("CryptographicValidation = true, want false for unsupported subfilter")
+	}
+	if !strings.Contains(preservation.CryptographicValidationNote, "not performed") {
+		t.Fatalf("CryptographicValidationNote = %q, want explicit not performed note", preservation.CryptographicValidationNote)
+	}
+
+	info := inspectSignatureInfo(input)
+	if info.SubFilter != "ETSI.RFC3161" {
+		t.Fatalf("SubFilter = %q, want ETSI.RFC3161", info.SubFilter)
+	}
+	if info.CryptographicValidation || info.CryptographicValidationStatus != signatureCryptographicValidationNotPerformed {
+		t.Fatalf("signature info validation = %t/%q, want false/%q", info.CryptographicValidation, info.CryptographicValidationStatus, signatureCryptographicValidationNotPerformed)
+	}
+}
+
 func TestApplyIncrementalTextEditPreservingSignaturesSelectsMatchIndex(t *testing.T) {
 	content := []byte("BT\n(repeated) Tj\nET\n")
 	input := testPDF(
@@ -299,6 +339,51 @@ func TestApplyIncrementalTextEditPreservingSignaturesRequiresByteRangeForSignedP
 	)
 	if !errors.Is(err, ErrSignedPDFByteRangeProofRequired) {
 		t.Fatalf("error = %v, want ErrSignedPDFByteRangeProofRequired", err)
+	}
+}
+
+func TestApplyIncrementalTextEditPreservingSignaturesRejectsMalformedSignatureDictionaries(t *testing.T) {
+	tests := []struct {
+		name      string
+		signature string
+	}{
+		{
+			name:      "missing byte range",
+			signature: "<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /ETSI.RFC3161 /Contents <01020f> >>",
+		},
+		{
+			name:      "non array byte range",
+			signature: "<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /ETSI.RFC3161 /ByteRange (0 10 20 30) /Contents <01020f> >>",
+		},
+		{
+			name:      "odd byte range values",
+			signature: "<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /ETSI.RFC3161 /ByteRange [0 10 20] /Contents <01020f> >>",
+		},
+		{
+			name:      "wrong byte range value type",
+			signature: "<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /ETSI.RFC3161 /ByteRange [0 /bad 20 30] /Contents <01020f> >>",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := signedTextPDFWithSignatureDictionary("08-15-2024", tt.signature)
+
+			output, report, verification, preservation, err := ApplyIncrementalTextEditPreservingSignatures(
+				input,
+				core.Match{Kind: KindTextShow, Text: "08-15-2024"},
+				core.Mutation{Replace: "May 5, 2026"},
+				nil,
+			)
+			if !errors.Is(err, ErrSignedPDFByteRangeProofRequired) {
+				t.Fatalf("error = %v, want ErrSignedPDFByteRangeProofRequired", err)
+			}
+			if output != nil {
+				t.Fatal("malformed signature dictionary should not return edited output")
+			}
+			if report.Edit != "" || verification.ReparseOK || preservation.ByteRangeProof || preservation.CryptographicValidation {
+				t.Fatalf("partial metadata = report %+v verification %+v preservation %+v, want no validation claim", report, verification, preservation)
+			}
+		})
 	}
 }
 
@@ -392,4 +477,16 @@ func minimalIncrementalPDF(t *testing.T) ([]byte, int) {
 	fmt.Fprintf(&input, "%010d 00000 n \n", objectOffset)
 	fmt.Fprintf(&input, "trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", xrefOffset)
 	return input.Bytes(), xrefOffset
+}
+
+func signedTextPDFWithSignatureDictionary(text, signatureDictionary string) []byte {
+	content := []byte(fmt.Sprintf("BT\n(%s) Tj\nET\n", encodeLiteralString(text)))
+	return testPDF(
+		"<< /Type /Catalog /Pages 2 0 R /SigFlags 3 /AcroForm << /Fields [5 0 R] >> >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
+		"<< /FT /Sig /T (Approval) /V 6 0 R >>",
+		signatureDictionary,
+	)
 }

@@ -135,6 +135,62 @@ func TestSignatureInfoCAdESSubFilterContainerHint(t *testing.T) {
 	}
 }
 
+func TestSignatureInfoUnsupportedSubFiltersDoNotClaimValidation(t *testing.T) {
+	tests := []struct {
+		name             string
+		subFilter        string
+		wantContainer    string
+		wantDigest       string
+		wantDigestStatus string
+	}{
+		{
+			name:             "document timestamp",
+			subFilter:        "ETSI.RFC3161",
+			wantContainer:    signatureContainerUnknown,
+			wantDigest:       signatureDigestAlgorithmUnknown,
+			wantDigestStatus: signatureDigestAlgorithmNotParsed,
+		},
+		{
+			name:             "x509 rsa sha1",
+			subFilter:        "adbe.x509.rsa_sha1",
+			wantContainer:    signatureContainerUnknown,
+			wantDigest:       "sha1",
+			wantDigestStatus: signatureDigestAlgorithmSubFilterHint,
+		},
+		{
+			name:             "vendor extension",
+			subFilter:        "vendor.detached",
+			wantContainer:    signatureContainerUnknown,
+			wantDigest:       signatureDigestAlgorithmUnknown,
+			wantDigestStatus: signatureDigestAlgorithmNotParsed,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			info := inspectSignatureInfo(testPDF(
+				"<< /Type /Catalog /SigFlags 3 >>",
+				"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /"+tt.subFilter+" /ByteRange [0 10 20 30] /Contents <01020f> >>",
+			))
+
+			if !info.HasSignatureMarker {
+				t.Fatalf("HasSignatureMarker = false, want true")
+			}
+			if info.SubFilter != tt.subFilter {
+				t.Fatalf("SubFilter = %q, want %q", info.SubFilter, tt.subFilter)
+			}
+			if info.SignatureContainer != tt.wantContainer {
+				t.Fatalf("SignatureContainer = %q, want %q", info.SignatureContainer, tt.wantContainer)
+			}
+			if info.DigestAlgorithm != tt.wantDigest || info.DigestAlgorithmStatus != tt.wantDigestStatus {
+				t.Fatalf("digest algorithm = %q/%q, want %q/%q", info.DigestAlgorithm, info.DigestAlgorithmStatus, tt.wantDigest, tt.wantDigestStatus)
+			}
+			if info.CryptographicValidation || info.CryptographicValidationStatus != signatureCryptographicValidationNotPerformed {
+				t.Fatalf("cryptographic validation = %t/%q, want false/%q", info.CryptographicValidation, info.CryptographicValidationStatus, signatureCryptographicValidationNotPerformed)
+			}
+		})
+	}
+}
+
 func TestSignatureInfoMalformedByteRange(t *testing.T) {
 	info := inspectSignatureInfo(testPDF("<< /Type /Catalog /ByteRange [0 1 999999 10] >>", "<<>>"))
 
@@ -149,6 +205,45 @@ func TestSignatureInfoMalformedByteRange(t *testing.T) {
 	}
 	if info.CryptographicValidation || info.CryptographicValidationStatus != signatureCryptographicValidationNotPerformed {
 		t.Fatalf("cryptographic validation = %t/%q, want false/%q", info.CryptographicValidation, info.CryptographicValidationStatus, signatureCryptographicValidationNotPerformed)
+	}
+}
+
+func TestSignatureInfoMalformedByteRangeOrderingProof(t *testing.T) {
+	tests := []struct {
+		name   string
+		object string
+	}{
+		{
+			name:   "odd number of pairs",
+			object: "<< /Type /Catalog /ByteRange [0 1 2 3 4 5] >>",
+		},
+		{
+			name:   "zero length range",
+			object: "<< /Type /Catalog /ByteRange [0 1 2 0] >>",
+		},
+		{
+			name:   "overlapping ranges",
+			object: "<< /Type /Catalog /ByteRange [0 10 5 10] >>",
+		},
+		{
+			name:   "unsorted ranges",
+			object: "<< /Type /Catalog /ByteRange [20 10 0 10] >>",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			info := inspectSignatureInfo(testPDF(tt.object, "<<>>"))
+
+			if !info.HasSignatureMarker {
+				t.Fatalf("HasSignatureMarker = false, want true")
+			}
+			if info.ByteRangeCount != 0 || len(info.ByteRanges) != 0 {
+				t.Fatalf("byte ranges = count %d values %+v, want none", info.ByteRangeCount, info.ByteRanges)
+			}
+			if !errors.Is(info.MalformedByteRangeError, ErrSignedPDFByteRangeProofRequired) {
+				t.Fatalf("MalformedByteRangeError = %v, want ErrSignedPDFByteRangeProofRequired", info.MalformedByteRangeError)
+			}
+		})
 	}
 }
 
@@ -169,6 +264,53 @@ func TestSignatureInfoMalformedDirectDictionaryMetadataIsAbsent(t *testing.T) {
 	}
 	if info.SignatureContainer != signatureContainerUnknown || info.DigestAlgorithm != signatureDigestAlgorithmUnknown || info.DigestAlgorithmStatus != signatureDigestAlgorithmNotParsed {
 		t.Fatalf("signature diagnostics = container %q digest %q/%q, want unknown/unknown/%q", info.SignatureContainer, info.DigestAlgorithm, info.DigestAlgorithmStatus, signatureDigestAlgorithmNotParsed)
+	}
+}
+
+func TestSignatureInfoMalformedSignatureDictionariesDoNotClaimValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		objects []string
+	}{
+		{
+			name: "bad contents hex",
+			objects: []string{
+				"<< /Type /Catalog /SigFlags 3 >>",
+				"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /ETSI.RFC3161 /ByteRange [0 10 20 30] /Contents <0Z> >>",
+			},
+		},
+		{
+			name: "malformed signature object",
+			objects: []string{
+				"<< /Type /Catalog /SigFlags 3 >>",
+				"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /ETSI.RFC3161 /ByteRange [0 10 20 30] /Contents <0102> ",
+			},
+		},
+		{
+			name: "wrong metadata value types",
+			objects: []string{
+				"<< /Type /Catalog /SigFlags 3 >>",
+				"<< /Type /Sig /Filter 42 /SubFilter (ETSI.RFC3161) /M /Name /ByteRange [0 10 20 30] /Contents [1 2] >>",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			info := inspectSignatureInfo(testPDF(tt.objects...))
+
+			if !info.HasSignatureMarker {
+				t.Fatalf("HasSignatureMarker = false, want true")
+			}
+			if info.ContentsByteLength != nil {
+				t.Fatalf("ContentsByteLength = %v, want absent", *info.ContentsByteLength)
+			}
+			if info.SigningTime != "" {
+				t.Fatalf("SigningTime = %q, want absent", info.SigningTime)
+			}
+			if info.CryptographicValidation || info.CryptographicValidationStatus != signatureCryptographicValidationNotPerformed {
+				t.Fatalf("cryptographic validation = %t/%q, want false/%q", info.CryptographicValidation, info.CryptographicValidationStatus, signatureCryptographicValidationNotPerformed)
+			}
+		})
 	}
 }
 
