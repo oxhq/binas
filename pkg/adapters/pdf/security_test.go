@@ -1,6 +1,7 @@
 package pdf
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -66,9 +67,14 @@ func TestSecurityPasswordOptionFailsUnsupportedEncryptionAlgorithmWithMetadata(t
 
 func TestSecurityMetadataReportsAESV3CryptFiltersWithoutSecrets(t *testing.T) {
 	zero32 := strings.Repeat("00", 32)
+	ownerKey := strings.Repeat("11", 32)
+	userKey := strings.Repeat("22", 32)
+	ownerEncryptionKey := strings.Repeat("33", 32)
+	userEncryptionKey := strings.Repeat("44", 32)
+	perms := strings.Repeat("55", 16)
 	input := testPDF(
 		"<< /Type /Catalog /Encrypt 2 0 R >>",
-		fmt.Sprintf("<< /Filter /Standard /V 5 /R 6 /Length 256 /O <%s> /U <%s> /P -4 /StmF /StdCF /StrF /StdCF /EFF /StdCF /CF << /StdCF << /CFM /AESV3 /Length 256 /AuthEvent /DocOpen >> >> >>", zero32, zero32),
+		fmt.Sprintf("<< /Filter /Standard /V 5 /R 6 /Length 256 /O <%s> /U <%s> /OE <%s> /UE <%s> /Perms <%s> /P -4 /StmF /StdCF /StrF /StdCF /EFF /StdCF /CF << /StdCF << /CFM /AESV3 /Length 256 /AuthEvent /DocOpen >> >> >>", ownerKey, userKey, ownerEncryptionKey, userEncryptionKey, perms),
 	)
 
 	metadata := SecurityMetadataForInput(input)
@@ -89,6 +95,7 @@ func TestSecurityMetadataReportsAESV3CryptFiltersWithoutSecrets(t *testing.T) {
 	if filter.Name != "StdCF" || filter.CFM != "AESV3" || filter.AuthEvent != "DocOpen" || filter.Length == nil || *filter.Length != 256 {
 		t.Fatalf("crypt filter metadata = %+v, want StdCF AESV3 DocOpen Length=256", filter)
 	}
+	assertSecurityJSONDoesNotContain(t, metadata, "secret", ownerKey, userKey, ownerEncryptionKey, userEncryptionKey, perms, zero32)
 
 	err := CheckSecurity(input, SecurityOptions{Password: "secret"})
 	if !errors.Is(err, ErrEncryptedPDFUnsupportedAlgorithm) {
@@ -97,12 +104,14 @@ func TestSecurityMetadataReportsAESV3CryptFiltersWithoutSecrets(t *testing.T) {
 	if got := err.Error(); strings.Contains(got, "secret") || !strings.Contains(got, "CF.StdCF(CFM=AESV3") {
 		t.Fatalf("error = %q, want AESV3 metadata without password leakage", got)
 	}
+	assertStringDoesNotContain(t, err.Error(), "AESV3 error", ownerKey, userKey, ownerEncryptionKey, userEncryptionKey, perms, zero32)
 }
 
 func TestSecurityMetadataReportsPublicKeyEncryptionBoundary(t *testing.T) {
+	recipient := "01020304aabbccdd"
 	input := testPDF(
 		"<< /Type /Catalog /Encrypt 2 0 R >>",
-		"<< /Filter /Adobe.PubSec /SubFilter /adbe.pkcs7.s5 /V 4 /R 4 /Length 128 /Recipients [<01020304>] >>",
+		fmt.Sprintf("<< /Filter /Adobe.PubSec /SubFilter /adbe.pkcs7.s5 /V 4 /R 4 /Length 128 /Recipients [<%s>] >>", recipient),
 	)
 
 	metadata := SecurityMetadataForInput(input)
@@ -113,13 +122,38 @@ func TestSecurityMetadataReportsPublicKeyEncryptionBoundary(t *testing.T) {
 	if encryption.Filter != "Adobe.PubSec" || encryption.SubFilter != "adbe.pkcs7.s5" {
 		t.Fatalf("encryption metadata = %+v, want public-key filter/subfilter", encryption)
 	}
+	if !encryption.PublicKey || encryption.RecipientCount == nil || *encryption.RecipientCount != 1 {
+		t.Fatalf("public-key recipient metadata = %+v, want public_key=true recipient_count=1", encryption)
+	}
+	assertSecurityJSONDoesNotContain(t, metadata, "unused", recipient)
 
-	err := CheckSecurity(input, SecurityOptions{Password: "unused"})
+	err := CheckSecurity(input, SecurityOptions{})
 	if !errors.Is(err, ErrEncryptedPDFUnsupportedAlgorithm) {
 		t.Fatalf("CheckSecurity() error = %v, want ErrEncryptedPDFUnsupportedAlgorithm", err)
 	}
-	if got := err.Error(); strings.Contains(got, "01020304") || !strings.Contains(got, "Filter=Adobe.PubSec") || !strings.Contains(got, "SubFilter=adbe.pkcs7.s5") {
-		t.Fatalf("error = %q, want public-key metadata without recipient bytes", got)
+	if got := err.Error(); strings.Contains(got, recipient) || strings.Contains(got, "unused") || !strings.Contains(got, "Filter=Adobe.PubSec") || !strings.Contains(got, "SubFilter=adbe.pkcs7.s5") {
+		t.Fatalf("error = %q, want public-key fail-closed metadata without recipient bytes", got)
+	}
+}
+
+func assertSecurityJSONDoesNotContain(t *testing.T, metadata SecurityMetadata, values ...string) {
+	t.Helper()
+	data, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStringDoesNotContain(t, string(data), "security JSON", values...)
+}
+
+func assertStringDoesNotContain(t *testing.T, got, label string, values ...string) {
+	t.Helper()
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if strings.Contains(got, value) {
+			t.Fatalf("%s leaked %q in %q", label, value, got)
+		}
 	}
 }
 
@@ -130,6 +164,20 @@ func TestSecurityPasswordOptionAcceptsSupportedStandardRC4(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CheckSecurity() error = %v, want supported encrypted PDF", err)
 	}
+}
+
+func TestSecurityPasswordOptionAcceptsSupportedStandardAESV3AndRedactsWrongPassword(t *testing.T) {
+	input := standardEncryptedAESV3TextFixture(t, "08-15-2024")
+
+	if err := CheckSecurity(input, SecurityOptions{Password: "user"}); err != nil {
+		t.Fatalf("CheckSecurity(correct password) error = %v, want supported AESV3 encrypted PDF", err)
+	}
+
+	err := CheckSecurity(input, SecurityOptions{Password: "wrong-password-with-secret"})
+	if !errors.Is(err, ErrEncryptedPDFPasswordRequired) {
+		t.Fatalf("CheckSecurity(wrong password) error = %v, want ErrEncryptedPDFPasswordRequired", err)
+	}
+	assertStringDoesNotContain(t, err.Error(), "wrong-password error", "wrong-password-with-secret", "O=", "U=", "OE=", "UE=", "Perms=")
 }
 
 func TestSecuritySignaturePreserveIncrementalAcceptsParseableByteRangeProof(t *testing.T) {

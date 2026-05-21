@@ -742,6 +742,11 @@ func validationFailureError(result validationResult) error {
 }
 
 func parseInputWithPassword(adapter core.Adapter, input []byte, format string, opts core.ParseOptions, password string) (*core.Tree, error) {
+	if strings.ToLower(format) == "pdf" && password == "" {
+		if err := pdf.CheckSecurity(input, pdf.SecurityOptions{}); err != nil {
+			return nil, err
+		}
+	}
 	if strings.ToLower(format) == "pdf" && password != "" {
 		tree, err := pdf.ParseWithPassword(input, opts, password)
 		if err != nil && errors.Is(err, pdf.ErrEncryptedPDFUnsupportedAlgorithm) {

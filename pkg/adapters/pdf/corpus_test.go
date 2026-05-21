@@ -517,6 +517,49 @@ func TestCorpusObjectStreamFixtureParses(t *testing.T) {
 	}
 }
 
+func TestCorpusP4PreserveStructureObjectStreamOutputKeepsMarkerAndSelectableText(t *testing.T) {
+	input := readCorpusPDF(t, "p4-object-stream-preserve-text.pdf")
+
+	output, report, verification, err := ApplyCanonicalEditWithWriterMode(
+		input,
+		PDFWriterModePreserveStructure,
+		core.Match{Kind: KindTextShow, Text: "08-15-2024"},
+		core.Mutation{Replace: "05-20-2026"},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("ApplyCanonicalEditWithWriterMode preserve-structure object stream: %v", err)
+	}
+	assertCorpusP4PreserveStructureReport(t, report, verification)
+	if !bytes.Contains(output, []byte("/Type /ObjStm")) {
+		t.Fatalf("preserve-structure object-stream output lost /ObjStm marker:\n%s", output)
+	}
+	assertCorpusP4OutputSelectableText(t, output, "08-15-2024", "05-20-2026")
+}
+
+func TestCorpusP4PreserveStructureXrefStreamOutputKeepsMarkerAndSelectableText(t *testing.T) {
+	input := readCorpusPDF(t, "p4-xref-stream-preserve-text.pdf")
+
+	output, report, verification, err := ApplyCanonicalEditWithWriterMode(
+		input,
+		PDFWriterModePreserveStructure,
+		core.Match{Kind: KindTextShow, Text: "08-15-2024"},
+		core.Mutation{Replace: "05-20-2026"},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("ApplyCanonicalEditWithWriterMode preserve-structure xref stream: %v", err)
+	}
+	assertCorpusP4PreserveStructureReport(t, report, verification)
+	if !bytes.Contains(output, []byte("/Type /XRef")) {
+		t.Fatalf("preserve-structure xref-stream output lost /Type /XRef marker:\n%s", output)
+	}
+	if bytes.Contains(output, []byte("\nxref\n")) {
+		t.Fatalf("preserve-structure xref-stream output rebuilt a table xref:\n%s", output)
+	}
+	assertCorpusP4OutputSelectableText(t, output, "08-15-2024", "05-20-2026")
+}
+
 func TestCorpusQuoteOperatorsRewriteLiteralAndHexText(t *testing.T) {
 	content := []byte("BT\n/F1 12 Tf\n14 TL\n(LineOld) '\n3 4 <4865784F6C64> \"\nET\n")
 	input := testPDF(
@@ -708,6 +751,32 @@ func assertCorpusTextMatches(t *testing.T, tree *core.Tree, text string, want in
 	if len(got) != want {
 		t.Fatalf("%q matches = %d, want %d", text, len(got), want)
 	}
+}
+
+func assertCorpusP4PreserveStructureReport(t *testing.T, report core.Report, verification core.Verification) {
+	t.Helper()
+	if report.FallbackUsed {
+		t.Fatalf("report = %+v, want no fallback", report)
+	}
+	if report.Meta["writer_mode"] != string(PDFWriterModePreserveStructure) {
+		t.Fatalf("writer_mode = %v, want %q; meta=%+v", report.Meta["writer_mode"], PDFWriterModePreserveStructure, report.Meta)
+	}
+	if report.Meta["used_canonical_writer_path"] != false {
+		t.Fatalf("used_canonical_writer_path = %v, want false; meta=%+v", report.Meta["used_canonical_writer_path"], report.Meta)
+	}
+	if !verification.ReparseOK || !verification.OldTextRemoved || !verification.NewSelectable || !verification.PageUnchanged {
+		t.Fatalf("verification = %+v, want reparse/old-gone/new-selectable/page-unchanged", verification)
+	}
+}
+
+func assertCorpusP4OutputSelectableText(t *testing.T, output []byte, oldText, newText string) {
+	t.Helper()
+	reparsed, err := NewAdapter().Parse(output, core.ParseOptions{Strict: true})
+	if err != nil {
+		t.Fatalf("reparse preserve-structure output: %v\n%s", err, output)
+	}
+	assertCorpusTextMatches(t, reparsed, oldText, 0)
+	assertCorpusTextMatches(t, reparsed, newText, 1)
 }
 
 type p3DecodeParmsRewriteFixture struct {

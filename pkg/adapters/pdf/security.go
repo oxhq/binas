@@ -47,6 +47,8 @@ type EncryptionMetadata struct {
 	StringFilter       string                  `json:"string_filter,omitempty"`
 	EmbeddedFileFilter string                  `json:"embedded_file_filter,omitempty"`
 	CryptFilters       []EncryptionCryptFilter `json:"crypt_filters,omitempty"`
+	PublicKey          bool                    `json:"public_key,omitempty"`
+	RecipientCount     *int                    `json:"recipient_count,omitempty"`
 	ObjectNumber       *int                    `json:"object_number,omitempty"`
 	ObjectGeneration   *int                    `json:"object_generation,omitempty"`
 	DictionaryParsed   bool                    `json:"dictionary_parsed"`
@@ -156,6 +158,10 @@ func rejectUnsupportedSecurityBoundariesWithOptions(boundaries residualBoundaryS
 
 func rejectUnsupportedSecurityBoundariesWithInput(input []byte, boundaries residualBoundarySummary, opts SecurityOptions) error {
 	if boundaries.HasEncryption {
+		encryption := encryptionMetadataForInput(input)
+		if encryption.isPublicKeyBoundary() || encryption.SubFilter != "" || (encryption.Filter != "" && encryption.Filter != "Standard") {
+			return &UnsupportedEncryptionAlgorithmError{Encryption: encryption}
+		}
 		if opts.Password == "" {
 			return ErrEncryptedPDFPasswordRequired
 		}
@@ -171,7 +177,7 @@ func rejectUnsupportedSecurityBoundariesWithInput(input []byte, boundaries resid
 				if errors.As(err, &unsupported) {
 					return err
 				}
-				return &UnsupportedEncryptionAlgorithmError{Encryption: encryptionMetadataForInput(input)}
+				return &UnsupportedEncryptionAlgorithmError{Encryption: encryption}
 			}
 			return err
 		}
@@ -259,6 +265,14 @@ func applyEncryptionDictMetadata(metadata *EncryptionMetadata, dict pdfDict) {
 	if subFilter, ok := dictPDFName(dict, "SubFilter"); ok {
 		metadata.SubFilter = subFilter
 	}
+	if metadata.Filter == "Adobe.PubSec" {
+		metadata.PublicKey = true
+	}
+	if value, ok := dict["Recipients"]; ok {
+		metadata.PublicKey = true
+		count := encryptionRecipientCount(value)
+		metadata.RecipientCount = &count
+	}
 	if value, ok := dictInt(dict, "V"); ok {
 		metadata.V = &value
 	}
@@ -322,6 +336,12 @@ func (m EncryptionMetadata) summaryParts() []string {
 	if m.EmbeddedFileFilter != "" {
 		parts = append(parts, "EFF="+m.EmbeddedFileFilter)
 	}
+	if m.PublicKey {
+		parts = append(parts, "PublicKey=true")
+	}
+	if m.RecipientCount != nil {
+		parts = append(parts, fmt.Sprintf("Recipients=%d", *m.RecipientCount))
+	}
 	for _, filter := range m.CryptFilters {
 		if filter.Name == "" {
 			continue
@@ -347,6 +367,10 @@ func (m EncryptionMetadata) summaryParts() []string {
 		parts = append(parts, fmt.Sprintf("Object=%d %d R", *m.ObjectNumber, *m.ObjectGeneration))
 	}
 	return parts
+}
+
+func (m EncryptionMetadata) isPublicKeyBoundary() bool {
+	return m.PublicKey || (m.RecipientCount != nil && *m.RecipientCount > 0)
 }
 
 func encryptionCryptFilterMetadata(cf pdfDict) []EncryptionCryptFilter {
@@ -375,6 +399,17 @@ func encryptionCryptFilterMetadata(cf pdfDict) []EncryptionCryptFilter {
 		filters = append(filters, filter)
 	}
 	return filters
+}
+
+func encryptionRecipientCount(value pdfValue) int {
+	switch v := value.(type) {
+	case pdfArray:
+		return len(v)
+	case pdfLiteralString, pdfHexString, pdfDecryptedString:
+		return 1
+	default:
+		return 0
+	}
 }
 
 type signatureByteRange struct {

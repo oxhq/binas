@@ -14,7 +14,7 @@ const (
 	PDFWriterModePreserveStructure PDFWriterMode = "preserve-structure"
 )
 
-var ErrPreserveStructureRepackUnsupported = errors.New("preserve-structure PDF writer cannot repack object streams or xref streams")
+var ErrPreserveStructureRepackUnsupported = errors.New("preserve-structure PDF writer cannot repack this object/xref stream layout")
 
 type PreserveStructureUnsupportedError struct {
 	Plan    pdfStructurePlan
@@ -23,8 +23,8 @@ type PreserveStructureUnsupportedError struct {
 
 func (e *PreserveStructureUnsupportedError) Error() string {
 	details := e.structureDetails()
-	return fmt.Sprintf(
-		"%v: preserve-structure requested but structure_plan requires packed writer support (has_table_xref=%t, has_xref_stream=%t, has_hybrid_xref=%t, object_stream_objects=%d, xref_stream_objects=%d)",
+	message := fmt.Sprintf(
+		"%v: preserve-structure requested but structure_plan requires unsupported packed writer handling (has_table_xref=%t, has_xref_stream=%t, has_hybrid_xref=%t, object_stream_objects=%d, xref_stream_objects=%d)",
 		ErrPreserveStructureRepackUnsupported,
 		details["has_table_xref"],
 		details["has_xref_stream"],
@@ -32,6 +32,10 @@ func (e *PreserveStructureUnsupportedError) Error() string {
 		details["object_stream_objects"],
 		details["xref_stream_objects"],
 	)
+	if reason, ok := details["reason"].(string); ok && reason != "" {
+		message += ": " + reason
+	}
+	return message
 }
 
 func (e *PreserveStructureUnsupportedError) Unwrap() error {
@@ -68,7 +72,14 @@ func ApplyCanonicalEditWithWriterMode(input []byte, mode PDFWriterMode, selector
 	if err != nil {
 		return nil, core.Report{}, core.Verification{}, err
 	}
-	output, report, verification, err := ApplyCanonicalEdit(input, selector, mutation, invariants)
+	output, report, verification, err := editCanonicalWithOptions(
+		input,
+		selector,
+		mutation,
+		invariants,
+		pdfGraphParseOptions{},
+		pdfCanonicalWriteOptions{WriterMode: mode},
+	)
 	if err != nil {
 		return nil, core.Report{}, core.Verification{}, err
 	}
@@ -83,9 +94,13 @@ type pdfWriterModeProof struct {
 }
 
 func (p pdfWriterModeProof) reportMeta() map[string]any {
+	writerPath := "canonical"
+	if p.Mode == PDFWriterModePreserveStructure && !p.UsedCanonicalWriterPath {
+		writerPath = p.StructurePlan.writerPath()
+	}
 	return map[string]any{
 		"writer_mode":                string(p.Mode),
-		"writer_path":                "canonical",
+		"writer_path":                writerPath,
 		"used_canonical_writer_path": p.UsedCanonicalWriterPath,
 		"structure_plan":             p.StructurePlan.metadata(),
 	}
@@ -101,8 +116,12 @@ func ensurePDFWriterModeSupported(input []byte, mode PDFWriterMode, parseOpts pd
 	if mode != PDFWriterModePreserveStructure {
 		return pdfWriterModeProof{Mode: mode, UsedCanonicalWriterPath: true}, nil
 	}
+	xref := summarizeXref(input)
 	graph, err := parsePDFGraphWithOptions(input, parseOpts)
 	if err != nil {
+		if xrefSummaryRequiresPackedWriter(xref) {
+			return pdfWriterModeProof{}, newPreserveStructureUnsupportedXrefSummaryError(xref, err)
+		}
 		return pdfWriterModeProof{}, err
 	}
 	return ensurePDFWriterModeSupportedForGraph(graph, mode)
@@ -121,13 +140,38 @@ func ensurePDFWriterModeSupportedForGraph(graph *pdfGraph, mode PDFWriterMode) (
 		StructurePlan:           plan,
 		UsedCanonicalWriterPath: !plan.requiresPackedWriter(),
 	}
-	if !plan.requiresPackedWriter() {
-		return proof, nil
+	if plan.UnknownObjects > 0 {
+		return pdfWriterModeProof{}, &PreserveStructureUnsupportedError{
+			Plan:    plan,
+			Details: plan.metadata(),
+		}
 	}
-	return pdfWriterModeProof{}, &PreserveStructureUnsupportedError{
-		Plan:    plan,
-		Details: plan.metadata(),
+	return proof, nil
+}
+
+func xrefSummaryRequiresPackedWriter(xref xrefSummary) bool {
+	return xref.HasObjectStream || xref.HasStream || xref.HasHybridStream
+}
+
+func newPreserveStructureUnsupportedXrefSummaryError(xref xrefSummary, parseErr error) *PreserveStructureUnsupportedError {
+	details := map[string]any{
+		"total_objects":             len(xref.Objects),
+		"normal_objects":            len(xref.Objects),
+		"object_stream_objects":     len(xref.ObjectStreamObjects),
+		"xref_stream_objects":       len(xref.StreamObjects),
+		"unknown_objects":           0,
+		"has_table_xref":            xref.HasTable,
+		"has_xref_stream":           xref.HasStream,
+		"has_hybrid_xref":           xref.HasHybridStream,
+		"hybrid_stream_offset":      xref.HybridStreamOffset,
+		"unsupported_xref_stream":   xref.UnsupportedXrefStream,
+		"unsupported_object_stream": xref.UnsupportedObjectStream,
+		"requires_packed_writer":    xrefSummaryRequiresPackedWriter(xref),
 	}
+	if parseErr != nil {
+		details["parse_error"] = parseErr.Error()
+	}
+	return &PreserveStructureUnsupportedError{Details: details}
 }
 
 func mergeReportMeta(base map[string]any, extra map[string]any) map[string]any {

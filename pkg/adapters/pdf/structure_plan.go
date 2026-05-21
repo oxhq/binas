@@ -44,6 +44,19 @@ func (p pdfStructurePlan) requiresPackedWriter() bool {
 	return p.ObjectStreamObjects > 0 || p.XrefStreamObjects > 0 || p.HasHybridXref
 }
 
+func (p pdfStructurePlan) writerPath() string {
+	if !p.requiresPackedWriter() {
+		return "canonical"
+	}
+	if p.ObjectStreamObjects > 0 {
+		return "preserve-packed"
+	}
+	if p.HasHybridXref {
+		return "hybrid_xref_stream"
+	}
+	return "xref_stream"
+}
+
 func summarizePDFStructurePlan(graph *pdfGraph) pdfStructurePlan {
 	if graph == nil {
 		return pdfStructurePlan{}

@@ -77,6 +77,7 @@ type pdfGraphParseOptions struct {
 type pdfCanonicalWriteOptions struct {
 	AllowSignatureInvalidation bool
 	AllowEncryption            bool
+	WriterMode                 PDFWriterMode
 }
 
 func parsePDFGraph(input []byte) (*pdfGraph, error) {
@@ -1036,7 +1037,7 @@ func editCanonicalWithOptions(input []byte, selector core.Match, mutation core.M
 	delete(stream.Dict, "DecodeParms")
 	stream.Dict["Length"] = len(stream.Data)
 	candidate.Object.Value = stream
-	output, err := writeCanonicalPDFWithOptions(graph, writeOpts)
+	output, err := writePDFGraphWithOptions(graph, writeOpts)
 	if err != nil {
 		return nil, core.Report{}, core.Verification{}, err
 	}
@@ -1312,6 +1313,13 @@ func encodeCanonicalTextReplacement(show parsedTextShow, replacement string) (st
 
 func writeCanonicalPDF(graph *pdfGraph) ([]byte, error) {
 	return writeCanonicalPDFWithOptions(graph, pdfCanonicalWriteOptions{})
+}
+
+func writePDFGraphWithOptions(graph *pdfGraph, opts pdfCanonicalWriteOptions) ([]byte, error) {
+	if opts.WriterMode == PDFWriterModePreserveStructure {
+		return writePreserveStructurePDFWithOptions(graph, opts)
+	}
+	return writeCanonicalPDFWithOptions(graph, opts)
 }
 
 func writeCanonicalPDFWithOptions(graph *pdfGraph, opts pdfCanonicalWriteOptions) ([]byte, error) {

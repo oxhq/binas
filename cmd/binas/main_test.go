@@ -7,6 +7,7 @@ import (
 	"crypto/cipher"
 	"crypto/md5"
 	"crypto/rc4"
+	"crypto/sha256"
 	"encoding/ascii85"
 	"encoding/binary"
 	"encoding/hex"
@@ -437,7 +438,8 @@ func TestCLIInspectEncryptedPDFJSONIncludesSecurityMetadata(t *testing.T) {
 	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
 		t.Fatal(err)
 	}
-	if result.ParseError != "unsupported PDF: encrypted PDFs require an explicit password-capable path; Adapter.Parse does not decrypt" {
+	if !strings.Contains(result.ParseError, "encrypted PDFs require an explicit password-capable path") &&
+		(!strings.Contains(result.ParseError, "unsupported PDF: encrypted PDFs are not parser-wired") || !strings.Contains(result.ParseError, "SubFilter=adbe.pkcs7.s5")) {
 		t.Fatalf("parse_error = %q", result.ParseError)
 	}
 	enc := result.Root.Security.Encryption
@@ -489,6 +491,47 @@ func TestCLIValidateEncryptedPDFPasswordReportsUnsupportedAlgorithmMetadata(t *t
 	if result.Valid || len(result.Errors) != 1 || !strings.Contains(result.Errors[0], "unsupported encryption algorithm/handler") {
 		t.Fatalf("validation result = %+v, want unsupported encryption algorithm error", result)
 	}
+}
+
+func TestCLIPublicKeyEncryptedPDFReportsRecipientMetadataWithoutRecipientBytes(t *testing.T) {
+	recipient := "01020304aabbccdd"
+	path := writePublicKeyEncryptedFixture(t, recipient)
+
+	inspectOut := captureStdout(t, func() error {
+		return run([]string{"inspect", path, "--format", "pdf", "--json"})
+	})
+	assertStringDoesNotContain(t, inspectOut, "public-key inspect JSON", recipient)
+	var inspect struct {
+		ParseError string `json:"parse_error"`
+		Root       struct {
+			Security struct {
+				Encryption struct {
+					Filter         string `json:"filter"`
+					SubFilter      string `json:"sub_filter"`
+					PublicKey      bool   `json:"public_key"`
+					RecipientCount int    `json:"recipient_count"`
+				} `json:"encryption"`
+			} `json:"security"`
+		} `json:"root"`
+	}
+	if err := json.Unmarshal([]byte(inspectOut), &inspect); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(inspect.ParseError, "unsupported encryption algorithm/handler") {
+		t.Fatalf("parse_error = %q, want public-key unsupported encryption error", inspect.ParseError)
+	}
+	enc := inspect.Root.Security.Encryption
+	if enc.Filter != "Adobe.PubSec" || enc.SubFilter != "adbe.pkcs7.s5" || !enc.PublicKey || enc.RecipientCount != 1 {
+		t.Fatalf("public-key inspect metadata = %+v", enc)
+	}
+
+	validateOut, err := captureStdoutAndError(t, func() error {
+		return run([]string{"validate", path, "--format", "pdf", "--json", "--fail-on-invalid"})
+	})
+	if err == nil || !strings.Contains(err.Error(), "unsupported encryption algorithm/handler") || strings.Contains(err.Error(), recipient) {
+		t.Fatalf("validate error = %v, want public-key unsupported error without recipient bytes", err)
+	}
+	assertStringDoesNotContain(t, validateOut, "public-key validate JSON", recipient)
 }
 
 func TestCLIQueryEncryptedPDFWithPasswordFindsSelectableText(t *testing.T) {
@@ -845,6 +888,119 @@ func TestCLIEditEncryptedXrefStreamPDFWithPasswordCanonicalInflatesReencryptsAnd
 		return run([]string{"query", out, "--format", "pdf", "--password", "user", "--kind", "pdf.content.text_show", "--text", "05-05-2026", "--json"})
 	})
 	assertCLIQueryCount(t, newQueryOut, 1)
+}
+
+func TestCLIEditAESV3EncryptedPDFsWithPasswordCanonicalReencryptsAndVerifies(t *testing.T) {
+	cases := []struct {
+		name       string
+		fixture    func(*testing.T, string) string
+		outputName string
+	}{
+		{
+			name:       "normal-content",
+			fixture:    writeSupportedAESV3EncryptedFixture,
+			outputName: "encrypted-aesv3-out.pdf",
+		},
+		{
+			name:       "object-stream",
+			fixture:    writeSupportedAESV3EncryptedObjectStreamFixture,
+			outputName: "encrypted-aesv3-object-stream-out.pdf",
+		},
+		{
+			name:       "xref-stream",
+			fixture:    writeSupportedAESV3EncryptedXrefStreamFixture,
+			outputName: "encrypted-aesv3-xref-stream-out.pdf",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := tc.fixture(t, "08-15-2024")
+			out := filepath.Join(t.TempDir(), tc.outputName)
+
+			validateOut := captureStdout(t, func() error {
+				return run([]string{"validate", path, "--format", "pdf", "--password", "user", "--json", "--fail-on-invalid"})
+			})
+			var validation validationResult
+			if err := json.Unmarshal([]byte(validateOut), &validation); err != nil {
+				t.Fatal(err)
+			}
+			if !validation.Valid || len(validation.Errors) != 0 {
+				t.Fatalf("AESV3 validation = %+v, want valid encrypted PDF with password", validation)
+			}
+
+			inspectOut := captureStdout(t, func() error {
+				return run([]string{"inspect", path, "--format", "pdf", "--password", "user", "--json"})
+			})
+			var inspect struct {
+				Nodes int    `json:"nodes"`
+				Error string `json:"parse_error"`
+			}
+			if err := json.Unmarshal([]byte(inspectOut), &inspect); err != nil {
+				t.Fatal(err)
+			}
+			if inspect.Nodes == 0 || inspect.Error != "" {
+				t.Fatalf("AESV3 inspect = %+v, want parsed encrypted tree", inspect)
+			}
+
+			initialQueryOut := captureStdout(t, func() error {
+				return run([]string{"query", path, "--format", "pdf", "--password", "user", "--kind", "pdf.content.text_show", "--text", "08-15-2024", "--json"})
+			})
+			assertCLIQueryCount(t, initialQueryOut, 1)
+
+			_, err := captureStdoutAndError(t, func() error {
+				return run([]string{"query", path, "--format", "pdf", "--password", "wrong", "--kind", "pdf.content.text_show", "--text", "08-15-2024", "--json"})
+			})
+			if err == nil || !strings.Contains(err.Error(), "supplied password did not authenticate") || strings.Contains(err.Error(), "wrong") {
+				t.Fatalf("wrong-password query error = %v, want sanitized authentication failure", err)
+			}
+
+			stdout := captureStdout(t, func() error {
+				return run([]string{
+					"edit", path,
+					"--format", "pdf",
+					"--password", "user",
+					"--rewrite", "auto",
+					"--kind", "pdf.content.text_show",
+					"--text", "08-15-2024",
+					"--replace", "05-05-2026",
+					"-o", out,
+					"--json",
+				})
+			})
+			assertCanonicalCLIEditResult(t, stdout)
+			output, err := os.ReadFile(out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.Contains(output, []byte("08-15-2024")) || bytes.Contains(output, []byte("05-05-2026")) {
+				t.Fatal("AESV3 output contains plaintext old/new text; want encrypted content")
+			}
+
+			_, err = captureStdoutAndError(t, func() error {
+				return run([]string{"query", out, "--format", "pdf", "--kind", "pdf.content.text_show", "--text", "05-05-2026", "--json"})
+			})
+			if err == nil || !strings.Contains(err.Error(), "encrypted PDFs require an explicit password") {
+				t.Fatalf("query without password on AESV3 output error = %v, want encrypted-PDF refusal", err)
+			}
+
+			oldQueryOut := captureStdout(t, func() error {
+				return run([]string{"query", out, "--format", "pdf", "--password", "user", "--kind", "pdf.content.text_show", "--text", "08-15-2024", "--json"})
+			})
+			assertCLIQueryCount(t, oldQueryOut, 0)
+
+			newQueryOut := captureStdout(t, func() error {
+				return run([]string{"query", out, "--format", "pdf", "--password", "user", "--kind", "pdf.content.text_show", "--text", "05-05-2026", "--json"})
+			})
+			assertCLIQueryCount(t, newQueryOut, 1)
+
+			_, err = captureStdoutAndError(t, func() error {
+				return run([]string{"query", out, "--format", "pdf", "--password", "wrong", "--kind", "pdf.content.text_show", "--text", "05-05-2026", "--json"})
+			})
+			if err == nil || !strings.Contains(err.Error(), "supplied password did not authenticate") || strings.Contains(err.Error(), "wrong") {
+				t.Fatalf("wrong-password output query error = %v, want sanitized authentication failure", err)
+			}
+		})
+	}
 }
 
 func TestCLIEditEncryptedPDFSurgicalPasswordFailsClosed(t *testing.T) {
@@ -2201,6 +2357,15 @@ func TestCLIEditPreserveStructureTableXrefUsesAdapterWriterMode(t *testing.T) {
 		})
 	})
 	assertCanonicalCLIEditResult(t, stdout)
+	result := decodePreserveStructureCLIEditResult(t, stdout)
+	assertPreserveStructureCLIReportMeta(t, result.Report.Meta, "canonical", true, map[string]any{
+		"has_table_xref":         true,
+		"has_xref_stream":        false,
+		"has_hybrid_xref":        false,
+		"object_stream_objects":  0,
+		"xref_stream_objects":    0,
+		"requires_packed_writer": false,
+	})
 }
 
 func TestCLIEditCanonicalRewriteWritesVerifiedPDF(t *testing.T) {
@@ -2516,50 +2681,77 @@ func TestCLIEditObjectStreamPDFUsesCanonicalForAutoAndRejectsSurgical(t *testing
 	}
 }
 
-func TestCLIEditPreserveStructurePackedPDFsFailClosedWithExplicitRepackError(t *testing.T) {
+func TestCLIEditPreserveStructurePackedPDFsUsePreserveWriter(t *testing.T) {
 	cases := []struct {
-		name    string
-		fixture func(*testing.T) string
-		details []string
+		name           string
+		fixture        func(*testing.T) string
+		writerPath     string
+		wantStructure  map[string]any
+		wantOutputByte []byte
 	}{
 		{
-			name:    "object-stream",
-			fixture: writeObjectStreamContentFixture,
-			details: []string{"object_stream_objects=1", "xref_stream_objects=0"},
+			name:       "object-stream",
+			fixture:    writeObjectStreamContentFixture,
+			writerPath: "preserve-packed",
+			wantStructure: map[string]any{
+				"has_table_xref":         true,
+				"has_xref_stream":        false,
+				"has_hybrid_xref":        false,
+				"object_stream_objects":  1,
+				"xref_stream_objects":    0,
+				"requires_packed_writer": true,
+			},
+			wantOutputByte: []byte("/Type /ObjStm"),
 		},
 		{
-			name:    "xref-stream",
-			fixture: writeXrefStreamContentFixture,
-			details: []string{"object_stream_objects=0", "xref_stream_objects=1"},
+			name:       "xref-stream",
+			fixture:    writeXrefStreamContentFixture,
+			writerPath: "xref_stream",
+			wantStructure: map[string]any{
+				"has_table_xref":         false,
+				"has_xref_stream":        true,
+				"has_hybrid_xref":        false,
+				"object_stream_objects":  0,
+				"xref_stream_objects":    1,
+				"requires_packed_writer": true,
+			},
+			wantOutputByte: []byte("/Type /XRef"),
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			path := tc.fixture(t)
 			out := filepath.Join(t.TempDir(), "out.pdf")
-			err := run([]string{
-				"edit", path,
-				"--format", "pdf",
-				"--kind", "pdf.content.text_show",
-				"--text", "08-15-2024",
-				"--replace", "May 5, 2026",
-				"--rewrite", "preserve-structure",
-				"-o", out,
-				"--json",
+			stdout := captureStdout(t, func() error {
+				return run([]string{
+					"edit", path,
+					"--format", "pdf",
+					"--kind", "pdf.content.text_show",
+					"--text", "08-15-2024",
+					"--replace", "May 5, 2026",
+					"--rewrite", "preserve-structure",
+					"--verify", "reparse,old-gone,new-selectable",
+					"-o", out,
+					"--json",
+				})
 			})
-			if err == nil {
-				t.Fatal("preserve-structure edit succeeded, want packed writer refusal")
+			result := decodePreserveStructureCLIEditResult(t, stdout)
+			if result.Report.OutputPath != out {
+				t.Fatalf("output_path = %q, want %q", result.Report.OutputPath, out)
 			}
-			if !strings.Contains(err.Error(), "preserve-structure PDF writer cannot repack object streams or xref streams") {
-				t.Fatalf("error = %q, want explicit preserve-structure repack refusal", err)
+			if result.Report.Edit != "pdf.canonical_content_stream_text_rewrite" || result.Report.FallbackUsed || result.Report.NodesModified != 1 {
+				t.Fatalf("report = %+v, want preserve-structure edit without fallback", result.Report)
 			}
-			for _, detail := range tc.details {
-				if !strings.Contains(err.Error(), detail) {
-					t.Fatalf("error = %q, want detail %q", err, detail)
-				}
+			if !result.Verification.ReparseOK || !result.Verification.OldTextRemoved || !result.Verification.NewSelectable {
+				t.Fatalf("verification = %+v, want reparse/old-gone/new-selectable", result.Verification)
 			}
-			if _, statErr := os.Stat(out); !os.IsNotExist(statErr) {
-				t.Fatalf("output file exists after preserve-structure refusal: %v", statErr)
+			assertPreserveStructureCLIReportMeta(t, result.Report.Meta, tc.writerPath, false, tc.wantStructure)
+			written, err := os.ReadFile(out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Contains(written, tc.wantOutputByte) {
+				t.Fatalf("preserve-structure output missing %q:\n%s", tc.wantOutputByte, written)
 			}
 		})
 	}
@@ -3456,6 +3648,35 @@ func writeEncryptedFixture(t *testing.T) string {
 	return path
 }
 
+func writePublicKeyEncryptedFixture(t *testing.T, recipient string) string {
+	t.Helper()
+	var input bytes.Buffer
+	input.WriteString("%PDF-1.4\n")
+	offsets := make([]int, 0, 3)
+	writeObject := func(number int, body []byte) {
+		t.Helper()
+		offsets = append(offsets, input.Len())
+		fmt.Fprintf(&input, "%d 0 obj\n", number)
+		input.Write(body)
+		input.WriteString("\nendobj\n")
+	}
+	writeObject(1, []byte("<< /Type /Catalog /Pages 3 0 R >>"))
+	writeObject(2, []byte(fmt.Sprintf("<< /Filter /Adobe.PubSec /SubFilter /adbe.pkcs7.s5 /V 4 /R 4 /Length 128 /Recipients [<%s>] >>", recipient)))
+	writeObject(3, []byte("<< /Type /Page >>"))
+	xrefOffset := input.Len()
+	input.WriteString("xref\n0 4\n")
+	input.WriteString("0000000000 65535 f \n")
+	for _, offset := range offsets {
+		fmt.Fprintf(&input, "%010d 00000 n \n", offset)
+	}
+	fmt.Fprintf(&input, "trailer\n<< /Size 4 /Root 1 0 R /Encrypt 2 0 R >>\nstartxref\n%d\n%%%%EOF\n", xrefOffset)
+	path := filepath.Join(t.TempDir(), "public-key-encrypted.pdf")
+	if err := os.WriteFile(path, input.Bytes(), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 func writeSupportedEncryptedFixture(t *testing.T, text string) string {
 	t.Helper()
 	fileID := []byte("fixture-file-id1")
@@ -3767,6 +3988,171 @@ func writeSupportedAESV2StreamCryptEncryptedFixture(t *testing.T, text string) s
 	return path
 }
 
+func writeSupportedAESV3EncryptedFixture(t *testing.T, text string) string {
+	t.Helper()
+	fileID := []byte("revision5-aesv3")
+	fileKey, encryptObject := cliStandardAESV3EncryptionObject(t)
+	content := []byte(fmt.Sprintf("BT\n(%s) Tj\nET\n", strings.ReplaceAll(text, "-", `\055`)))
+	encryptedContent := cliAESV3Object(t, fileKey, content)
+	encryptedTitle := cliAESV3Object(t, fileKey, []byte("Sensitive Title"))
+
+	var input bytes.Buffer
+	input.WriteString("%PDF-1.7\n")
+	offsets := make([]int, 0, 6)
+	writeObject := func(number int, body []byte) {
+		t.Helper()
+		offsets = append(offsets, input.Len())
+		fmt.Fprintf(&input, "%d 0 obj\n", number)
+		input.Write(body)
+		input.WriteString("\nendobj\n")
+	}
+	writeObject(1, []byte("<< /Type /Catalog /Pages 2 0 R >>"))
+	writeObject(2, []byte("<< /Type /Pages /Kids [3 0 R] /Count 1 >>"))
+	writeObject(3, []byte("<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>"))
+	offsets = append(offsets, input.Len())
+	input.WriteString("4 0 obj\n")
+	fmt.Fprintf(&input, "<< /Length %d >>\nstream\n", len(encryptedContent))
+	input.Write(encryptedContent)
+	input.WriteString("\nendstream\nendobj\n")
+	writeObject(5, []byte(fmt.Sprintf("<< /Title <%s> >>", hex.EncodeToString(encryptedTitle))))
+	writeObject(6, []byte(encryptObject))
+
+	xrefOffset := input.Len()
+	input.WriteString("xref\n0 7\n")
+	input.WriteString("0000000000 65535 f \n")
+	for _, offset := range offsets {
+		fmt.Fprintf(&input, "%010d 00000 n \n", offset)
+	}
+	fmt.Fprintf(&input, "trailer\n<< /Size 7 /Root 1 0 R /Info 5 0 R /Encrypt 6 0 R /ID [<%s> <%s>] >>\nstartxref\n%d\n%%%%EOF\n",
+		hex.EncodeToString(fileID),
+		hex.EncodeToString(fileID),
+		xrefOffset,
+	)
+	path := filepath.Join(t.TempDir(), "supported-aesv3-encrypted.pdf")
+	if err := os.WriteFile(path, input.Bytes(), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func writeSupportedAESV3EncryptedObjectStreamFixture(t *testing.T, text string) string {
+	t.Helper()
+	fileID := []byte("revision5-aesv3")
+	fileKey, encryptObject := cliStandardAESV3EncryptionObject(t)
+	content := []byte(fmt.Sprintf("BT\n(%s) Tj\nET\n", strings.ReplaceAll(text, "-", `\055`)))
+	encryptedContent := cliAESV3Object(t, fileKey, content)
+	encryptedTitle := cliAESV3Object(t, fileKey, []byte("Sensitive Title"))
+	objectStreamData := cliObjectStreamData(
+		cliObjectStreamEntry{number: 1, value: "<< /Type /Catalog /Pages 2 0 R >>"},
+		cliObjectStreamEntry{number: 2, value: "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"},
+		cliObjectStreamEntry{number: 3, value: "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>"},
+	)
+	encryptedObjectStream := cliAESV3Object(t, fileKey, objectStreamData)
+	first := bytes.IndexByte(objectStreamData, '\n') + 1
+
+	var input bytes.Buffer
+	input.WriteString("%PDF-1.7\n")
+	offsets := map[int]int{}
+	writeObject := func(number int, body []byte) {
+		t.Helper()
+		offsets[number] = input.Len()
+		fmt.Fprintf(&input, "%d 0 obj\n", number)
+		input.Write(body)
+		input.WriteString("\nendobj\n")
+	}
+	offsets[4] = input.Len()
+	input.WriteString("4 0 obj\n")
+	fmt.Fprintf(&input, "<< /Length %d >>\nstream\n", len(encryptedContent))
+	input.Write(encryptedContent)
+	input.WriteString("\nendstream\nendobj\n")
+	writeObject(5, []byte(fmt.Sprintf("<< /Title <%s> >>", hex.EncodeToString(encryptedTitle))))
+	writeObject(6, []byte(encryptObject))
+	offsets[7] = input.Len()
+	input.WriteString("7 0 obj\n")
+	fmt.Fprintf(&input, "<< /Type /ObjStm /N 3 /First %d /Length %d >>\nstream\n", first, len(encryptedObjectStream))
+	input.Write(encryptedObjectStream)
+	input.WriteString("\nendstream\nendobj\n")
+
+	xrefOffset := input.Len()
+	input.WriteString("xref\n0 8\n")
+	input.WriteString("0000000000 65535 f \n")
+	for number := 1; number <= 7; number++ {
+		if offset, ok := offsets[number]; ok {
+			fmt.Fprintf(&input, "%010d 00000 n \n", offset)
+			continue
+		}
+		input.WriteString("0000000000 65535 f \n")
+	}
+	fmt.Fprintf(&input, "trailer\n<< /Size 8 /Root 1 0 R /Info 5 0 R /Encrypt 6 0 R /ID [<%s> <%s>] >>\nstartxref\n%d\n%%%%EOF\n",
+		hex.EncodeToString(fileID),
+		hex.EncodeToString(fileID),
+		xrefOffset,
+	)
+	path := filepath.Join(t.TempDir(), "supported-aesv3-encrypted-object-stream.pdf")
+	if err := os.WriteFile(path, input.Bytes(), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func writeSupportedAESV3EncryptedXrefStreamFixture(t *testing.T, text string) string {
+	t.Helper()
+	fileID := []byte("revision5-aesv3")
+	fileKey, encryptObject := cliStandardAESV3EncryptionObject(t)
+	content := []byte(fmt.Sprintf("BT\n(%s) Tj\nET\n", strings.ReplaceAll(text, "-", `\055`)))
+	encryptedContent := cliAESV3Object(t, fileKey, content)
+	encryptedTitle := cliAESV3Object(t, fileKey, []byte("Sensitive Title"))
+
+	var input bytes.Buffer
+	input.WriteString("%PDF-1.7\n")
+	offsets := map[int]int{}
+	writeObject := func(number int, body []byte) {
+		t.Helper()
+		offsets[number] = input.Len()
+		fmt.Fprintf(&input, "%d 0 obj\n", number)
+		input.Write(body)
+		input.WriteString("\nendobj\n")
+	}
+	writeObject(1, []byte("<< /Type /Catalog /Pages 2 0 R >>"))
+	writeObject(2, []byte("<< /Type /Pages /Kids [3 0 R] /Count 1 >>"))
+	writeObject(3, []byte("<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>"))
+	offsets[4] = input.Len()
+	input.WriteString("4 0 obj\n")
+	fmt.Fprintf(&input, "<< /Length %d >>\nstream\n", len(encryptedContent))
+	input.Write(encryptedContent)
+	input.WriteString("\nendstream\nendobj\n")
+	writeObject(5, []byte(fmt.Sprintf("<< /Title <%s> >>", hex.EncodeToString(encryptedTitle))))
+	writeObject(6, []byte(encryptObject))
+
+	xrefOffset := input.Len()
+	offsets[8] = xrefOffset
+	xrefData := make([]byte, 0, 9*6)
+	for number := 0; number <= 8; number++ {
+		offset, ok := offsets[number]
+		if !ok {
+			xrefData = appendXrefStreamEntry(xrefData, 0, 0, 0)
+			continue
+		}
+		xrefData = appendXrefStreamEntry(xrefData, 1, offset, 0)
+	}
+	xrefStream := xrefData
+	input.WriteString("8 0 obj\n")
+	fmt.Fprintf(&input, "<< /Type /XRef /Size 9 /Root 1 0 R /Info 5 0 R /Encrypt 6 0 R /ID [<%s> <%s>] /W [1 4 1] /Length %d >>\nstream\n",
+		hex.EncodeToString(fileID),
+		hex.EncodeToString(fileID),
+		len(xrefStream),
+	)
+	input.Write(xrefStream)
+	input.WriteString("\nendstream\nendobj\n")
+	fmt.Fprintf(&input, "startxref\n%d\n%%%%EOF\n", xrefOffset)
+
+	path := filepath.Join(t.TempDir(), "supported-aesv3-encrypted-xref-stream.pdf")
+	if err := os.WriteFile(path, input.Bytes(), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 var cliStandardPadding = []byte{
 	0x28, 0xbf, 0x4e, 0x5e, 0x4e, 0x75, 0x8a, 0x41,
 	0x64, 0x00, 0x4e, 0x56, 0xff, 0xfa, 0x01, 0x08,
@@ -3894,6 +4280,104 @@ func cliAESV2Object(t *testing.T, fileKey []byte, number, generation int, input 
 	out := make([]byte, 0, len(iv)+len(data))
 	out = append(out, iv...)
 	out = append(out, data...)
+	return out
+}
+
+func cliStandardAESV3EncryptionObject(t *testing.T) ([]byte, string) {
+	t.Helper()
+	fileKey := []byte("0123456789abcdef0123456789abcdef")
+	userPassword := []byte("user")
+	ownerPassword := []byte("owner")
+	userValidationSalt := []byte("uvalsalt")
+	userKeySalt := []byte("ukeysalt")
+	ownerValidationSalt := []byte("ovalsalt")
+	ownerKeySalt := []byte("okeysalt")
+
+	userHashInput := append(bytes.Clone(userPassword), userValidationSalt...)
+	userHash := sha256.Sum256(userHashInput)
+	userKeyHashInput := append(bytes.Clone(userPassword), userKeySalt...)
+	userKeyHash := sha256.Sum256(userKeyHashInput)
+	userEntry := append(append(bytes.Clone(userHash[:]), userValidationSalt...), userKeySalt...)
+	userEncryptedFileKey := cliAESCBCNoPadding(t, userKeyHash[:], bytes.Repeat([]byte{0}, aes.BlockSize), fileKey, true)
+
+	ownerHashInput := append(bytes.Clone(ownerPassword), ownerValidationSalt...)
+	ownerHashInput = append(ownerHashInput, userEntry[:48]...)
+	ownerHash := sha256.Sum256(ownerHashInput)
+	ownerKeyHashInput := append(bytes.Clone(ownerPassword), ownerKeySalt...)
+	ownerKeyHashInput = append(ownerKeyHashInput, userEntry[:48]...)
+	ownerKeyHash := sha256.Sum256(ownerKeyHashInput)
+	ownerEntry := append(append(bytes.Clone(ownerHash[:]), ownerValidationSalt...), ownerKeySalt...)
+	ownerEncryptedFileKey := cliAESCBCNoPadding(t, ownerKeyHash[:], bytes.Repeat([]byte{0}, aes.BlockSize), fileKey, true)
+
+	perms := cliAESV3Perms(t, fileKey, -1028, true)
+	encryptObject := fmt.Sprintf(`<<
+/CF << /StdCF << /CFM /AESV3 /Length 256 >> >>
+/EncryptMetadata true
+/Filter /Standard
+/Length 256
+/O <%s>
+/OE <%s>
+/P -1028
+/Perms <%s>
+/R 5
+/StmF /StdCF
+/StrF /StdCF
+/U <%s>
+/UE <%s>
+/V 5
+>>`,
+		hex.EncodeToString(ownerEntry),
+		hex.EncodeToString(ownerEncryptedFileKey),
+		hex.EncodeToString(perms),
+		hex.EncodeToString(userEntry),
+		hex.EncodeToString(userEncryptedFileKey),
+	)
+	return fileKey, encryptObject
+}
+
+func cliAESV3Perms(t *testing.T, fileKey []byte, permissions int, encryptMetadata bool) []byte {
+	t.Helper()
+	block := make([]byte, aes.BlockSize)
+	binary.LittleEndian.PutUint32(block[:4], uint32(int32(permissions)))
+	copy(block[4:8], []byte{0xff, 0xff, 0xff, 0xff})
+	if encryptMetadata {
+		block[8] = 'T'
+	} else {
+		block[8] = 'F'
+	}
+	copy(block[9:12], []byte("adb"))
+	copy(block[12:16], []byte{0xa0, 0xa1, 0xa2, 0xa3})
+	blockCipher, err := aes.NewCipher(fileKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := bytes.Clone(block)
+	blockCipher.Encrypt(out, out)
+	return out
+}
+
+func cliAESV3Object(t *testing.T, fileKey, input []byte) []byte {
+	t.Helper()
+	iv := bytes.Repeat([]byte{0x5a}, aes.BlockSize)
+	encrypted := cliAESCBCNoPadding(t, fileKey, iv, cliPKCS7Pad(input, aes.BlockSize), true)
+	return append(iv, encrypted...)
+}
+
+func cliAESCBCNoPadding(t *testing.T, key, iv, input []byte, encrypt bool) []byte {
+	t.Helper()
+	if len(iv) != aes.BlockSize || len(input)%aes.BlockSize != 0 {
+		t.Fatalf("invalid AES-CBC input: iv=%d input=%d", len(iv), len(input))
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := bytes.Clone(input)
+	if encrypt {
+		cipher.NewCBCEncrypter(block, iv).CryptBlocks(out, out)
+	} else {
+		cipher.NewCBCDecrypter(block, iv).CryptBlocks(out, out)
+	}
 	return out
 }
 
@@ -4312,6 +4796,61 @@ func assertCanonicalCLIEditResult(t *testing.T, stdout string) {
 	}
 }
 
+func assertStringDoesNotContain(t *testing.T, got, label string, values ...string) {
+	t.Helper()
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if strings.Contains(got, value) {
+			t.Fatalf("%s leaked %q in %q", label, value, got)
+		}
+	}
+}
+
+type preserveStructureCLIEditResult struct {
+	Report struct {
+		Edit          string         `json:"edit"`
+		FallbackUsed  bool           `json:"fallback_used"`
+		NodesModified int            `json:"nodes_modified"`
+		OutputPath    string         `json:"output_path"`
+		Meta          map[string]any `json:"meta"`
+	} `json:"report"`
+	Verification struct {
+		ReparseOK      bool `json:"reparse_ok"`
+		OldTextRemoved bool `json:"old_text_removed"`
+		NewSelectable  bool `json:"new_text_selectable"`
+	} `json:"verification"`
+}
+
+func decodePreserveStructureCLIEditResult(t *testing.T, stdout string) preserveStructureCLIEditResult {
+	t.Helper()
+	var result preserveStructureCLIEditResult
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func assertPreserveStructureCLIReportMeta(t *testing.T, meta map[string]any, wantPath string, wantCanonicalPath bool, wantStructure map[string]any) {
+	t.Helper()
+	if meta["writer_mode"] != "preserve-structure" {
+		t.Fatalf("writer_mode = %v, want preserve-structure; meta=%+v", meta["writer_mode"], meta)
+	}
+	if meta["writer_path"] != wantPath || meta["used_canonical_writer_path"] != wantCanonicalPath {
+		t.Fatalf("writer metadata = %+v, want writer_path=%q used_canonical_writer_path=%t", meta, wantPath, wantCanonicalPath)
+	}
+	structure, ok := meta["structure_plan"].(map[string]any)
+	if !ok {
+		t.Fatalf("structure_plan = %#v, want map", meta["structure_plan"])
+	}
+	for key, want := range wantStructure {
+		if got := structure[key]; fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Fatalf("structure_plan[%q] = %v, want %v; structure=%+v", key, got, want, structure)
+		}
+	}
+}
+
 func assertCLISelectableEditResult(t *testing.T, stdout string) {
 	t.Helper()
 	var result struct {
@@ -4430,15 +4969,26 @@ func writeObjectStreamFixture(t *testing.T) string {
 func writeObjectStreamContentFixture(t *testing.T) string {
 	t.Helper()
 	content := []byte("BT\n(08\\05515\\0552024) Tj\nET\n")
+	var input bytes.Buffer
+	input.WriteString("%PDF-1.5\n")
+	catalogOffset := input.Len()
+	input.WriteString("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+	contentOffset := input.Len()
+	fmt.Fprintf(&input, "3 0 obj\n<< /Length %d >>\nstream\n%sendstream\nendobj\n", len(content), content)
 	page := []byte("<< /Type /Page /Contents 3 0 R >>")
 	objectStreamBody := append([]byte("2 0 "), page...)
-	input := pdfFixture(
-		"<< /Type /Catalog /Pages 2 0 R >>",
-		fmt.Sprintf("<< /Type /ObjStm /N 1 /First 4 /Length %d >>\nstream\n%sendstream", len(objectStreamBody), objectStreamBody),
-		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
-	)
+	objectStreamOffset := input.Len()
+	fmt.Fprintf(&input, "4 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length %d >>\nstream\n%sendstream\nendobj\n", len(objectStreamBody), objectStreamBody)
+	xrefOffset := input.Len()
+	input.WriteString("xref\n0 5\n")
+	input.WriteString("0000000000 65535 f \n")
+	fmt.Fprintf(&input, "%010d 00000 n \n", catalogOffset)
+	input.WriteString("0000000000 65535 f \n")
+	fmt.Fprintf(&input, "%010d 00000 n \n", contentOffset)
+	fmt.Fprintf(&input, "%010d 00000 n \n", objectStreamOffset)
+	fmt.Fprintf(&input, "trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", xrefOffset)
 	path := filepath.Join(t.TempDir(), "object-stream-content.pdf")
-	if err := os.WriteFile(path, input, 0644); err != nil {
+	if err := os.WriteFile(path, input.Bytes(), 0644); err != nil {
 		t.Fatal(err)
 	}
 	return path

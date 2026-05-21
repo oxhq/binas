@@ -7,6 +7,9 @@ import (
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/rc4"
+	"crypto/sha256"
+	"crypto/sha512"
+	"crypto/subtle"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -24,6 +27,7 @@ type pdfStandardCryptMethod string
 const (
 	pdfStandardCryptRC4   pdfStandardCryptMethod = "RC4"
 	pdfStandardCryptAESV2 pdfStandardCryptMethod = "AESV2"
+	pdfStandardCryptAESV3 pdfStandardCryptMethod = "AESV3"
 )
 
 type pdfStandardSecurity struct {
@@ -32,6 +36,9 @@ type pdfStandardSecurity struct {
 	keyLengthBytes  int
 	ownerKey        []byte
 	userKey         []byte
+	ownerEncryptKey []byte
+	userEncryptKey  []byte
+	perms           []byte
 	permissions     int32
 	fileID          []byte
 	encryptMetadata bool
@@ -366,13 +373,6 @@ func newPDFStandardSecurityFromDict(dict pdfDict, fileID []byte) (*pdfStandardSe
 	if err != nil {
 		return nil, err
 	}
-	if len(ownerKey) != 32 {
-		return nil, unsupportedPDFEncryption("Standard Security /O must be 32 bytes, got %d", len(ownerKey))
-	}
-	if len(userKey) != 32 {
-		return nil, unsupportedPDFEncryption("Standard Security /U must be 32 bytes, got %d", len(userKey))
-	}
-
 	lengthBits := 40
 	if value, ok := dictInt(dict, "Length"); ok {
 		lengthBits = value
@@ -380,11 +380,8 @@ func newPDFStandardSecurityFromDict(dict pdfDict, fileID []byte) (*pdfStandardSe
 	if revision == 2 {
 		lengthBits = 40
 	}
-	if revision < 2 || revision > 4 {
+	if revision < 2 || revision > 6 {
 		return nil, unsupportedPDFEncryption("unsupported Standard Security revision R=%d", revision)
-	}
-	if lengthBits < 40 || lengthBits > 128 || lengthBits%8 != 0 {
-		return nil, unsupportedPDFEncryption("unsupported Standard Security key length %d bits", lengthBits)
 	}
 	if revision == 2 && version != 1 {
 		return nil, unsupportedPDFEncryption("unsupported Standard Security R=2 with V=%d", version)
@@ -395,24 +392,85 @@ func newPDFStandardSecurityFromDict(dict pdfDict, fileID []byte) (*pdfStandardSe
 	if revision == 4 && version != 4 {
 		return nil, unsupportedPDFEncryption("unsupported Standard Security R=4 with V=%d", version)
 	}
+	if revision >= 5 && version != 5 {
+		return nil, unsupportedPDFEncryption("unsupported Standard Security R=%d with V=%d", revision, version)
+	}
+	if revision <= 4 {
+		if len(ownerKey) != 32 {
+			return nil, unsupportedPDFEncryption("Standard Security /O must be 32 bytes, got %d", len(ownerKey))
+		}
+		if len(userKey) != 32 {
+			return nil, unsupportedPDFEncryption("Standard Security /U must be 32 bytes, got %d", len(userKey))
+		}
+		if lengthBits < 40 || lengthBits > 128 || lengthBits%8 != 0 {
+			return nil, unsupportedPDFEncryption("unsupported Standard Security key length %d bits", lengthBits)
+		}
+	} else {
+		if len(ownerKey) != 48 {
+			return nil, unsupportedPDFEncryption("Standard Security R=%d /O must be 48 bytes, got %d", revision, len(ownerKey))
+		}
+		if len(userKey) != 48 {
+			return nil, unsupportedPDFEncryption("Standard Security R=%d /U must be 48 bytes, got %d", revision, len(userKey))
+		}
+		if lengthBits != 256 {
+			return nil, unsupportedPDFEncryption("unsupported Standard Security R=%d key length %d bits", revision, lengthBits)
+		}
+	}
 	if version != 4 {
 		if _, hasCF := dict["CF"]; hasCF {
-			return nil, unsupportedPDFEncryption("unsupported encryption crypt filters require V=4")
+			if version != 5 {
+				return nil, unsupportedPDFEncryption("unsupported encryption crypt filters require V=4 or V=5")
+			}
 		}
 		if _, hasStmF := dict["StmF"]; hasStmF {
-			return nil, unsupportedPDFEncryption("unsupported encryption /StmF requires V=4")
+			if version != 5 {
+				return nil, unsupportedPDFEncryption("unsupported encryption /StmF requires V=4 or V=5")
+			}
 		}
 		if _, hasStrF := dict["StrF"]; hasStrF {
-			return nil, unsupportedPDFEncryption("unsupported encryption /StrF requires V=4")
+			if version != 5 {
+				return nil, unsupportedPDFEncryption("unsupported encryption /StrF requires V=4 or V=5")
+			}
 		}
 	}
 	cryptMethod := pdfStandardCryptRC4
-	if version == 4 {
+	if version == 4 || version == 5 {
 		method, err := pdfStandardCryptMethodFromFilters(dict)
 		if err != nil {
 			return nil, err
 		}
 		cryptMethod = method
+	}
+	if revision >= 5 && cryptMethod != pdfStandardCryptAESV3 {
+		return nil, unsupportedPDFEncryption("Standard Security R=%d requires AESV3 crypt filters", revision)
+	}
+	if revision < 5 && cryptMethod == pdfStandardCryptAESV3 {
+		return nil, unsupportedPDFEncryption("unsupported encryption crypt filter /StdCF /CFM /AESV3 for Standard Security R=%d", revision)
+	}
+
+	var ownerEncryptKey, userEncryptKey, perms []byte
+	if revision >= 5 {
+		ownerEncryptKey, err = dictPDFStringBytes(dict, "OE")
+		if err != nil {
+			return nil, err
+		}
+		userEncryptKey, err = dictPDFStringBytes(dict, "UE")
+		if err != nil {
+			return nil, err
+		}
+		perms, err = dictPDFStringBytes(dict, "Perms")
+		if err != nil {
+			return nil, err
+		}
+		if len(ownerEncryptKey) != 32 {
+			return nil, unsupportedPDFEncryption("Standard Security R=%d /OE must be 32 bytes, got %d", revision, len(ownerEncryptKey))
+		}
+		if len(userEncryptKey) != 32 {
+			return nil, unsupportedPDFEncryption("Standard Security R=%d /UE must be 32 bytes, got %d", revision, len(userEncryptKey))
+		}
+		if len(perms) != 16 {
+			return nil, unsupportedPDFEncryption("Standard Security R=%d /Perms must be 16 bytes, got %d", revision, len(perms))
+		}
 	}
 
 	encryptMetadata := true
@@ -425,6 +483,9 @@ func newPDFStandardSecurityFromDict(dict pdfDict, fileID []byte) (*pdfStandardSe
 		keyLengthBytes:  lengthBits / 8,
 		ownerKey:        bytes.Clone(ownerKey),
 		userKey:         bytes.Clone(userKey),
+		ownerEncryptKey: bytes.Clone(ownerEncryptKey),
+		userEncryptKey:  bytes.Clone(userEncryptKey),
+		perms:           bytes.Clone(perms),
 		permissions:     int32(permissions),
 		fileID:          bytes.Clone(fileID),
 		encryptMetadata: encryptMetadata,
@@ -467,6 +528,8 @@ func pdfStandardCryptMethodFromFilters(dict pdfDict) (pdfStandardCryptMethod, er
 		method = pdfStandardCryptRC4
 	case "AESV2":
 		method = pdfStandardCryptAESV2
+	case "AESV3":
+		method = pdfStandardCryptAESV3
 	default:
 		return "", unsupportedPDFEncryption("unsupported encryption crypt filter /StdCF /CFM /%s", cfm)
 	}
@@ -476,12 +539,18 @@ func pdfStandardCryptMethodFromFilters(dict pdfDict) (pdfStandardCryptMethod, er
 	if length, ok := dictInt(stdCF, "Length"); ok && method == pdfStandardCryptAESV2 && length != 128 {
 		return "", unsupportedPDFEncryption("unsupported encryption crypt filter /StdCF /Length %d", length)
 	}
+	if length, ok := dictInt(stdCF, "Length"); ok && method == pdfStandardCryptAESV3 && length != 32 && length != 256 {
+		return "", unsupportedPDFEncryption("unsupported encryption crypt filter /StdCF /Length %d", length)
+	}
 	return method, nil
 }
 
 func (s *pdfStandardSecurity) authenticateUserPassword(password []byte) ([]byte, bool, error) {
 	if s == nil {
 		return nil, false, unsupportedPDFEncryption("missing Standard Security state")
+	}
+	if s.revision >= 5 {
+		return s.authenticateRevision5Or6Password(password)
 	}
 	fileKey, err := s.deriveFileKey(password)
 	if err != nil {
@@ -495,6 +564,142 @@ func (s *pdfStandardSecurity) authenticateUserPassword(password []byte) ([]byte,
 		return fileKey, bytes.Equal(expected, s.userKey), nil
 	}
 	return fileKey, bytes.Equal(expected[:16], s.userKey[:16]), nil
+}
+
+func (s *pdfStandardSecurity) authenticateRevision5Or6Password(password []byte) ([]byte, bool, error) {
+	if s.keyLengthBytes != 32 {
+		return nil, false, unsupportedPDFEncryption("unsupported Standard Security R=%d key length %d bytes", s.revision, s.keyLengthBytes)
+	}
+	password = truncatePDFStandardSecurityV5Password(password)
+	if fileKey, ok, err := s.authenticateRevision5Or6OwnerPassword(password); err != nil || ok {
+		return fileKey, ok, err
+	}
+	if fileKey, ok, err := s.authenticateRevision5Or6UserPassword(password); err != nil || ok {
+		return fileKey, ok, err
+	}
+	return nil, false, nil
+}
+
+func (s *pdfStandardSecurity) authenticateRevision5Or6OwnerPassword(password []byte) ([]byte, bool, error) {
+	if len(s.ownerKey) != 48 || len(s.ownerEncryptKey) != 32 || len(s.userKey) < 48 {
+		return nil, false, unsupportedPDFEncryption("malformed Standard Security R=%d owner credential entries", s.revision)
+	}
+	hash, err := s.revision5Or6Hash(password, s.ownerKey[32:40], s.userKey[:48])
+	if err != nil {
+		return nil, false, err
+	}
+	if subtle.ConstantTimeCompare(hash, s.ownerKey[:32]) != 1 {
+		return nil, false, nil
+	}
+	key, err := s.revision5Or6Hash(password, s.ownerKey[40:48], s.userKey[:48])
+	if err != nil {
+		return nil, false, err
+	}
+	fileKey, err := aesCBCDecryptNoPadding(key, zeroAESIV(), s.ownerEncryptKey)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(fileKey) != 32 {
+		return nil, false, unsupportedPDFEncryption("Standard Security R=%d /OE decrypted to %d bytes", s.revision, len(fileKey))
+	}
+	if err := s.verifyRevision5Or6Perms(fileKey); err != nil {
+		return nil, false, err
+	}
+	return fileKey, true, nil
+}
+
+func (s *pdfStandardSecurity) authenticateRevision5Or6UserPassword(password []byte) ([]byte, bool, error) {
+	if len(s.userKey) != 48 || len(s.userEncryptKey) != 32 {
+		return nil, false, unsupportedPDFEncryption("malformed Standard Security R=%d user credential entries", s.revision)
+	}
+	hash, err := s.revision5Or6Hash(password, s.userKey[32:40], nil)
+	if err != nil {
+		return nil, false, err
+	}
+	if subtle.ConstantTimeCompare(hash, s.userKey[:32]) != 1 {
+		return nil, false, nil
+	}
+	key, err := s.revision5Or6Hash(password, s.userKey[40:48], nil)
+	if err != nil {
+		return nil, false, err
+	}
+	fileKey, err := aesCBCDecryptNoPadding(key, zeroAESIV(), s.userEncryptKey)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(fileKey) != 32 {
+		return nil, false, unsupportedPDFEncryption("Standard Security R=%d /UE decrypted to %d bytes", s.revision, len(fileKey))
+	}
+	if err := s.verifyRevision5Or6Perms(fileKey); err != nil {
+		return nil, false, err
+	}
+	return fileKey, true, nil
+}
+
+func (s *pdfStandardSecurity) revision5Or6Hash(password, salt, udata []byte) ([]byte, error) {
+	seed := make([]byte, 0, len(password)+len(salt)+len(udata))
+	seed = append(seed, password...)
+	seed = append(seed, salt...)
+	seed = append(seed, udata...)
+	digest := sha256.Sum256(seed)
+	key := digest[:]
+	if s.revision < 6 {
+		return bytes.Clone(key), nil
+	}
+	for count := 1; ; count++ {
+		unit := make([]byte, 0, len(password)+len(key)+len(udata))
+		unit = append(unit, password...)
+		unit = append(unit, key...)
+		unit = append(unit, udata...)
+		k1 := make([]byte, 0, len(unit)*64)
+		for i := 0; i < 64; i++ {
+			k1 = append(k1, unit...)
+		}
+		encrypted, err := aesCBCEncryptNoPadding(key[:16], key[16:32], k1)
+		if err != nil {
+			return nil, err
+		}
+		sum := 0
+		for _, value := range encrypted[:16] {
+			sum += int(value)
+		}
+		switch sum % 3 {
+		case 0:
+			next := sha256.Sum256(encrypted)
+			key = next[:]
+		case 1:
+			next := sha512.Sum384(encrypted)
+			key = next[:]
+		default:
+			next := sha512.Sum512(encrypted)
+			key = next[:]
+		}
+		if count >= 64 && int(encrypted[len(encrypted)-1]) <= count-32 {
+			return bytes.Clone(key[:32]), nil
+		}
+	}
+}
+
+func (s *pdfStandardSecurity) verifyRevision5Or6Perms(fileKey []byte) error {
+	decrypted, err := aesECBDecryptNoPadding(fileKey, s.perms)
+	if err != nil {
+		return err
+	}
+	if len(decrypted) < 12 || subtle.ConstantTimeCompare(decrypted[4:8], []byte{0xff, 0xff, 0xff, 0xff}) != 1 || subtle.ConstantTimeCompare(decrypted[9:12], []byte("adb")) != 1 {
+		return unsupportedPDFEncryption("Standard Security R=%d /Perms integrity check failed", s.revision)
+	}
+	permissions := int32(binary.LittleEndian.Uint32(decrypted[:4]))
+	if permissions != s.permissions {
+		return unsupportedPDFEncryption("Standard Security R=%d /Perms permissions mismatch", s.revision)
+	}
+	wantMetadata := byte('T')
+	if !s.encryptMetadata {
+		wantMetadata = 'F'
+	}
+	if decrypted[8] != wantMetadata {
+		return unsupportedPDFEncryption("Standard Security R=%d /Perms metadata flag mismatch", s.revision)
+	}
+	return nil
 }
 
 func (s *pdfStandardSecurity) deriveFileKey(password []byte) ([]byte, error) {
@@ -592,6 +797,11 @@ func (s *pdfStandardSecurity) decryptObject(fileKey []byte, id pdfObjectID, ciph
 			return nil, err
 		}
 		return aesV2Decrypt(objectKey, ciphertext)
+	case pdfStandardCryptAESV3:
+		if len(fileKey) != 32 {
+			return nil, unsupportedPDFEncryption("unsupported AESV3 file key length %d", len(fileKey))
+		}
+		return aesV2Decrypt(fileKey, ciphertext)
 	default:
 		return nil, unsupportedPDFEncryption("unsupported Standard Security crypt method %q", s.cryptMethod)
 	}
@@ -607,9 +817,76 @@ func (s *pdfStandardSecurity) encryptObject(fileKey []byte, id pdfObjectID, plai
 			return nil, err
 		}
 		return aesV2Encrypt(objectKey, plaintext)
+	case pdfStandardCryptAESV3:
+		if len(fileKey) != 32 {
+			return nil, unsupportedPDFEncryption("unsupported AESV3 file key length %d", len(fileKey))
+		}
+		return aesV2Encrypt(fileKey, plaintext)
 	default:
 		return nil, unsupportedPDFEncryption("unsupported Standard Security crypt method %q", s.cryptMethod)
 	}
+}
+
+func aesCBCDecryptNoPadding(key, iv, ciphertext []byte) ([]byte, error) {
+	if len(ciphertext) == 0 || len(ciphertext)%aes.BlockSize != 0 {
+		return nil, unsupportedPDFEncryption("malformed AES CBC ciphertext length %d", len(ciphertext))
+	}
+	if len(iv) != aes.BlockSize {
+		return nil, unsupportedPDFEncryption("malformed AES CBC IV length %d", len(iv))
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	data := bytes.Clone(ciphertext)
+	cipher.NewCBCDecrypter(block, iv).CryptBlocks(data, data)
+	return data, nil
+}
+
+func aesCBCEncryptNoPadding(key, iv, plaintext []byte) ([]byte, error) {
+	if len(plaintext) == 0 || len(plaintext)%aes.BlockSize != 0 {
+		return nil, unsupportedPDFEncryption("malformed AES CBC plaintext length %d", len(plaintext))
+	}
+	if len(iv) != aes.BlockSize {
+		return nil, unsupportedPDFEncryption("malformed AES CBC IV length %d", len(iv))
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	data := bytes.Clone(plaintext)
+	cipher.NewCBCEncrypter(block, iv).CryptBlocks(data, data)
+	return data, nil
+}
+
+func aesECBDecryptNoPadding(key, ciphertext []byte) ([]byte, error) {
+	if len(ciphertext) == 0 || len(ciphertext)%aes.BlockSize != 0 {
+		return nil, unsupportedPDFEncryption("malformed AES ECB ciphertext length %d", len(ciphertext))
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	out := bytes.Clone(ciphertext)
+	for start := 0; start < len(out); start += aes.BlockSize {
+		block.Decrypt(out[start:start+aes.BlockSize], out[start:start+aes.BlockSize])
+	}
+	return out, nil
+}
+
+func aesECBEncryptNoPadding(key, plaintext []byte) ([]byte, error) {
+	if len(plaintext) == 0 || len(plaintext)%aes.BlockSize != 0 {
+		return nil, unsupportedPDFEncryption("malformed AES ECB plaintext length %d", len(plaintext))
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	out := bytes.Clone(plaintext)
+	for start := 0; start < len(out); start += aes.BlockSize {
+		block.Encrypt(out[start:start+aes.BlockSize], out[start:start+aes.BlockSize])
+	}
+	return out, nil
 }
 
 func aesV2Decrypt(key, ciphertext []byte) ([]byte, error) {
@@ -680,6 +957,17 @@ func padPDFStandardPassword(password []byte) []byte {
 	copy(out, password)
 	copy(out[len(password):], pdfStandardSecurityPasswordPadding)
 	return out
+}
+
+func truncatePDFStandardSecurityV5Password(password []byte) []byte {
+	if len(password) > 127 {
+		password = password[:127]
+	}
+	return bytes.Clone(password)
+}
+
+func zeroAESIV() []byte {
+	return make([]byte, aes.BlockSize)
 }
 
 func xorPDFStandardKey(key []byte, value byte) []byte {
