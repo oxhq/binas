@@ -2689,6 +2689,84 @@ func TestCLIOCRTextLayerPlanWritesExplicitFallbackJSON(t *testing.T) {
 	}
 }
 
+func TestCLIOCRTextLayerEmbedsSelectableTextLayerJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ocr-layer.pdf")
+	out := filepath.Join(t.TempDir(), "ocr-layer-out.pdf")
+	input := pdfFixture(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /Resources << >> >>",
+	)
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{
+			"ocr", "text-layer", path,
+			"--format", "pdf",
+			"--page-index", "0",
+			"--text", "External OCR text",
+			"--x-min", "10",
+			"--y-min", "20",
+			"--x-max", "110",
+			"--y-max", "45",
+			"--confidence", "0.9",
+			"-o", out,
+			"--json",
+		})
+	})
+	var result struct {
+		Operation string `json:"operation"`
+		Report    struct {
+			Edit           string `json:"edit"`
+			FallbackUsed   bool   `json:"fallback_used"`
+			FallbackKind   string `json:"fallback_kind"`
+			FallbackPolicy struct {
+				Fallback string `json:"fallback"`
+				Mode     string `json:"mode"`
+			} `json:"fallback_policy"`
+			NodesModified int    `json:"nodes_modified"`
+			OutputPath    string `json:"output_path"`
+			Meta          struct {
+				Operation   string  `json:"operation"`
+				PlannedOnly bool    `json:"planned_only"`
+				PageIndex   int     `json:"page_index"`
+				Text        string  `json:"text"`
+				Confidence  float64 `json:"confidence"`
+			} `json:"meta"`
+		} `json:"report"`
+		Verification struct {
+			ReparseOK     bool `json:"reparse_ok"`
+			NewSelectable bool `json:"new_text_selectable"`
+			PageUnchanged bool `json:"page_count_unchanged"`
+		} `json:"verification"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Operation != "pdf.ocr_text_layer_explicit_embed" || result.Report.Edit != result.Operation {
+		t.Fatalf("operation = %q report edit = %q, want OCR text-layer embed", result.Operation, result.Report.Edit)
+	}
+	if !result.Report.FallbackUsed || result.Report.FallbackKind != "ocr_text_layer" || result.Report.FallbackPolicy.Fallback != "ocr_text_layer" || result.Report.FallbackPolicy.Mode != "explicit" {
+		t.Fatalf("report fallback = used %v kind %q policy %+v, want ocr_text_layer/explicit", result.Report.FallbackUsed, result.Report.FallbackKind, result.Report.FallbackPolicy)
+	}
+	if result.Report.NodesModified != 1 || result.Report.OutputPath != out {
+		t.Fatalf("report = %+v, want one OCR text-layer write and output path", result.Report)
+	}
+	if result.Report.Meta.Operation != "ocr_text_layer_embed" || result.Report.Meta.PlannedOnly || result.Report.Meta.PageIndex != 0 || result.Report.Meta.Text != "External OCR text" || result.Report.Meta.Confidence != 0.9 {
+		t.Fatalf("meta = %+v, want OCR text-layer embed metadata", result.Report.Meta)
+	}
+	if !result.Verification.ReparseOK || !result.Verification.NewSelectable || !result.Verification.PageUnchanged {
+		t.Fatalf("verification = %+v, want reparse/selectable/page unchanged", result.Verification)
+	}
+
+	queryOut := captureStdout(t, func() error {
+		return run([]string{"query", out, "--format", "pdf", "--kind", "pdf.content.text_show", "--text", "External OCR text", "--json"})
+	})
+	assertCLIQueryCount(t, queryOut, 1)
+}
+
 func TestCLIOCRTextLayerPlanFailsClosedForInvalidInput(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ocr-plan.pdf")
 	input := pdfFixture(

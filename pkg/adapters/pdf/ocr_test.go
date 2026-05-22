@@ -63,6 +63,50 @@ func TestOCRTextLayerExplicitInputReportsFallbackPolicy(t *testing.T) {
 	}
 }
 
+func TestApplyExplicitOCRTextLayerEmbedsSelectableInvisibleText(t *testing.T) {
+	input := testPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /Resources << >> >>",
+	)
+
+	output, report, verification, err := ApplyExplicitOCRTextLayer(input, OCRTextLayerOptions{
+		PageIndex:  0,
+		Text:       "External OCR text",
+		Box:        OCRTextLayerBox{XMin: 10, YMin: 20, XMax: 110, YMax: 45},
+		Confidence: 0.82,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Edit != explicitOCRTextLayerEmbedOperation {
+		t.Fatalf("report edit = %q, want %q", report.Edit, explicitOCRTextLayerEmbedOperation)
+	}
+	if report.NodesModified != 1 || !report.FallbackUsed || report.FallbackKind != string(FallbackOCRTextLayer) {
+		t.Fatalf("report = %+v, want explicit OCR text-layer fallback write", report)
+	}
+	if report.FallbackPolicy == nil || report.FallbackPolicy.Fallback != string(FallbackOCRTextLayer) || report.FallbackPolicy.Mode != string(FallbackModeExplicit) {
+		t.Fatalf("report fallback policy = %+v, want ocr_text_layer/explicit", report.FallbackPolicy)
+	}
+	if !verification.ReparseOK || !verification.NewSelectable || !verification.PageUnchanged {
+		t.Fatalf("verification = %+v, want selectable OCR text layer", verification)
+	}
+	if !strings.Contains(string(output), "3 Tr") {
+		t.Fatalf("output missing invisible text rendering mode:\n%s", output)
+	}
+	graph, err := parsePDFGraph(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := graph.textShowCandidates("External OCR text")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("OCR text candidates = %d, want 1", len(candidates))
+	}
+}
+
 func TestOCRTextLayerExplicitInputFailsClosedForInvalidInputs(t *testing.T) {
 	input := testPDF(
 		"<< /Type /Catalog /Pages 2 0 R >>",

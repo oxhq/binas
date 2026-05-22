@@ -14,7 +14,10 @@ import (
 	"github.com/oxhq/binas/pkg/core"
 )
 
-const explicitOCRTextLayerOperation = "pdf.ocr_text_layer_explicit_plan"
+const (
+	explicitOCRTextLayerOperation      = "pdf.ocr_text_layer_explicit_plan"
+	explicitOCRTextLayerEmbedOperation = "pdf.ocr_text_layer_explicit_embed"
+)
 
 type OCRTextLayerBox struct {
 	XMin float64 `json:"x_min"`
@@ -233,6 +236,130 @@ func PlanExplicitOCRTextLayer(input []byte, opts OCRTextLayerOptions) (OCRTextLa
 			Fallback: string(policy.Fallback),
 			Mode:     string(policy.Mode),
 		},
+	}, nil
+}
+
+func ApplyExplicitOCRTextLayer(input []byte, opts OCRTextLayerOptions) ([]byte, core.Report, core.Verification, error) {
+	plan, err := PlanExplicitOCRTextLayer(input, opts)
+	if err != nil {
+		return nil, core.Report{}, core.Verification{}, err
+	}
+	graph, err := parsePDFGraph(input)
+	if err != nil {
+		return nil, core.Report{}, core.Verification{}, err
+	}
+	pages := overlayPageObjects(graph)
+	if len(pages) == 0 {
+		return nil, core.Report{}, core.Verification{}, errors.New("ocr text-layer requires at least one page")
+	}
+	if opts.PageIndex >= len(pages) {
+		return nil, core.Report{}, core.Verification{}, fmt.Errorf("ocr text-layer page index %d out of range for %d pages (zero-based)", opts.PageIndex, len(pages))
+	}
+
+	page := pages[opts.PageIndex]
+	pageDict, pageStream, err := overlayPageDict(page)
+	if err != nil {
+		return nil, core.Report{}, core.Verification{}, err
+	}
+
+	fontID := pdfObjectID{Number: nextPDFObjectNumber(graph), Generation: 0}
+	contentID := pdfObjectID{Number: fontID.Number + 1, Generation: 0}
+	fontResourceName := "BinasOCRTextLayerFont"
+	graph.Objects[fontID] = &pdfIndirectObject{
+		ID: fontID,
+		Value: pdfDict{
+			"Type":     pdfName("Font"),
+			"Subtype":  pdfName("Type1"),
+			"BaseFont": pdfName("Helvetica"),
+		},
+	}
+	graph.Objects[contentID] = &pdfIndirectObject{
+		ID: contentID,
+		Value: pdfStreamObject{
+			Dict: pdfDict{},
+			Data: []byte(ocrTextLayerContentStream(fontResourceName, opts)),
+		},
+	}
+
+	if err := addOverlayFontResource(graph, pageDict, fontResourceName, pdfRef{ID: fontID}); err != nil {
+		return nil, core.Report{}, core.Verification{}, err
+	}
+	pageDict["Contents"] = appendOverlayContent(pageDict["Contents"], pdfRef{ID: contentID})
+	if pageStream != nil {
+		stream := *pageStream
+		stream.Dict = pageDict
+		page.Value = stream
+	} else {
+		page.Value = pageDict
+	}
+
+	output, err := writeCanonicalPDF(graph)
+	if err != nil {
+		return nil, core.Report{}, core.Verification{}, err
+	}
+	verification, err := verifyExplicitOCRTextLayer(output, opts.Text, len(pages))
+	if err != nil {
+		return nil, core.Report{}, core.Verification{}, err
+	}
+
+	policy := OverlayPolicy{Fallback: FallbackOCRTextLayer, Mode: FallbackModeExplicit}
+	report := WithFallbackPolicy(core.Report{
+		Format:        "pdf",
+		Edit:          explicitOCRTextLayerEmbedOperation,
+		NodesModified: 1,
+		MatchIndex:    &opts.PageIndex,
+		Invariants: []core.Invariant{
+			core.InvariantReparse,
+			core.InvariantNewSelectable,
+			core.InvariantPageUnchanged,
+		},
+		Verification: &verification,
+		Meta: map[string]any{
+			"operation":    "ocr_text_layer_embed",
+			"planned_only": false,
+			"page_index":   opts.PageIndex,
+			"text":         opts.Text,
+			"box":          opts.Box,
+			"confidence":   opts.Confidence,
+			"plan":         plan.Operation,
+		},
+	}, policy)
+	return output, report, verification, nil
+}
+
+func ocrTextLayerContentStream(fontName string, opts OCRTextLayerOptions) string {
+	fontSize := opts.Box.YMax - opts.Box.YMin
+	if fontSize < 1 {
+		fontSize = 1
+	}
+	var out strings.Builder
+	out.WriteString("q\nBT\n/")
+	out.WriteString(fontName)
+	out.WriteByte(' ')
+	out.WriteString(pdfNumberToken(fontSize))
+	out.WriteString(" Tf\n3 Tr\n")
+	out.WriteString(pdfNumberToken(opts.Box.XMin))
+	out.WriteByte(' ')
+	out.WriteString(pdfNumberToken(opts.Box.YMin))
+	out.WriteString(" Td\n(")
+	out.WriteString(encodeLiteralString(opts.Text))
+	out.WriteString(") Tj\nET\nQ")
+	return out.String()
+}
+
+func verifyExplicitOCRTextLayer(output []byte, text string, pageCount int) (core.Verification, error) {
+	graph, err := parsePDFGraph(output)
+	if err != nil {
+		return core.Verification{}, err
+	}
+	candidates, err := graph.textShowCandidates(text)
+	if err != nil {
+		return core.Verification{}, err
+	}
+	return core.Verification{
+		ReparseOK:     true,
+		NewSelectable: len(candidates) > 0,
+		PageUnchanged: graph.pageCount() == pageCount,
 	}, nil
 }
 

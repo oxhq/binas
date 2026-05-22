@@ -52,14 +52,71 @@ func run(args []string) error {
 
 func ocr(args []string) error {
 	if len(args) == 0 {
-		return errors.New("expected ocr command: text-layer-plan")
+		return errors.New("expected ocr command: text-layer, text-layer-plan")
 	}
 	switch args[0] {
+	case "text-layer":
+		return ocrTextLayer(args[1:])
 	case "text-layer-plan":
 		return ocrTextLayerPlan(args[1:])
 	default:
 		return fmt.Errorf("unknown ocr command %q", args[0])
 	}
+}
+
+func ocrTextLayer(args []string) error {
+	fs := flag.NewFlagSet("ocr text-layer", flag.ContinueOnError)
+	format := fs.String("format", "pdf", "input format")
+	pageIndex := fs.Int("page-index", 0, "zero-based page index")
+	text := fs.String("text", "", "OCR text")
+	xMin := fs.Float64("x-min", 0, "OCR text bounding box minimum x")
+	yMin := fs.Float64("y-min", 0, "OCR text bounding box minimum y")
+	xMax := fs.Float64("x-max", 0, "OCR text bounding box maximum x")
+	yMax := fs.Float64("y-max", 0, "OCR text bounding box maximum y")
+	confidence := fs.Float64("confidence", 0, "OCR confidence from 0 to 1")
+	outputPath := fs.String("o", "", "output file")
+	asJSON := fs.Bool("json", false, "write JSON")
+	if err := fs.Parse(reorderFlags(args, map[string]bool{"json": true}, map[string]bool{
+		"format":     true,
+		"page-index": true,
+		"text":       true,
+		"x-min":      true,
+		"y-min":      true,
+		"x-max":      true,
+		"y-max":      true,
+		"confidence": true,
+		"o":          true,
+	})); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("ocr text-layer requires one input file")
+	}
+	if strings.ToLower(*format) != "pdf" {
+		return fmt.Errorf("ocr text-layer is unsupported for format %q", *format)
+	}
+	if *outputPath == "" {
+		return errors.New("ocr text-layer requires -o")
+	}
+	input, err := os.ReadFile(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	output, report, verification, err := pdf.ApplyExplicitOCRTextLayer(input, pdf.OCRTextLayerOptions{
+		PageIndex: *pageIndex,
+		Text:      *text,
+		Box: pdf.OCRTextLayerBox{
+			XMin: *xMin,
+			YMin: *yMin,
+			XMax: *xMax,
+			YMax: *yMax,
+		},
+		Confidence: *confidence,
+	})
+	if err != nil {
+		return err
+	}
+	return writeOverlayTextResult(output, report, verification, *outputPath, *asJSON)
 }
 
 func ocrTextLayerPlan(args []string) error {
