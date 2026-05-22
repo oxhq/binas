@@ -1,35 +1,29 @@
 # binas
 
-`binas` is a Go-first binary AST and verified rewrite engine. The first adapter is PDF, focused on fail-closed content-stream text surgery. Explicit overlay output exists as a separate fallback command; it is not treated as a true selectable-text rewrite or OCR implementation.
+`binas` is a Go-first binary AST and verified rewrite engine. The first production adapter is PDF: it parses PDF object/content structure, exposes queryable nodes, and applies fail-closed rewrites that are verified by reparsing the output.
 
-This is an early v0 proof. The public core API is intentionally small and unstable while the PDF adapter teaches the shape of the engine.
+The current release is intentionally narrow. It is useful for inspecting PDFs, querying selectable text, replacing supported text operands, filling supported AcroForm fields, updating supported annotations/XFA packets, adding explicit overlay/OCR text-layer fallbacks, and inspecting or explicitly handling signature boundaries. It is not a general visual PDF editor.
 
-## Current Proof
+## Install
 
 ```powershell
-go run ./cmd/binas inspect C:\path\file.pdf --format pdf --json
-go run ./cmd/binas validate C:\path\file.pdf --format pdf --json
-go run ./cmd/binas query C:\path\file.pdf --format pdf --kind pdf.content.text_show --text "08-15-2024" --meta operator=Tj --json
-go run ./cmd/binas edit C:\path\file.pdf --format pdf --kind pdf.content.text_show --text "08-15-2024" --replace "May 5, 2026" --verify reparse,old-gone,new-selectable -o C:\path\out.pdf --json
-go run ./cmd/binas form list C:\path\file.pdf --format pdf --json
-go run ./cmd/binas form set C:\path\file.pdf --format pdf --field payer.name --value "New Name" --regenerate-appearance -o C:\path\form-out.pdf --json
-go run ./cmd/binas form set C:\path\file.pdf --format pdf --field payer.plans --values "Basic" --values "Pro Plan" -o C:\path\form-multi-out.pdf --json
-go run ./cmd/binas annot list C:\path\file.pdf --format pdf --json
-go run ./cmd/binas annot set-contents C:\path\file.pdf --format pdf --index 0 --contents "Updated note" --regenerate-appearance -o C:\path\annot-out.pdf --json
-go run ./cmd/binas ocr text-layer-plan C:\path\file.pdf --format pdf --page-index 0 --text "OCR text" --x-min 1 --y-min 2 --x-max 3 --y-max 4 --confidence 0.9 --json
-go run ./cmd/binas ocr text-layer C:\path\file.pdf --format pdf --page-index 0 --text "OCR text" --x-min 1 --y-min 2 --x-max 3 --y-max 4 --confidence 0.9 -o C:\path\ocr-out.pdf --json
-go run ./cmd/binas xfa list C:\path\file.pdf --format pdf --json
-go run ./cmd/binas xfa datasets C:\path\file.pdf --format pdf --json
-go run ./cmd/binas xfa mappings C:\path\file.pdf --format pdf --json
-go run ./cmd/binas xfa dataset-set C:\path\file.pdf --format pdf --path form.name --value "New Name" -o C:\path\xfa-datasets-out.pdf --json
-go run ./cmd/binas xfa replace C:\path\file.pdf --format pdf --packet-kind template --text "<template>old</template>" --replace "<template>new</template>" --match-index 0 -o C:\path\xfa-out.pdf --json
-go run ./cmd/binas signature inspect C:\path\signed.pdf --format pdf --json
-go run ./cmd/binas signature re-sign C:\path\signed.pdf --format pdf -o C:\path\resigned.pdf --signer-command C:\path\external-signer.exe --signer-name "HSM signer" --external-key-id "key-handle" --json
-$env:GOOS = "js"; $env:GOARCH = "wasm"; go build -o tmp\binas.wasm ./cmd/binas-wasm
-Remove-Item Env:\GOOS, Env:\GOARCH
-Copy-Item "$(go env GOROOT)\lib\wasm\wasm_exec.js" tmp\wasm_exec.js
-python -m http.server 8765
-# Open http://127.0.0.1:8765/cmd/binas-wasm/editor.html
+go install github.com/oxhq/binas/cmd/binas@latest
+```
+
+Or build from a checkout:
+
+```powershell
+go test ./...
+go build -o tmp\binas.exe ./cmd/binas
+```
+
+## Quick Start
+
+```powershell
+binas inspect C:\path\file.pdf --format pdf --json
+binas validate C:\path\file.pdf --format pdf --json
+binas query C:\path\file.pdf --format pdf --kind pdf.content.text_show --text "Invoice #1234" --json
+binas edit C:\path\file.pdf --format pdf --kind pdf.content.text_show --text "Invoice #1234" --replace "Invoice #5678" --verify reparse,old-gone,new-selectable,page-count-unchanged,no-fallback -o C:\path\out.pdf --json
 ```
 
 Go consumers can use the v0 API without shelling out:
@@ -43,50 +37,76 @@ output, report, verification, err := pdfapi.New(input).
 	Bytes()
 ```
 
-The main `edit` mode rewrites direct PDF literal-string text, supported hex-string text, and literal/hex `TJ` array text inside raw/uncompressed content streams, direct `/Filter /FlateDecode`, `/Filter /LZWDecode`, `/Filter /ASCIIHexDecode`, `/Filter /ASCII85Decode`, and `/Filter /RunLengthDecode` streams, their standard abbreviations `/Fl`, `/LZW`, `/AHx`, `/A85`, and `/RL`, and filter arrays made only from those reversible filters after abbreviation normalization. Non-null `/DecodeParms` support is implemented for Flate and LZW filter positions, including resolved indirect parameter dictionaries/arrays and resolved indirect dictionary/null entries inside parameter arrays. Edits can rewrite to a different encoded length, update the direct length or referenced length object, rebuild a basic xref table/trailer, and reparse the output for verification. It does not use overlay, stamp, or OCR fallback.
+## CLI Surface
 
-See [docs/release-surface.md](docs/release-surface.md) for the current CLI output contract, validation behavior, inspect metadata, and failure modes. See [docs/pdf-semantic-boundaries.md](docs/pdf-semantic-boundaries.md) for the semantic guardrails around encryption, signatures, XFA, AcroForm, annotations, and font/CMap markers. See [docs/w8ben-variable-length-rewrite.md](docs/w8ben-variable-length-rewrite.md) for the W-8BEN proof commands, current support boundaries, and incremental roadmap.
+- `inspect`: parse an input and report root metadata, xref/object-stream shape, semantic boundary markers, and stream metadata.
+- `validate`: report parse validity, errors, warnings, and partial root metadata where available.
+- `profile`: summarize whether a PDF is currently editable/fillable, which rewrite mode is recommended, and which boundaries are present.
+- `query`: select parsed nodes, including `pdf.content.text_show`, by decoded text and exact metadata filters.
+- `edit`: rewrite supported selectable text operands and verify by reparsing.
+- `form list` / `form set`: list AcroForm fields and update supported text, choice, checkbox, button, and narrow radio field shapes.
+- `annot list` / `annot set-contents`: list annotations and update supported `/Contents` values, with explicit appearance preservation/removal/regeneration modes.
+- `xfa list`, `xfa datasets`, `xfa mappings`, `xfa dataset-set`, `xfa replace`: inspect and narrowly update directly represented XFA packets and static datasets.
+- `overlay text`: explicitly stamp visible text as a fallback; this is not a true selectable-text rewrite.
+- `ocr text-layer-plan` / `ocr text-layer`: plan or embed caller-provided OCR text-layer data; `binas` does not run OCR.
+- `signature inspect` / `signature re-sign`: inspect supported signature byte ranges/CMS metadata and append a new external-signer-backed signature layer.
 
-## Current CLI Surface
+See [docs/release-surface.md](docs/release-surface.md) for the JSON contracts and failure modes, and [docs/pdf-semantic-boundaries.md](docs/pdf-semantic-boundaries.md) for the semantic guardrails around encryption, signatures, XFA, AcroForm, annotations, and font/CMap markers.
 
-- `validate` performs a strict adapter parse and reports `{ "format": "pdf", "valid": true|false, "errors": [], "warnings": [] }` in JSON mode. Parse failures are reported as `valid: false`; unsupported formats and file I/O errors are command errors. Add `--fail-on-invalid` when invalid parser results should also return a non-zero exit code. For fail-closed structural/security PDF shapes that can still be summarized, JSON mode also includes partial root metadata, including encrypted-PDF metadata when available. `--password` chooses the explicit encrypted-PDF path for supported Standard Security RC4 R2/R3/R4 and R4 AESV2 files.
-- `inspect` reports the parsed tree size and root metadata. For PDFs this includes `header`, byte `size`, estimated `pages`, `boundaries` fields for detected high-level PDF surfaces, and `xref` fields: `has_table`, `table_offset`, `has_hybrid_stream`, `hybrid_stream_offset`, `hybrid_stream_object`, `has_stream`, `stream_count`, `has_object_stream`, `object_count`, `object_stream_count`, `objects`, `stream_objects`, and `object_stream_objects`. Parseable xref-stream, hybrid xref, and object-stream PDFs parse through the graph path; malformed xref streams can still return inspect metadata with `parse_error`.
-- `query` currently targets parsed `pdf.content.text_show` nodes by decoded text value and repeatable exact metadata filters such as `--meta operator=TJ`. `--password` enables the supported encrypted graph parse path.
-- `edit` currently rewrites direct literal-string text operands, simple ASCII hex-string text operands, literal/hex `TJ` array operands, page font-scoped `/ToUnicode` CMap-backed hex text and CMap-backed `TJ` hex arrays for simple `Tf` flows, and one unambiguous `/ToUnicode` CMap fallback in raw or supported filtered content streams, then verifies `reparse`, `old-gone`, and `new-selectable` by default. This is true text rewrite: the underlying PDF text operators are changed and the new text must be selectable after reparse. When direct simple font widths are proven, text-show nodes include conservative raw `width_units` metadata; omitted `/Encoding` on standard non-symbol Type1 base fonts is inferred as StandardEncoding. Shared Form XObject text edits fail closed when a single page-context edit would mutate multiple invocations. This is not layout/reflow support. `--rewrite auto` uses canonical graph rewriting for object-stream, xref-stream, and supported encrypted PDFs when the surgical path cannot prove safety. `--password` with `--rewrite auto|canonical` decrypts supported Standard Security RC4 R2/R3/R4 and R4 AESV2 object graphs, applies the verified canonical text rewrite, and re-encrypts strings and streams before writing. `--signature-mode invalidate` is the explicit signed-PDF invalidation path. `--signature-mode preserve-incremental` uses an append-only incremental update for supported raw content-stream text edits, preserves the original file bytes as a prefix, proves parseable `/ByteRange` bytes are unchanged, and reports `signature_preservation` JSON. `signature inspect` can compare supported CMS/PKCS#7 signed `messageDigest` attributes against the PDF byte-range digest and report certificate count/signer subject and issuer when parseable; JSON separates byte-range digest status from certificate trust status. By default it does not use system roots or validate trust. Passing one or more `--trust-root` PEM/DER certificates, plus optional `--trust-intermediate` files, validates only the signer certificate chain to those explicit roots. `signature re-sign` appends a new incremental signature dictionary through an external signer command, sends only digest/byte-range JSON to stdin, accepts base64 or hex signature bytes on stdout, and verifies the new PDF byte-range digest layer after reparse. It does not validate revocation, timestamp authorities, signer public-key signatures over CMS authenticated attributes, system trust, or unsupported encrypted/object-stream/xref-stream/filtered-stream preserve targets.
-- `form list` reports AcroForm field indexes, fully qualified names, object ids, inherited field types, `type_flag_names`, alternate `/TU` names, mapping `/TM` names, decoded `/V` values, direct default `/DV` values, kid counts, inherited/direct field flags, proven button widget appearance state, sorted proven button appearance states, and directly decoded choice-field `/Opt` options. Plain-text output includes key metadata such as flags, type flags, names, defaults, options, and button states when present. `form set` updates one AcroForm field `/V` value by exact field name or fully qualified parent/child field name and fails closed on zero or multiple matches unless `--match-index` selects one. Text fields use a literal `/V` value and set `/NeedAppearances true`; non-editable choice fields with proven direct `/Opt` options reject unlisted values; editable choice fields and choice fields without proven options accept literal values. Multi-select choice fields accept repeatable `--values` entries, with `--value-array` as an alias; the legacy JSON string-array passed through `--value` remains supported, and mixing `--value` with `--values`/`--value-array` fails closed. Proven checkbox/button fields set `/V` and `/AS` to `/Off` or the proven on-state from `/AP /N`, including inherited `/FT /Btn` and a narrow parent-field radio shape. `--regenerate-appearance` creates simple Helvetica widget appearances for text/choice widgets with proven direct `/Rect`, including explicit newlines, approximate wrapping, clipping, and height truncation; it can also synthesize basic checkbox normal appearances for a single widget with direct `/Rect` and a safe on-state. Radio/group/custom button appearance synthesis remains fail-closed.
-- `annot list` reports zero-based annotation indexes, subtype, contents, annotation `/NM` name, `/M` modified value, `/T` title, object id when indirect, whether `/AP` is present, proven page index/object metadata when the annotation is reached through a page `/Annots` array, direct numeric flags, direct numeric color and border metadata, direct four-number `/Rect` metadata, `quad_points_count`, and appearance-generation status/blocker metadata when available. Plain-text output includes page, rect, color, border, quad-point count, and flag metadata when present. `annot set-contents` updates one annotation dictionary `/Contents` value by index. It preserves `/AP` by default; `--remove-appearance` explicitly removes stale annotation `/AP`; `--regenerate-appearance` creates a simple `/AP /N` Form XObject for supported text-like annotations with proven direct `/Rect`, using the same approximate multiline layout.
-- `xfa list` reports directly represented XFA packet indexes, labels, conservative packet kind, object ids, stream flags, decoded byte length, decoded text length, preview text, filter/decode-params metadata, decode errors for referenced stream packets that cannot be decoded, and JSON `semantics` metadata that classifies static template/datasets packets separately from dynamic rendering-required XFA. `--packet-kind` and `--label` filter the listed packet set exactly. `xfa datasets` lists leaf fields from directly represented datasets packets as stable dot paths. `xfa mappings` reports read-only template-field to dataset-path mappings with values and packet metadata. `xfa dataset-set` updates exactly one datasets leaf field by dot path, XML-escapes the new value, verifies by reparsing the dataset value, and fails closed on zero, multiple, container, unsafe XML, selector-ambiguous matches, detected dynamic XFA markers such as flowed template subforms, repeatable `occur`, pagination/layout nodes, or `dynamicRender` config, or XFA packet families not classified as static template/datasets. `--packet-kind` and `--label` restrict the dataset packet before ambiguity checks. `xfa replace` updates exactly one directly represented XFA packet occurrence in a literal/hex value, referenced string/stream object, or XFA packet array, skipping literal/hex/name packet labels the same way `xfa list` does; `--packet-kind` and `--label` restrict the replacement target before ambiguity checks. Multiple generic replacement matches fail closed unless `--match-index` selects the zero-based occurrence. Generic `inspect`, `query`, `validate`, and `edit` still reject XFA by default.
-- `overlay text` is an explicit fallback command that stamps visible text onto the page and reports fallback metadata. It does not rewrite existing text operators and does not make the stamped text selectable as underlying PDF text. `ocr text-layer-plan` is an explicit planning-only path that reports caller-provided OCR text coordinates/confidence and fallback policy metadata without writing an output PDF or changing true text edit behavior. `ocr text-layer` embeds caller-provided OCR text as an explicit selectable text-layer fallback and reports `fallback_used=true`; it does not run OCR or act as a hidden fallback inside `edit`. The package also accepts JSON and minimal ALTO XML OCR inputs for planning/embedding metadata.
+## Supported PDF Rewrite Shape
 
-Current support is intentionally narrow but no longer only a W-8BEN slice: direct PDF literal strings, simple ASCII hex strings, literal/hex `TJ` arrays, page font-scoped `/ToUnicode` CMaps for simple `Tf` flows including CMap-backed hex `TJ` arrays, one unambiguous fallback CMap, direct or resolved indirect integer `/Length`, raw streams, direct `/Filter /FlateDecode`, `/Filter /LZWDecode`, `/Filter /ASCIIHexDecode`, `/Filter /ASCII85Decode`, and `/Filter /RunLengthDecode` streams, their `/Fl`, `/LZW`, `/AHx`, `/A85`, and `/RL` abbreviations, supported filter arrays composed only of those reversible filters after abbreviation normalization, Flate and LZW `/DecodeParms`, canonical object graph rewrites for object-stream/xref-stream/hybrid-xref content, and basic xref table rebuilds. Indirect length support is limited to `/Length N G R` references that resolve to a standalone integer object. Fixture-backed `/DecodeParms` support includes direct or resolved indirect dictionaries/arrays, resolved indirect dictionary/null array entries, omitted `/Predictor` defaulting to `1`, Flate and LZW `/Predictor 1` with any direct signed integer geometry keys treated as no-op metadata, TIFF predictor `2` packed sample rows with `/BitsPerComponent <= 32`, PNG predictors `10` through `15` with row width computed from `/Columns`, `/Colors`, and `/BitsPerComponent`, plus LZW `/EarlyChange 0|1`. `/DecodeParms` arrays must align one-for-one with the filter array; non-null dictionaries are accepted only for Flate and LZW positions.
+`edit` rewrites direct literal-string text, supported hex-string text, and literal/hex `TJ` array text inside raw content streams and supported reversible filtered streams:
 
-Other `/DecodeParms` shapes, including scalar references, reference cycles, unsupported keys, and unknown predictors, filters outside ASCIIHex, ASCII85, RunLength, Flate, LZW, and their standard abbreviations, encrypted AESV3+/public-key/unsupported-crypt-filter shapes, default signed-PDF edits, XFA outside the explicit `xfa list`, `xfa datasets`, `xfa mappings`, `xfa dataset-set`, and `xfa replace` paths, broad appearance/layout fidelity, bundled OCR/raster recognition, and implicit fallback behavior are not supported by true text edit. Overlay stamping and OCR text-layer embedding are supported only through their explicit fallback commands.
+- `/FlateDecode`, `/LZWDecode`, `/ASCIIHexDecode`, `/ASCII85Decode`, `/RunLengthDecode`
+- standard abbreviations `/Fl`, `/LZW`, `/AHx`, `/A85`, `/RL`
+- filter arrays composed only from those reversible filters
+- supported Flate/LZW `/DecodeParms` predictors and `/EarlyChange`
+- direct or resolved standalone-indirect integer `/Length`
+- graph/canonical rewrites for object-stream, xref-stream, and hybrid-xref PDFs when supported
 
-Object streams are parsed into the internal graph and canonical-written back as normal indirect objects. Parseable xref-stream and hybrid `/XRefStm` PDFs also route through the graph path for generic parse and supported text queries/rewrites; malformed xref streams still fail closed with partial metadata. Detection is intentionally limited to stream dictionaries whose top-level `/Type` is `/ObjStm` or `/XRef`; unrelated `/ObjStm` mentions in other keys, nested dictionaries, or string literals are not treated as object streams.
+Every rewrite remains fail-closed: ambiguous matches, unsupported encodings, unsupported streams, unsafe semantic surfaces, stale source spans, and failed verification stop the command instead of producing a partial edit.
 
-Encrypted PDFs fail closed unless the caller supplies `--password`; the explicit password path supports Standard Security RC4 R2/R3/R4 and R4 AESV2 table-xref or xref-stream files with normal encrypted strings and streams, encrypted object streams inflated into graph objects, encrypted xref streams decoded before graph parsing, plus stream-level `/Crypt` filters for `/Identity` and `/StdCF`. It keeps AESV3+, public-key security, and unsupported crypt filters fail-closed. Digitally signed PDFs and XFA PDFs still fail closed during generic public parse. Signed-PDF markers include true PDF name tokens for `/Sig`, `/ByteRange`, and `/SigFlags`; residual boundary scanning skips PDF literal strings, comments, and hex strings for non-signature boundary name markers too. Signed PDFs require either `binas edit --rewrite canonical --signature-mode invalidate` when the caller accepts invalidation, `binas edit --signature-mode preserve-incremental` when the selected edit can be appended as an incremental update with parseable `/ByteRange` proof, or `binas signature re-sign` when an external signer is available. The preserve path compares signed byte ranges byte-for-byte but does not cryptographically validate, re-sign, or guarantee viewer policy acceptance. The re-sign path proves only the new byte-range digest layer and never accepts raw private keys through CLI flags. AcroForm dictionaries, annotations, and font/CMap markers are exposed through `inspect` metadata and `validate` warnings because their supported behavior is narrower than general PDF semantic editing.
+## Boundaries
 
-The object graph is the foundation for detection, selection, and verified rewrites. It is not a promise that every PDF semantic surface is editable. Broad widget/annotation layout, signature byte ranges, encrypted shapes outside the supported Standard Security RC4/AESV2 path, XFA packet families outside the explicit list/replace helpers, full CMap/font decoding, font widths, and visual layout remain separate semantic systems.
+Not supported as broad/default behavior:
 
-## Next Boundary
+- universal arbitrary-PDF text replacement or layout reflow
+- filters outside ASCIIHex, ASCII85, RunLength, Flate, LZW, and their abbreviations
+- broader `/DecodeParms` shapes beyond the documented Flate/LZW support
+- AESV3, public-key encryption, and unsupported crypt filters
+- default edits to signed PDFs without explicit invalidation/preserve/re-sign modes
+- legal-grade signature trust, revocation, timestamp, or system-root validation
+- full dynamic XFA rendering
+- full AcroForm/widget/annotation visual fidelity
+- bundled OCR or hidden overlay fallback
 
-Current residual boundaries:
-
-- Broader `/DecodeParms` shapes, including scalar references, reference cycles, unknown predictor values, unsupported LZW predictor combinations, and unsupported keys, stay out of scope until each one has fixture-backed parser, edit, length-update, xref-rebuild, and verification proof.
-- Filter chains containing filters outside ASCIIHex, ASCII85, RunLength, Flate, LZW, and their standard abbreviations remain unsupported.
-- AESV3+/public-key/unsupported-crypt-filter encrypted PDFs, default signed-PDF edits, system-root signature trust, revocation/timestamp validation, timestamp/signature public-key verification, dynamic/full XFA rendering, broad appearance/layout fidelity, broad font/CMap/layout support, bundled OCR/raster recognition, and implicit fallback behavior remain out of scope. Overlay stamping, OCR text-layer embedding, and signature re-signing are intentionally limited to explicit commands.
+Overlay and OCR text-layer output are available only through explicit fallback commands and are reported as fallback usage.
 
 ## Packages
 
 - `pkg/core`: span-preserving tree, selector, adapter, edit plan, report, and verification types.
-- `pkg/adapters/pdf`: PDF detection, object graph parsing, xref summary helpers, stream scanning with encoded/decoded length metadata, text-show node parsing, `TJ` array parsing/rewrite, variable-length literal-string rewrite, direct and indirect `/Length` update, generation-aware xref rebuild, incremental-update helpers with a public append-only signed text-edit path for parseable `/ByteRange` shapes, supported ASCIIHexDecode, ASCII85Decode, RunLengthDecode, FlateDecode, LZWDecode plus standard abbreviation aliases, direct and resolved indirect `/DecodeParms` handling for Flate/LZW predictors and LZW EarlyChange, explicit-password Standard Security RC4/AESV2 graph parse/edit/re-encryption for supported R2/R3/R4 files, conservative simple-font width metadata and standard Type1 default encoding inference, AcroForm/XFA/annotation semantic helpers with simple appearance generation paths, explicit OCR text-layer planning/embedding helpers for caller-provided JSON/ALTO metadata, page font-scoped ToUnicode CMap support including CMap-backed hex `TJ` arrays, signature byte-range digest inspection for supported CMS detached signatures, external-callback incremental re-signing, and verification.
-- `pkg/pdfapi`: v0 Go API and fluent DSL for inspect, validate, query, and verified text rewrite over PDF bytes. `RewriteModeAuto` currently uses the canonical rewrite path. This is the OxPDF-facing integration surface; the current proof is local-replace consumer proof over a supported compressed multi-line PDF, while release-tagged install and release-tagged OxPDF consumer proof remain deferred.
-- `cmd/binas`: CLI for `inspect`, `validate`, `query`, `edit`, `overlay`, `ocr`, `form`, `annot`, `xfa`, and `signature`.
-- `cmd/binas-wasm`: browser/WASM entrypoint exposing inspect, query, and verified text edit helpers over `Uint8Array` PDF bytes, plus local `smoke.html` and a rendered `editor.html` browser editor. The editor loads Go WASM, loads PDF.js from a pinned CDN or manually selected local files, renders pages to canvas, navigates pages, zooms, overlays exact text highlights from PDF.js text content, runs verified WASM edits, rerenders edited bytes, and downloads the edited PDF.
+- `pkg/adapters/pdf`: PDF parser, object graph, stream/text/form/annotation/XFA/signature helpers, canonical writer, and verification logic.
+- `pkg/pdfapi`: v0 Go API and fluent DSL for inspect, validate, profile, query, and verified text rewrite over PDF bytes.
+- `cmd/binas`: CLI for PDF inspection, validation, query, edit, forms, annotations, XFA, overlay/OCR fallback, and signature flows.
+- `cmd/binas-wasm`: browser/WASM entrypoint for inspect, query, and verified text edit over `Uint8Array` PDF bytes.
+
+## Browser/WASM
+
+```powershell
+$env:GOOS = "js"; $env:GOARCH = "wasm"
+go build -o tmp\binas.wasm ./cmd/binas-wasm
+Remove-Item Env:\GOOS, Env:\GOARCH
+Copy-Item "$(go env GOROOT)\lib\wasm\wasm_exec.js" tmp\wasm_exec.js
+python -m http.server 8765
+# Open http://127.0.0.1:8765/cmd/binas-wasm/editor.html
+```
+
+The browser editor uses PDF.js for rendering and the Go WASM module for semantic inspect/query/edit operations. Rendering is not a second proof of PDF semantic correctness; the rewrite proof still comes from `binas`.
 
 ## Verification
 
 ```powershell
-go test ./...
+go test ./... -count=1
 go build -o tmp\binas.exe ./cmd/binas
+$env:GOOS = "js"; $env:GOARCH = "wasm"; go build -o tmp\binas.wasm ./cmd/binas-wasm; Remove-Item Env:\GOOS, Env:\GOARCH
 ```

@@ -1,6 +1,6 @@
 # W-8BEN Variable-Length Rewrite
 
-This document tracks the current proof slice for rewriting selectable W-8BEN PDF text without painting an overlay on top of the page.
+This document describes a real-file smoke pattern for rewriting selectable W-8BEN PDF text without painting an overlay on top of the page.
 
 For the CLI output contract, `validate` behavior, inspect metadata, and current failure modes, see [release-surface.md](release-surface.md). For the semantic guardrails around detection-only and fail-closed PDF surfaces, see [pdf-semantic-boundaries.md](pdf-semantic-boundaries.md).
 
@@ -93,7 +93,7 @@ Expected proof:
 
 If `BINAS_W8BEN_PDF` is not set, `TestW8BENDateRewriteIsSelectableText` skips that real-file proof. The synthetic variable-length test still proves the byte-length mechanics by rewriting `08-15-2024` to `05-05-2026`, updating `/Length`, rebuilding `xref`, and verifying selectable text.
 
-## Incremental Roadmap
+## Maintenance Notes
 
 1. Keep the direct-length literal-string path tight.
    - Preserve fail-closed source-span checks.

@@ -4,15 +4,15 @@ This document describes the current public CLI surface for the PDF proof slice. 
 
 For the semantic edit contract behind these CLI fields, including the difference between fail-closed boundaries and detection-only warnings, see [pdf-semantic-boundaries.md](pdf-semantic-boundaries.md).
 
-## OxPDF v1 Readiness Profile
+## Release Contract
 
-The current public surface is being shaped for OxPDF v1 arbitrary-PDF intake, but this document does not claim release readiness. The remaining biting points are supported arbitrary intake, form fill, filter/decode tolerance, a clear Text Editability Profile, and explicit refusal boundaries.
+The public surface is a v0 PDF adapter release for `binas`, not a general PDF editor. Supported operations are explicit and fixture-backed; unsupported shapes fail closed or are reported as detection metadata.
 
-- Supported arbitrary intake is limited to files that parse through the current graph and security boundaries. Unsupported encryption, default signed edits, dynamic/full XFA, malformed xref streams, and unsupported object/filter shapes still fail closed or report detection metadata.
-- Form fill is explicit through `form list` and `form set`, with narrow support for text, proven choice options, multi-select values, checkbox/button states, and simple appearance regeneration. Rich widgets, broad field-tree surgery, and broad visual layout remain refusal boundaries unless fixture-backed code lands.
+- Arbitrary intake is limited to files that parse through the current graph and security boundaries. Unsupported encryption, default signed edits, dynamic/full XFA, malformed xref streams, and unsupported object/filter shapes still fail closed or report detection metadata.
+- Form fill is explicit through `form list` and `form set`, with narrow support for text, proven choice options, multi-select values, checkbox/button states, and simple appearance regeneration. Rich widgets, broad field-tree surgery, and broad visual layout remain refusal boundaries.
 - Filter/decode tolerance accepts the documented reversible filters and pass-through non-target streams; unsupported filters and unsupported `/DecodeParms` shapes remain precise failures.
-- The Text Editability Profile for OxPDF callers should distinguish directly editable text operands, CMap-backed text, canonical rewrite paths, explicit fallback commands, and non-editable documents. It should not imply full font metrics, visual reflow, or bundled OCR.
-- Release-tagged install proof and release-tagged OxPDF consumer proof remain deferred to the release step.
+- The text editability profile distinguishes directly editable text operands, CMap-backed text, canonical rewrite paths, explicit fallback commands, and non-editable documents. It does not imply full font metrics, visual reflow, or bundled OCR.
+- Browser/WASM support exposes the same inspect/query/edit semantics over PDF bytes. PDF.js rendering in the local editor is a visual surface, not a separate correctness proof.
 
 ## Validate
 
