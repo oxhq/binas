@@ -81,8 +81,12 @@ func applyIncrementalTextEdit(input []byte, selector core.Match, mutation core.M
 	}
 
 	candidate := candidates[index]
-	replacement, err := encodeCanonicalTextReplacement(candidate.Show, mutation.Replace)
+	replacement, replacementProof, err := encodeCanonicalTextReplacement(candidate.Show, mutation.Replace)
 	if err != nil {
+		return nil, core.Report{}, core.Verification{}, SignaturePreservationVerification{}, err
+	}
+	layoutProofMeta := textShowReplacementReportMetadata(candidate.Show.Meta, textShowReplacementLayoutProofMetadata(candidate.Show.Meta, replacement))
+	if err := rejectUnsupportedTextReplacementLayout(layoutProofMeta, replacementProof); err != nil {
 		return nil, core.Report{}, core.Verification{}, SignaturePreservationVerification{}, err
 	}
 	updated, err := replacementContentStream(candidate, replacement)
@@ -108,6 +112,7 @@ func applyIncrementalTextEdit(input []byte, selector core.Match, mutation core.M
 		NewText:    mutation.Replace,
 		PageCount:  graph.pageCount(),
 		Invariants: invariants,
+		Meta:       layoutProofMeta,
 	}
 	verification, preservation, err := verifyIncrementalTextReplacementOutput(input, output, plan, byteRanges, requireSignatureProof && boundaries.HasSignature)
 	if err != nil {
@@ -120,6 +125,7 @@ func applyIncrementalTextEdit(input []byte, selector core.Match, mutation core.M
 		NodesModified: 1,
 		MatchIndex:    matchIndex,
 		Invariants:    invariants,
+		Meta:          plan.Meta,
 	})
 	return output, report, verification, preservation, nil
 }

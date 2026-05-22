@@ -946,6 +946,7 @@ type parsedTextShow struct {
 	Encoding     string
 	CMap         *toUnicodeCMap
 	FontEncoding *pdfSimpleFontEncoding
+	Meta         map[string]any
 	TextState    pdfTextStateSnapshot
 	Start        int
 	End          int
@@ -1019,8 +1020,12 @@ func editCanonicalWithOptions(input []byte, selector core.Match, mutation core.M
 		return nil, core.Report{}, core.Verification{}, fmt.Errorf("selector matched %d nodes; pass --match-index N (zero-based, 0..%d) to choose one", len(candidates), len(candidates)-1)
 	}
 	candidate := candidates[index]
-	replacement, err := encodeCanonicalTextReplacement(candidate.Show, mutation.Replace)
+	replacement, replacementProof, err := encodeCanonicalTextReplacement(candidate.Show, mutation.Replace)
 	if err != nil {
+		return nil, core.Report{}, core.Verification{}, err
+	}
+	layoutProofMeta := textShowReplacementReportMetadata(candidate.Show.Meta, textShowReplacementLayoutProofMetadata(candidate.Show.Meta, replacement))
+	if err := rejectUnsupportedTextReplacementLayout(layoutProofMeta, replacementProof); err != nil {
 		return nil, core.Report{}, core.Verification{}, err
 	}
 	if candidate.Show.Start < 0 || candidate.Show.End < candidate.Show.Start || candidate.Show.End > len(candidate.Decoded) {
@@ -1056,6 +1061,7 @@ func editCanonicalWithOptions(input []byte, selector core.Match, mutation core.M
 		NewText:    mutation.Replace,
 		PageCount:  graph.pageCount(),
 		Invariants: invariants,
+		Meta:       layoutProofMeta,
 	}
 	verification, err := verifyCanonicalEditOutput(output, plan, parseOpts)
 	if err != nil {
@@ -1068,6 +1074,7 @@ func editCanonicalWithOptions(input []byte, selector core.Match, mutation core.M
 		NodesModified: 1,
 		MatchIndex:    matchIndex,
 		Invariants:    invariants,
+		Meta:          plan.Meta,
 	})
 	return output, report, verification, nil
 }
@@ -1112,7 +1119,7 @@ func (g *pdfGraph) textShowCandidatesWithCMap(text string, cmap *toUnicodeCMap) 
 func (g *pdfGraph) textShowCandidatesWithCMapContext(text string, cmapContext pdfCMapContext) ([]canonicalTextCandidate, error) {
 	candidates := make([]canonicalTextCandidate, 0)
 	for _, context := range g.textShowStreamContexts(cmapContext) {
-		shows := parseCanonicalTextShows(context.decoded, context.textContext.toUnicode, context.textContext.fontToUnicode, context.textContext.fontEncodings)
+		shows := parseCanonicalTextShows(context.decoded, context.textContext)
 		for _, show := range shows {
 			if text != "" && show.Text != text {
 				continue
@@ -1128,13 +1135,8 @@ func (g *pdfGraph) textShowCandidatesWithCMapContext(text string, cmapContext pd
 	return candidates, nil
 }
 
-func parseCanonicalTextShows(input []byte, cmap *toUnicodeCMap, fontCMaps map[string]*toUnicodeCMap, fontEncodings ...map[string]*pdfSimpleFontEncoding) []parsedTextShow {
+func parseCanonicalTextShows(input []byte, ctx textShowContext) []parsedTextShow {
 	shows := make([]parsedTextShow, 0)
-	var encodings map[string]*pdfSimpleFontEncoding
-	if len(fontEncodings) > 0 {
-		encodings = fontEncodings[0]
-	}
-	ctx := textShowContext{toUnicode: cmap, fontToUnicode: fontCMaps, fontEncodings: encodings}
 	activeFont := ""
 	textState := newPDFTextStateTracker()
 	stateScanAt := 0
@@ -1231,12 +1233,22 @@ func parseCanonicalTextShows(input []byte, cmap *toUnicodeCMap, fontCMaps map[st
 			stateScanAt = opEnd
 			continue
 		}
+		meta := map[string]any{
+			"encoded":  encoded,
+			"encoding": encoding,
+		}
+		if activeFont != "" {
+			meta["font"] = activeFont
+		}
+		enrichTextShowFontWidthMetadata(meta, activeFont, encoded, encoding, ctx.fontMetrics)
+		enrichTextShowCIDWidthMetadata(meta, activeFont, encoded, encoding, ctx.cidMetrics)
 		shows = append(shows, parsedTextShow{
 			Text:         decoded,
 			Encoded:      encoded,
 			Encoding:     encoding,
 			CMap:         ctx.cmapForFont(activeFont),
 			FontEncoding: ctx.fontEncodingForFont(activeFont),
+			Meta:         meta,
 			TextState:    textState.Snapshot(),
 			Start:        operandStart,
 			End:          closeAt,
@@ -1247,67 +1259,62 @@ func parseCanonicalTextShows(input []byte, cmap *toUnicodeCMap, fontCMaps map[st
 	return shows
 }
 
-func encodeCanonicalTextReplacement(show parsedTextShow, replacement string) (string, error) {
+func encodeCanonicalTextReplacement(show parsedTextShow, replacement string) (string, textReplacementEncodingProof, error) {
 	switch show.Encoding {
 	case "", "literal":
-		return encodeLiteralString(replacement), nil
+		return encodeLiteralString(replacement), textReplacementEncodingProof{}, nil
 	case "tj-array":
-		return "[(" + encodeLiteralString(replacement) + ")]", nil
+		return "[(" + encodeLiteralString(replacement) + ")]", textReplacementEncodingProof{}, nil
 	case "tj-array-cmap":
 		if show.CMap == nil {
-			return "", errors.New("matched text show has no ToUnicode CMap")
+			return "", textReplacementEncodingProof{}, errors.New("matched text show has no ToUnicode CMap")
 		}
 		encoded, maxCodeBytes, ok := show.CMap.EncodeHexWithMaxCodeBytes(replacement)
 		if !ok {
-			return "", errors.New("replacement for ToUnicode TJ array text is not representable by the CMap")
+			return "", textReplacementEncodingProof{}, errors.New("replacement for ToUnicode TJ array text is not representable by the CMap")
 		}
-		if err := rejectUnsupportedTextReplacementLayout(nil, textReplacementEncodingProof{CMapReverseEncoded: true, MaxCMapCodeBytes: maxCodeBytes}); err != nil {
-			return "", err
-		}
-		return "[<" + encoded + ">]", nil
+		return "[<" + encoded + ">]", textReplacementEncodingProof{CMapReverseEncoded: true, MaxCMapCodeBytes: maxCodeBytes}, nil
 	case "tj-array-font-encoding":
 		if show.FontEncoding == nil {
-			return "", errors.New("matched text show has no simple font encoding")
+			return "", textReplacementEncodingProof{}, errors.New("matched text show has no simple font encoding")
 		}
 		encoded, ok := show.FontEncoding.EncodeHex(replacement)
 		if !ok {
-			return "", errors.New("replacement for simple font encoded TJ array text is not representable by the font encoding")
+			return "", textReplacementEncodingProof{}, errors.New("replacement for simple font encoded TJ array text is not representable by the font encoding")
 		}
-		return "[<" + encoded + ">]", nil
+		return "[<" + encoded + ">]", textReplacementEncodingProof{}, nil
 	case "hex":
-		return encodeHexTextString(replacement)
+		encoded, err := encodeHexTextString(replacement)
+		return encoded, textReplacementEncodingProof{}, err
 	case "hex-cmap":
 		if show.CMap == nil {
-			return "", errors.New("matched text show has no ToUnicode CMap")
+			return "", textReplacementEncodingProof{}, errors.New("matched text show has no ToUnicode CMap")
 		}
 		encoded, maxCodeBytes, ok := show.CMap.EncodeHexWithMaxCodeBytes(replacement)
 		if !ok {
-			return "", errors.New("replacement for ToUnicode hex text show operand is not representable by the CMap")
+			return "", textReplacementEncodingProof{}, errors.New("replacement for ToUnicode hex text show operand is not representable by the CMap")
 		}
-		if err := rejectUnsupportedTextReplacementLayout(nil, textReplacementEncodingProof{CMapReverseEncoded: true, MaxCMapCodeBytes: maxCodeBytes}); err != nil {
-			return "", err
-		}
-		return encoded, nil
+		return encoded, textReplacementEncodingProof{CMapReverseEncoded: true, MaxCMapCodeBytes: maxCodeBytes}, nil
 	case "hex-font-encoding":
 		if show.FontEncoding == nil {
-			return "", errors.New("matched text show has no simple font encoding")
+			return "", textReplacementEncodingProof{}, errors.New("matched text show has no simple font encoding")
 		}
 		encoded, ok := show.FontEncoding.EncodeHex(replacement)
 		if !ok {
-			return "", errors.New("replacement for simple font encoded hex text show operand is not representable by the font encoding")
+			return "", textReplacementEncodingProof{}, errors.New("replacement for simple font encoded hex text show operand is not representable by the font encoding")
 		}
-		return encoded, nil
+		return encoded, textReplacementEncodingProof{}, nil
 	case "literal-font-encoding":
 		if show.FontEncoding == nil {
-			return "", errors.New("matched text show has no simple font encoding")
+			return "", textReplacementEncodingProof{}, errors.New("matched text show has no simple font encoding")
 		}
 		encoded, ok := show.FontEncoding.EncodeBytes(replacement)
 		if !ok {
-			return "", errors.New("replacement for simple font encoded literal text show operand is not representable by the font encoding")
+			return "", textReplacementEncodingProof{}, errors.New("replacement for simple font encoded literal text show operand is not representable by the font encoding")
 		}
-		return encodeLiteralBytes(encoded), nil
+		return encodeLiteralBytes(encoded), textReplacementEncodingProof{}, nil
 	default:
-		return "", fmt.Errorf("unsupported text show operand encoding %q", show.Encoding)
+		return "", textReplacementEncodingProof{}, fmt.Errorf("unsupported text show operand encoding %q", show.Encoding)
 	}
 }
 

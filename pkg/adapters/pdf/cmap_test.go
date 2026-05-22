@@ -358,6 +358,37 @@ func TestCMapMultiByteReverseEncodingWithIdentityHWidthProofEdits(t *testing.T) 
 	}
 }
 
+func TestCMapCanonicalMultiByteReverseEncodingWithIdentityHWidthProofEdits(t *testing.T) {
+	content := []byte("BT\n/F1 12 Tf\n<0001> Tj\nET\n")
+	input := testPDF(
+		"<< /Type /Catalog >>",
+		"<< /Type /Page /Contents 4 0 R /Resources << /Font << /F1 3 0 R >> >> >>",
+		"<< /Type /Font /Subtype /Type0 /Encoding /Identity-H /DescendantFonts [6 0 R] /ToUnicode 5 0 R >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
+		testTwoCIDToUnicodeCMapStream(),
+		"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /CIDFixture /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /W [1 2 500] >>",
+	)
+
+	output, report, verification, err := ApplyCanonicalEdit(
+		input,
+		core.Match{Kind: KindTextShow, Text: "A"},
+		core.Mutation{Replace: "B"},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Meta["layout_proof"] != layoutProofStatusWidthProven {
+		t.Fatalf("report layout_proof = %v, want %s; meta=%+v", report.Meta["layout_proof"], layoutProofStatusWidthProven, report.Meta)
+	}
+	if !bytes.Contains(output, []byte("<0002> Tj")) {
+		t.Fatalf("new Identity-H operand missing:\n%s", output)
+	}
+	if !verification.ReparseOK || !verification.OldTextRemoved || !verification.NewSelectable || !verification.PageUnchanged {
+		t.Fatalf("verification failed: %+v", verification)
+	}
+}
+
 func TestCMapInheritsPageResourcesFromParentPages(t *testing.T) {
 	content := []byte("BT\n/F1 12 Tf\n<0102030405> Tj\nET\n")
 	input := testPDF(

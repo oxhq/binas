@@ -53,7 +53,7 @@ func TestTextLayoutMetadataTracksFontPositionMatrixAndQuoteMovement(t *testing.T
 func TestCanonicalTextShowsCarryTextStateSnapshots(t *testing.T) {
 	content := []byte("BT\n/F2 9 Tf\n5 6 Td\n(Canonical) Tj\n18 TL\n(Line) '\nET\n")
 
-	shows := parseCanonicalTextShows(content, nil, nil)
+	shows := parseCanonicalTextShows(content, textShowContext{})
 	if len(shows) != 2 {
 		t.Fatalf("shows = %d, want 2", len(shows))
 	}
@@ -149,7 +149,7 @@ func TestDoubleQuoteTextShowWithMalformedSpacingFailsClosed(t *testing.T) {
 	if matches := tree.Query(core.Match{Kind: KindTextShow, Text: "Nope"}); len(matches) != 0 {
 		t.Fatalf("surgical matches = %d, want 0", len(matches))
 	}
-	if shows := parseCanonicalTextShows(content, nil, nil); len(shows) != 0 {
+	if shows := parseCanonicalTextShows(content, textShowContext{}); len(shows) != 0 {
 		t.Fatalf("canonical shows = %d, want 0", len(shows))
 	}
 }
