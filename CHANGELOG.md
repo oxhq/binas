@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.1
+
+Release hygiene update.
+
+- Use Node 24-native GitHub Actions tags in CI.
+- Keep the release surface and install path unchanged from v0.1.0.
+
 ## v0.1.0
 
 Initial public release of `binas`.
