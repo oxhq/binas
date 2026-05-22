@@ -1999,6 +1999,182 @@ func TestCLIXFAListPlainTextIncludesSemanticMetadata(t *testing.T) {
 	}
 }
 
+func TestCLIXFADatasetsEmitsJSONFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "xfa-datasets.pdf")
+	input := pdfFixture(
+		"<< /Type /Catalog /AcroForm << /XFA [(template) (<template>ignored</template>) (datasets) (<xfa:datasets xmlns:xfa=\"http://www.xfa.org/schema/xfa-data/1.0/\"><xfa:data><form><name>Alice</name><address><city>Tijuana</city></address></form></xfa:data></xfa:datasets>)] >> >>",
+	)
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{"xfa", "datasets", path, "--format", "pdf", "--json"})
+	})
+	var result struct {
+		Count  int `json:"count"`
+		Fields []struct {
+			PacketIndex int    `json:"packet_index"`
+			Label       string `json:"label"`
+			Path        string `json:"path"`
+			Value       string `json:"value"`
+		} `json:"fields"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Count != 2 || len(result.Fields) != 2 {
+		t.Fatalf("result = %+v, want two dataset fields", result)
+	}
+	first := result.Fields[0]
+	if first.PacketIndex != 1 || first.Label != "datasets" || first.Path != "form.name" || first.Value != "Alice" {
+		t.Fatalf("first field = %+v", first)
+	}
+	second := result.Fields[1]
+	if second.PacketIndex != 1 || second.Label != "datasets" || second.Path != "form.address.city" || second.Value != "Tijuana" {
+		t.Fatalf("second field = %+v", second)
+	}
+}
+
+func TestCLIXFADatasetsPlainTextPrintsPathValueLines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "xfa-datasets-text.pdf")
+	input := pdfFixture(
+		"<< /Type /Catalog /AcroForm << /XFA [(datasets) (<datasets><data><invoice><number>INV-7</number><total>42</total></invoice></data></datasets>)] >> >>",
+	)
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{"xfa", "datasets", path, "--format", "pdf"})
+	})
+	want := "invoice.number=INV-7\ninvoice.total=42\n"
+	if stdout != want {
+		t.Fatalf("stdout = %q, want %q", stdout, want)
+	}
+}
+
+func TestCLIXFADatasetSetWritesVerifiedFieldUpdate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "xfa-dataset-set.pdf")
+	input := pdfFixture(
+		"<< /Type /Catalog /AcroForm << /XFA [(template) (<template>ignored</template>) (datasets) (<xfa:datasets xmlns:xfa=\"http://www.xfa.org/schema/xfa-data/1.0/\"><xfa:data><form><name>Alice</name><address><city>Tijuana</city></address></form></xfa:data></xfa:datasets>)] >> >>",
+	)
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "xfa-dataset-set-out.pdf")
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{
+			"xfa", "dataset-set", path,
+			"--format", "pdf",
+			"--path", "form.name",
+			"--value", "Ana & Co",
+			"-o", out,
+			"--json",
+		})
+	})
+	var result struct {
+		Report struct {
+			Edit          string `json:"edit"`
+			NodesModified int    `json:"nodes_modified"`
+			OutputPath    string `json:"output_path"`
+		} `json:"report"`
+		Verification struct {
+			ReparseOK      bool `json:"reparse_ok"`
+			OldTextRemoved bool `json:"old_text_removed"`
+			NewSelectable  bool `json:"new_text_selectable"`
+		} `json:"verification"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Report.Edit != "pdf.xfa_dataset_field_update" || result.Report.NodesModified != 1 || result.Report.OutputPath != out {
+		t.Fatalf("result = %+v", result)
+	}
+	if !result.Verification.ReparseOK || !result.Verification.OldTextRemoved || !result.Verification.NewSelectable {
+		t.Fatalf("verification = %+v", result.Verification)
+	}
+	written, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(written, []byte("Alice")) {
+		t.Fatalf("old dataset value remains:\n%s", written)
+	}
+	if !bytes.Contains(written, []byte("Ana &amp; Co")) {
+		t.Fatalf("escaped dataset value missing:\n%s", written)
+	}
+	if !bytes.Contains(written, []byte("<template>ignored</template>")) {
+		t.Fatalf("unselected XFA packet changed:\n%s", written)
+	}
+}
+
+func TestCLIXFADatasetSetSelectorSelectsLabel(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "xfa-dataset-set-label.pdf")
+	input := pdfFixture(
+		"<< /Type /Catalog /AcroForm << /XFA [(left) (<datasets><data><form><name>Left</name></form></data></datasets>) (right) (<datasets><data><form><name>Right</name></form></data></datasets>)] >> >>",
+	)
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "xfa-dataset-set-label-out.pdf")
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{
+			"xfa", "dataset-set", path,
+			"--format", "pdf",
+			"--label", "right",
+			"--path", "form.name",
+			"--value", "Updated",
+			"-o", out,
+			"--json",
+		})
+	})
+	var result struct {
+		Report struct {
+			Edit string `json:"edit"`
+		} `json:"report"`
+		Verification struct {
+			ReparseOK     bool `json:"reparse_ok"`
+			NewSelectable bool `json:"new_text_selectable"`
+		} `json:"verification"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Report.Edit != "pdf.xfa_dataset_field_update" || !result.Verification.ReparseOK || !result.Verification.NewSelectable {
+		t.Fatalf("result = %+v", result)
+	}
+	written, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(written, []byte("<name>Left</name>")) {
+		t.Fatalf("unselected dataset packet changed:\n%s", written)
+	}
+	if bytes.Contains(written, []byte("<name>Right</name>")) || !bytes.Contains(written, []byte("<name>Updated</name>")) {
+		t.Fatalf("selected dataset packet was not updated:\n%s", written)
+	}
+}
+
+func TestCLIXFADatasetsRejectsNonPDFFormat(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "xfa-datasets.txt")
+	if err := os.WriteFile(path, []byte("not a pdf"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := captureStdoutAndError(t, func() error {
+		return run([]string{"xfa", "datasets", path, "--format", "txt", "--json"})
+	})
+	if err == nil {
+		t.Fatal("xfa datasets succeeded, want unsupported format error")
+	}
+	if err.Error() != `xfa datasets is unsupported for format "txt"` {
+		t.Fatalf("error = %q", err)
+	}
+}
+
 func TestCLIEditWritesVerifiedPDF(t *testing.T) {
 	path := writeFixture(t)
 	out := filepath.Join(t.TempDir(), "out.pdf")

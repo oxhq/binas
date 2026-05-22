@@ -452,11 +452,15 @@ func annotSetContents(args []string) error {
 
 func xfa(args []string) error {
 	if len(args) == 0 {
-		return errors.New("expected xfa command: list, replace")
+		return errors.New("expected xfa command: list, datasets, dataset-set, replace")
 	}
 	switch args[0] {
 	case "list":
 		return xfaList(args[1:])
+	case "datasets":
+		return xfaDatasets(args[1:])
+	case "dataset-set":
+		return xfaDatasetSet(args[1:])
 	case "replace":
 		return xfaReplace(args[1:])
 	default:
@@ -526,6 +530,74 @@ func xfaList(args []string) error {
 		fmt.Println(strings.Join(parts, " "))
 	}
 	return nil
+}
+
+func xfaDatasets(args []string) error {
+	fs := flag.NewFlagSet("xfa datasets", flag.ContinueOnError)
+	format := fs.String("format", "pdf", "input format")
+	asJSON := fs.Bool("json", false, "write JSON")
+	if err := fs.Parse(reorderFlags(args, map[string]bool{"json": true}, map[string]bool{"format": true})); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("xfa datasets requires one input file")
+	}
+	if strings.ToLower(*format) != "pdf" {
+		return fmt.Errorf("xfa datasets is unsupported for format %q", *format)
+	}
+	input, err := os.ReadFile(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	fields, err := pdf.ListXFADatasetFields(input)
+	if err != nil {
+		return err
+	}
+	result := map[string]any{"fields": fields, "count": len(fields)}
+	if *asJSON {
+		return writeJSON(result)
+	}
+	for _, field := range fields {
+		fmt.Printf("%s=%s\n", field.Path, field.Value)
+	}
+	return nil
+}
+
+func xfaDatasetSet(args []string) error {
+	fs := flag.NewFlagSet("xfa dataset-set", flag.ContinueOnError)
+	format := fs.String("format", "pdf", "input format")
+	path := fs.String("path", "", "XFA dataset field path")
+	value := fs.String("value", "", "replacement XFA dataset field value")
+	packetKind := fs.String("packet-kind", "", "restrict update to a conservative XFA packet kind")
+	label := fs.String("label", "", "restrict update to an XFA array label")
+	outputPath := fs.String("o", "", "output file")
+	asJSON := fs.Bool("json", false, "write JSON")
+	if err := fs.Parse(reorderFlags(args, map[string]bool{"json": true}, map[string]bool{"format": true, "path": true, "value": true, "packet-kind": true, "label": true, "o": true})); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("xfa dataset-set requires one input file")
+	}
+	if strings.ToLower(*format) != "pdf" {
+		return fmt.Errorf("xfa dataset-set is unsupported for format %q", *format)
+	}
+	if strings.TrimSpace(*path) == "" {
+		return errors.New("xfa dataset-set requires --path")
+	}
+	if *outputPath == "" {
+		return errors.New("xfa dataset-set requires -o")
+	}
+	input, err := os.ReadFile(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	output, report, verification, err := pdf.ApplyXFADatasetFieldUpdateWithOptions(input, *path, *value, pdf.XFADatasetFieldUpdateOptions{
+		Selector: pdf.XFASelector{PacketKind: *packetKind, Label: *label},
+	})
+	if err != nil {
+		return err
+	}
+	return writeSemanticEditResult(output, report, verification, *outputPath, *asJSON)
 }
 
 func xfaReplace(args []string) error {
