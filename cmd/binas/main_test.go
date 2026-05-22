@@ -13,12 +13,14 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/ascii85"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -3119,6 +3121,126 @@ func TestCLISignatureInspectTrustRootValidatesExplicitRoot(t *testing.T) {
 	if !strings.Contains(result.SignerCertificateSubject, "Binas CLI Test Signer") || !strings.Contains(result.SignerCertificateIssuer, "Binas CLI Test Root") {
 		t.Fatalf("signer certificate metadata = subject %q issuer %q", result.SignerCertificateSubject, result.SignerCertificateIssuer)
 	}
+}
+
+func TestCLISignatureReSignWithExternalSignerCommand(t *testing.T) {
+	input, _ := writeCLISignedCMSFixtureInput(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "signed-cms.pdf")
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "resigned.pdf")
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{
+			"signature", "re-sign", path,
+			"--format", "pdf",
+			"-o", out,
+			"--signer-command", os.Args[0],
+			"--signer-arg", "-test.run=TestCLISignatureReSignExternalSignerHelper",
+			"--signer-env", "BINAS_TEST_SIGNER=1",
+			"--signer-name", "test external signer",
+			"--external-key-id", "test-key-1",
+			"--digest", "sha256",
+			"--container", "pkcs7",
+			"--sub-filter", "adbe.pkcs7.detached",
+			"--reserved-bytes", "8192",
+			"--json",
+		})
+	})
+	var result struct {
+		OutputPath string `json:"output_path"`
+		Plan       struct {
+			Supported bool `json:"supported"`
+			ByteRange []struct {
+				Offset int `json:"offset"`
+				Length int `json:"length"`
+			} `json:"byte_ranges"`
+			CallbackMetadata struct {
+				Name               string `json:"name"`
+				ExternalKeyID      string `json:"external_key_id"`
+				DigestAlgorithm    string `json:"digest_algorithm"`
+				SignatureContainer string `json:"signature_container"`
+				SubFilter          string `json:"sub_filter"`
+			} `json:"callback_metadata"`
+		} `json:"plan"`
+		Verification struct {
+			IncrementalUpdate               bool   `json:"incremental_update"`
+			ReparseOK                       bool   `json:"reparse_ok"`
+			ByteRangeDigestValidation       bool   `json:"byte_range_digest_validation"`
+			ByteRangeDigestValidationStatus string `json:"byte_range_digest_validation_status"`
+			CryptographicSignatureStatus    string `json:"cryptographic_signature_status"`
+		} `json:"verification"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.OutputPath != out || !result.Plan.Supported || len(result.Plan.ByteRange) != 2 {
+		t.Fatalf("re-sign result = %+v", result)
+	}
+	if result.Plan.CallbackMetadata.Name != "test external signer" || result.Plan.CallbackMetadata.ExternalKeyID != "test-key-1" {
+		t.Fatalf("callback metadata = %+v", result.Plan.CallbackMetadata)
+	}
+	if result.Plan.CallbackMetadata.DigestAlgorithm != "sha256" || result.Plan.CallbackMetadata.SignatureContainer != "pkcs7" || result.Plan.CallbackMetadata.SubFilter != "adbe.pkcs7.detached" {
+		t.Fatalf("callback crypto metadata = %+v", result.Plan.CallbackMetadata)
+	}
+	if !result.Verification.IncrementalUpdate || !result.Verification.ReparseOK || !result.Verification.ByteRangeDigestValidation || result.Verification.ByteRangeDigestValidationStatus != "valid" {
+		t.Fatalf("verification = %+v, want valid byte-range digest", result.Verification)
+	}
+	if result.Verification.CryptographicSignatureStatus != "not_performed" {
+		t.Fatalf("cryptographic signature status = %q, want not_performed", result.Verification.CryptographicSignatureStatus)
+	}
+	if _, err := os.Stat(out); err != nil {
+		t.Fatalf("output file missing: %v", err)
+	}
+
+	inspectOut := captureStdout(t, func() error {
+		return run([]string{"signature", "inspect", out, "--format", "pdf", "--json"})
+	})
+	var signature struct {
+		ByteRangeDigestValidation       bool   `json:"byte_range_digest_validation"`
+		ByteRangeDigestValidationStatus string `json:"byte_range_digest_validation_status"`
+		CryptographicValidationStatus   string `json:"cryptographic_validation_status"`
+	}
+	if err := json.Unmarshal([]byte(inspectOut), &signature); err != nil {
+		t.Fatal(err)
+	}
+	if !signature.ByteRangeDigestValidation || signature.ByteRangeDigestValidationStatus != "valid" || signature.CryptographicValidationStatus != "byte_range_digest_valid" {
+		t.Fatalf("signature inspect = %+v, want valid byte-range digest layer", signature)
+	}
+}
+
+func TestCLISignatureReSignExternalSignerHelper(t *testing.T) {
+	if os.Getenv("BINAS_TEST_SIGNER") != "1" {
+		return
+	}
+	input, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request struct {
+		DigestBase64 string `json:"digest_base64"`
+		DigestHex    string `json:"digest_hex"`
+	}
+	if err := json.Unmarshal(input, &request); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := base64.StdEncoding.DecodeString(request.DigestBase64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(digest) != sha256.Size || request.DigestHex != hex.EncodeToString(digest) {
+		t.Fatalf("signing request digest = base64 %q hex %q", request.DigestBase64, request.DigestHex)
+	}
+	rootDER, leafDER := cliTestCertificateChain(t)
+	signature := cliMinimalDetachedCMSWithMessageDigestAndCertificates(t, digest, [][]byte{leafDER, rootDER})
+	if err := json.NewEncoder(os.Stdout).Encode(map[string]string{
+		"signature_base64": base64.StdEncoding.EncodeToString(signature),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	os.Exit(0)
 }
 
 func TestCLISignatureInspectPlainTextIncludesNonCryptographicHints(t *testing.T) {

@@ -1,13 +1,18 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 
@@ -177,14 +182,187 @@ func ocrTextLayerPlan(args []string) error {
 
 func signature(args []string) error {
 	if len(args) == 0 {
-		return errors.New("expected signature command: inspect")
+		return errors.New("expected signature command: inspect, re-sign")
 	}
 	switch args[0] {
 	case "inspect":
 		return signatureInspect(args[1:])
+	case "re-sign":
+		return signatureReSign(args[1:])
 	default:
 		return fmt.Errorf("unknown signature command %q", args[0])
 	}
+}
+
+type cliSignatureReSignResult struct {
+	OutputPath    string                             `json:"output_path,omitempty"`
+	Plan          pdf.SignatureSigningPlan           `json:"plan"`
+	Verification  pdf.SignatureReSigningVerification `json:"verification"`
+	SignerCommand string                             `json:"signer_command,omitempty"`
+}
+
+type cliSignatureSigningRequest struct {
+	DigestBase64       string                               `json:"digest_base64"`
+	DigestHex          string                               `json:"digest_hex"`
+	DigestAlgorithm    string                               `json:"digest_algorithm"`
+	SignatureContainer string                               `json:"signature_container"`
+	SubFilter          string                               `json:"sub_filter,omitempty"`
+	ByteRanges         []pdf.SignatureByteRange             `json:"byte_ranges,omitempty"`
+	Signature          pdf.SignatureMetadata                `json:"signature"`
+	CallbackMetadata   pdf.SignatureSigningCallbackMetadata `json:"callback_metadata"`
+}
+
+type cliSignatureSigningResponse struct {
+	SignatureBase64 string `json:"signature_base64,omitempty"`
+	SignatureHex    string `json:"signature_hex,omitempty"`
+	Signature       []byte `json:"signature,omitempty"`
+}
+
+func signatureReSign(args []string) error {
+	fs := flag.NewFlagSet("signature re-sign", flag.ContinueOnError)
+	format := fs.String("format", "pdf", "input format")
+	outputPath := fs.String("o", "", "output file")
+	signerCommand := fs.String("signer-command", "", "external signer executable")
+	signerName := fs.String("signer-name", "", "external signer name")
+	externalKeyID := fs.String("external-key-id", "", "opaque external key identifier")
+	digest := fs.String("digest", "sha256", "digest algorithm")
+	container := fs.String("container", "pkcs7", "signature container")
+	subFilter := fs.String("sub-filter", "adbe.pkcs7.detached", "PDF signature SubFilter")
+	reservedBytes := fs.Int("reserved-bytes", 8192, "reserved /Contents byte size")
+	asJSON := fs.Bool("json", false, "write JSON")
+	var signerArgs stringListFlag
+	var signerEnv stringListFlag
+	fs.Var(&signerArgs, "signer-arg", "argument passed to external signer (repeatable)")
+	fs.Var(&signerEnv, "signer-env", "environment variable passed to external signer as KEY=VALUE (repeatable)")
+	if err := fs.Parse(reorderFlags(args, map[string]bool{"json": true}, map[string]bool{
+		"format":          true,
+		"o":               true,
+		"signer-command":  true,
+		"signer-name":     true,
+		"external-key-id": true,
+		"digest":          true,
+		"container":       true,
+		"sub-filter":      true,
+		"reserved-bytes":  true,
+		"signer-arg":      true,
+		"signer-env":      true,
+	})); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("signature re-sign requires one input file")
+	}
+	if strings.ToLower(*format) != "pdf" {
+		return fmt.Errorf("signature re-sign is unsupported for format %q", *format)
+	}
+	if *outputPath == "" {
+		return errors.New("signature re-sign requires -o")
+	}
+	if strings.TrimSpace(*signerCommand) == "" {
+		return errors.New("signature re-sign requires --signer-command")
+	}
+	for _, env := range signerEnv {
+		if key, _, ok := strings.Cut(env, "="); !ok || strings.TrimSpace(key) == "" {
+			return fmt.Errorf("invalid --signer-env %q: expected KEY=VALUE", env)
+		}
+	}
+	input, err := os.ReadFile(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	metadata := pdf.SignatureSigningCallbackMetadata{
+		Name:               *signerName,
+		ExternalKeyID:      *externalKeyID,
+		DigestAlgorithm:    *digest,
+		SignatureContainer: *container,
+		SubFilter:          *subFilter,
+	}
+	callback := func(ctx context.Context, request pdf.SignatureSigningRequest) (pdf.SignatureSigningResponse, error) {
+		return runExternalSignatureSigner(ctx, *signerCommand, []string(signerArgs), []string(signerEnv), metadata, request)
+	}
+	output, plan, verification, err := pdf.ApplyIncrementalReSigning(context.Background(), input, pdf.SignatureSigningPlanOptions{
+		Callback:         callback,
+		CallbackMetadata: metadata,
+		ReservedBytes:    *reservedBytes,
+	})
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(*outputPath, output, 0644); err != nil {
+		return err
+	}
+	result := cliSignatureReSignResult{
+		OutputPath:    *outputPath,
+		Plan:          plan,
+		Verification:  verification,
+		SignerCommand: *signerCommand,
+	}
+	if *asJSON {
+		return writeJSON(result)
+	}
+	fmt.Printf("signature re-signed output=%s byte_range_digest_validation_status=%s reparse_ok=%t\n", result.OutputPath, verification.ByteRangeDigestValidationStatus, verification.ReparseOK)
+	return nil
+}
+
+func runExternalSignatureSigner(ctx context.Context, command string, args, env []string, metadata pdf.SignatureSigningCallbackMetadata, request pdf.SignatureSigningRequest) (pdf.SignatureSigningResponse, error) {
+	payload := cliSignatureSigningRequest{
+		DigestBase64:       base64.StdEncoding.EncodeToString(request.Digest),
+		DigestHex:          hex.EncodeToString(request.Digest),
+		DigestAlgorithm:    request.DigestAlgorithm,
+		SignatureContainer: request.SignatureContainer,
+		SubFilter:          request.SubFilter,
+		ByteRanges:         request.ByteRanges,
+		Signature:          request.Signature,
+		CallbackMetadata:   metadata,
+	}
+	requestJSON, err := json.Marshal(payload)
+	if err != nil {
+		return pdf.SignatureSigningResponse{}, err
+	}
+	cmd := exec.CommandContext(ctx, command, args...)
+	cmd.Stdin = bytes.NewReader(requestJSON)
+	cmd.Env = append(os.Environ(), env...)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		message := strings.TrimSpace(stderr.String())
+		if message != "" {
+			return pdf.SignatureSigningResponse{}, fmt.Errorf("external signature signer failed: %w: %s", err, message)
+		}
+		return pdf.SignatureSigningResponse{}, fmt.Errorf("external signature signer failed: %w", err)
+	}
+	var response cliSignatureSigningResponse
+	if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
+		return pdf.SignatureSigningResponse{}, fmt.Errorf("external signature signer returned invalid JSON: %w", err)
+	}
+	signature, err := cliSignatureBytes(response)
+	if err != nil {
+		return pdf.SignatureSigningResponse{}, err
+	}
+	return pdf.SignatureSigningResponse{Signature: signature}, nil
+}
+
+func cliSignatureBytes(response cliSignatureSigningResponse) ([]byte, error) {
+	if strings.TrimSpace(response.SignatureBase64) != "" {
+		signature, err := base64.StdEncoding.DecodeString(strings.TrimSpace(response.SignatureBase64))
+		if err != nil {
+			return nil, fmt.Errorf("external signature signer returned invalid signature_base64: %w", err)
+		}
+		return signature, nil
+	}
+	if strings.TrimSpace(response.SignatureHex) != "" {
+		signature, err := hex.DecodeString(strings.TrimSpace(response.SignatureHex))
+		if err != nil {
+			return nil, fmt.Errorf("external signature signer returned invalid signature_hex: %w", err)
+		}
+		return signature, nil
+	}
+	if len(response.Signature) > 0 {
+		return response.Signature, nil
+	}
+	return nil, errors.New("external signature signer returned no signature")
 }
 
 func signatureInspect(args []string) error {
