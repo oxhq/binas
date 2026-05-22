@@ -28,6 +28,10 @@ type SecurityOptions struct {
 	Password              string
 }
 
+type SecurityMetadataOptions struct {
+	SignatureTrust SignatureTrustOptions
+}
+
 type SecurityMetadata struct {
 	Encrypted  bool                `json:"encrypted"`
 	Signed     bool                `json:"signed"`
@@ -123,8 +127,16 @@ func CheckSecurity(input []byte, opts SecurityOptions) error {
 }
 
 func SecurityMetadataForInput(input []byte) SecurityMetadata {
+	return SecurityMetadataForInputWithOptions(input, SecurityMetadataOptions{})
+}
+
+func SecurityMetadataForInputWithOptions(input []byte, opts SecurityMetadataOptions) SecurityMetadata {
 	boundaries := summarizeResidualBoundariesForInput(input)
-	signature := inspectSignatureInfo(input)
+	signature := inspectSignatureInfoWithOptions(input, signerCertificateTrustOptions{
+		Roots:         opts.SignatureTrust.Roots,
+		Intermediates: opts.SignatureTrust.Intermediates,
+		CurrentTime:   opts.SignatureTrust.CurrentTime,
+	})
 	metadata := SecurityMetadata{
 		Encrypted: boundaries.HasEncryption,
 		Signed:    boundaries.HasSignature,

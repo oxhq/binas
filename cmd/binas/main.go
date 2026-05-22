@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -189,7 +191,11 @@ func signatureInspect(args []string) error {
 	fs := flag.NewFlagSet("signature inspect", flag.ContinueOnError)
 	format := fs.String("format", "pdf", "input format")
 	asJSON := fs.Bool("json", false, "write JSON")
-	if err := fs.Parse(reorderFlags(args, map[string]bool{"json": true}, map[string]bool{"format": true})); err != nil {
+	var trustRoots stringListFlag
+	var trustIntermediates stringListFlag
+	fs.Var(&trustRoots, "trust-root", "PEM/DER trust root certificate file for explicit signature trust validation (repeatable)")
+	fs.Var(&trustIntermediates, "trust-intermediate", "PEM/DER intermediate certificate file for explicit signature trust validation (repeatable)")
+	if err := fs.Parse(reorderFlags(args, map[string]bool{"json": true}, map[string]bool{"format": true, "trust-root": true, "trust-intermediate": true})); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
@@ -202,7 +208,20 @@ func signatureInspect(args []string) error {
 	if err != nil {
 		return err
 	}
-	signature := pdf.SecurityMetadataForInput(input).Signature
+	roots, err := loadCertificateFiles([]string(trustRoots), "--trust-root")
+	if err != nil {
+		return err
+	}
+	intermediates, err := loadCertificateFiles([]string(trustIntermediates), "--trust-intermediate")
+	if err != nil {
+		return err
+	}
+	signature := pdf.SecurityMetadataForInputWithOptions(input, pdf.SecurityMetadataOptions{
+		SignatureTrust: pdf.SignatureTrustOptions{
+			Roots:         roots,
+			Intermediates: intermediates,
+		},
+	}).Signature
 	if *asJSON {
 		return writeJSON(signature)
 	}
@@ -215,6 +234,8 @@ func signatureInspect(args []string) error {
 		fmt.Sprintf("signature_container=%s", signature.SignatureContainer),
 		fmt.Sprintf("digest_algorithm=%s", signature.DigestAlgorithm),
 		fmt.Sprintf("digest_algorithm_status=%s", signature.DigestAlgorithmStatus),
+		fmt.Sprintf("byte_range_digest_validation_status=%s", signature.ByteRangeDigestValidationStatus),
+		fmt.Sprintf("certificate_trust_validation_status=%s", signature.CertificateTrustValidationStatus),
 		fmt.Sprintf("cryptographic_validation_status=%s", signature.CryptographicValidationStatus),
 	}
 	if signature.ObjectNumber != nil && signature.ObjectGeneration != nil {
@@ -234,6 +255,56 @@ func signatureInspect(args []string) error {
 	}
 	fmt.Println("signature " + strings.Join(parts, " "))
 	return nil
+}
+
+func loadCertificateFiles(paths []string, flagName string) ([]*x509.Certificate, error) {
+	certs := make([]*x509.Certificate, 0, len(paths))
+	for _, path := range paths {
+		input, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("%s %q: %w", flagName, path, err)
+		}
+		parsed, err := parseCertificateFile(input)
+		if err != nil {
+			return nil, fmt.Errorf("%s %q: %w", flagName, path, err)
+		}
+		certs = append(certs, parsed...)
+	}
+	return certs, nil
+}
+
+func parseCertificateFile(input []byte) ([]*x509.Certificate, error) {
+	if len(input) == 0 {
+		return nil, errors.New("empty certificate file")
+	}
+	remaining := input
+	certs := make([]*x509.Certificate, 0, 1)
+	for {
+		block, rest := pem.Decode(remaining)
+		if block == nil {
+			break
+		}
+		remaining = rest
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		certs = append(certs, cert)
+	}
+	if len(certs) > 0 {
+		return certs, nil
+	}
+	derCerts, err := x509.ParseCertificates(input)
+	if err != nil {
+		return nil, err
+	}
+	if len(derCerts) == 0 {
+		return nil, errors.New("no certificates found")
+	}
+	return derCerts, nil
 }
 
 func overlay(args []string) error {
@@ -394,13 +465,17 @@ func formSet(args []string) error {
 	fs := flag.NewFlagSet("form set", flag.ContinueOnError)
 	format := fs.String("format", "pdf", "input format")
 	field := fs.String("field", "", "AcroForm field name")
-	value := fs.String("value", "", "new field value")
+	value := optionalStringFlag{}
+	fs.Var(&value, "value", "new field value")
+	var values stringListFlag
+	fs.Var(&values, "values", "multi-select choice value (repeatable)")
+	fs.Var(&values, "value-array", "multi-select choice value (repeatable; alias of --values)")
 	matchIndex := optionalIntFlag{}
 	fs.Var(&matchIndex, "match-index", "zero-based field match index")
 	outputPath := fs.String("o", "", "output file")
 	asJSON := fs.Bool("json", false, "write JSON")
 	regenerateAppearance := fs.Bool("regenerate-appearance", false, "regenerate simple text/choice widget appearances")
-	if err := fs.Parse(reorderFlags(args, map[string]bool{"json": true, "regenerate-appearance": true}, map[string]bool{"format": true, "field": true, "value": true, "match-index": true, "o": true})); err != nil {
+	if err := fs.Parse(reorderFlags(args, map[string]bool{"json": true, "regenerate-appearance": true}, map[string]bool{"format": true, "field": true, "value": true, "values": true, "value-array": true, "match-index": true, "o": true})); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
@@ -415,6 +490,17 @@ func formSet(args []string) error {
 	if *outputPath == "" {
 		return errors.New("form set requires -o")
 	}
+	editValue := value.value
+	if value.set && len(values) > 0 {
+		return errors.New("form set cannot combine --value with --values/--value-array")
+	}
+	if len(values) > 0 {
+		encoded, err := json.Marshal([]string(values))
+		if err != nil {
+			return err
+		}
+		editValue = string(encoded)
+	}
 	input, err := os.ReadFile(fs.Arg(0))
 	if err != nil {
 		return err
@@ -423,7 +509,7 @@ func formSet(args []string) error {
 	if matchIndex.set {
 		selected = &matchIndex.value
 	}
-	output, report, verification, err := pdf.ApplyFormFieldEditWithOptions(input, *field, *value, pdf.FormFieldEditOptions{
+	output, report, verification, err := pdf.ApplyFormFieldEditWithOptions(input, *field, editValue, pdf.FormFieldEditOptions{
 		MatchIndex:           selected,
 		RegenerateAppearance: *regenerateAppearance,
 	})
@@ -919,6 +1005,20 @@ func (f *optionalStringFlag) String() string {
 		return ""
 	}
 	return f.value
+}
+
+type stringListFlag []string
+
+func (f *stringListFlag) Set(raw string) error {
+	*f = append(*f, raw)
+	return nil
+}
+
+func (f *stringListFlag) String() string {
+	if f == nil || len(*f) == 0 {
+		return ""
+	}
+	return strings.Join(*f, ",")
 }
 
 type metaFlag struct {

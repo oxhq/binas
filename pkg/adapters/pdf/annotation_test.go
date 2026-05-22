@@ -201,6 +201,37 @@ func TestApplyAnnotationContentsEditCanRegenerateSquareAppearance(t *testing.T) 
 	}
 }
 
+func TestApplyAnnotationContentsEditCanRegenerateSquareAppearanceWithBSBorderStyle(t *testing.T) {
+	input := testPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Page /Annots [3 0 R] >>",
+		"<< /Type /Annot /Subtype /Square /Rect [10 20 50 45] /Contents (old square) /C [1 0.5 0] /BS << /W 2 /S /D /D [4 2] >> >>",
+	)
+
+	output, report, verification, err := ApplyAnnotationContentsEdit(input, 0, "fresh square", AnnotationContentsEditOptions{
+		RegenerateAppearance: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.AppearanceRegenerated || !verification.AppearanceRegenerated {
+		t.Fatalf("appearance was not regenerated: report %+v verification %+v", report, verification)
+	}
+
+	stream := annotationCandidateNormalAppearanceStream(t, output, 0)
+	got := string(stream.Data)
+	for _, want := range []string{
+		"2 w",
+		"[4 2] 0 d",
+		"1 0.5 0 RG",
+		"1 1 38 23 re S",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("square /BS appearance missing %q in %q", want, got)
+		}
+	}
+}
+
 func TestApplyAnnotationContentsEditRegenerateAppearanceFailsClosedForUnsupportedAnnotationInputs(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -327,6 +358,69 @@ func TestApplyAnnotationContentsEditCanRegenerateLinkBorderAppearance(t *testing
 	}
 }
 
+func TestApplyAnnotationContentsEditCanRegenerateLinkBSBorderAppearance(t *testing.T) {
+	tests := []struct {
+		name    string
+		bs      string
+		wantOps []string
+	}{
+		{
+			name: "solid",
+			bs:   "<< /W 3 /S /S >>",
+			wantOps: []string{
+				"3 w",
+				"0 0 1 RG",
+				"1.5 1.5 37 17 re S",
+			},
+		},
+		{
+			name: "dashed",
+			bs:   "<< /W 2 /S /D /D [4 1.5] >>",
+			wantOps: []string{
+				"2 w",
+				"[4 1.5] 0 d",
+				"1 1 38 18 re S",
+			},
+		},
+		{
+			name: "underline",
+			bs:   "<< /W 2 /S /U >>",
+			wantOps: []string{
+				"2 w",
+				"1 1 m",
+				"39 1 l S",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := testPDF(
+				"<< /Type /Catalog /Pages 2 0 R >>",
+				"<< /Type /Page /Annots [3 0 R] >>",
+				fmt.Sprintf("<< /Type /Annot /Subtype /Link /Rect [10 20 50 40] /Contents (old link) /Border [0 0 9] /BS %s /C [0 0 1] >>", tt.bs),
+			)
+
+			output, report, verification, err := ApplyAnnotationContentsEdit(input, 0, "fresh link", AnnotationContentsEditOptions{
+				RegenerateAppearance: true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !report.AppearanceRegenerated || !verification.AppearanceRegenerated {
+				t.Fatalf("appearance was not regenerated: report %+v verification %+v", report, verification)
+			}
+
+			stream := annotationCandidateNormalAppearanceStream(t, output, 0)
+			got := string(stream.Data)
+			for _, want := range tt.wantOps {
+				if !strings.Contains(got, want) {
+					t.Fatalf("link /BS appearance missing %q in %q", want, got)
+				}
+			}
+		})
+	}
+}
+
 func TestApplyAnnotationContentsEditRegenerateLinkAppearanceFailsClosedForUnsupportedVisualInputs(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -334,9 +428,24 @@ func TestApplyAnnotationContentsEditRegenerateLinkAppearanceFailsClosedForUnsupp
 		wantErr string
 	}{
 		{
-			name:    "border style dictionary",
-			annot:   "<< /Type /Annot /Subtype /Link /Rect [0 0 20 10] /Contents (old link) /Border [0 0 1] /BS << /W 1 /S /D >> >>",
-			wantErr: "unsupported /BS",
+			name:    "unsupported border style dictionary style",
+			annot:   "<< /Type /Annot /Subtype /Link /Rect [0 0 20 10] /Contents (old link) /Border [0 0 1] /BS << /W 1 /S /B >> >>",
+			wantErr: "unsupported /BS border style /S /B",
+		},
+		{
+			name:    "indirect border style dictionary",
+			annot:   "<< /Type /Annot /Subtype /Link /Rect [0 0 20 10] /Contents (old link) /Border [0 0 1] /BS 9 0 R >>",
+			wantErr: "unsupported /BS border style",
+		},
+		{
+			name:    "malformed border style width",
+			annot:   "<< /Type /Annot /Subtype /Link /Rect [0 0 20 10] /Contents (old link) /BS << /W /bad /S /S >> >>",
+			wantErr: "unsupported /BS /W border width",
+		},
+		{
+			name:    "unsupported dash array",
+			annot:   "<< /Type /Annot /Subtype /Link /Rect [0 0 20 10] /Contents (old link) /BS << /W 1 /S /D /D [0 0] >> >>",
+			wantErr: "unsupported /BS /D dash array",
 		},
 		{
 			name:    "dashed border array",
@@ -358,6 +467,44 @@ func TestApplyAnnotationContentsEditRegenerateLinkAppearanceFailsClosedForUnsupp
 			)
 
 			_, _, _, err := ApplyAnnotationContentsEdit(input, 0, "fresh link", AnnotationContentsEditOptions{
+				RegenerateAppearance: true,
+			})
+			if err == nil {
+				t.Fatal("expected regenerate appearance to fail")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %q, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestApplyAnnotationContentsEditRegenerateShapeAppearanceFailsClosedForUnsupportedBS(t *testing.T) {
+	tests := []struct {
+		name    string
+		annot   string
+		wantErr string
+	}{
+		{
+			name:    "underline square",
+			annot:   "<< /Type /Annot /Subtype /Square /Rect [0 0 20 10] /Contents (old square) /BS << /W 1 /S /U >> >>",
+			wantErr: "unsupported /BS border style /S /U for /Square",
+		},
+		{
+			name:    "unsupported dashed square dash array",
+			annot:   "<< /Type /Annot /Subtype /Square /Rect [0 0 20 10] /Contents (old square) /BS << /W 1 /S /D /D [-1 2] >> >>",
+			wantErr: "unsupported /BS /D dash array",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := testPDF(
+				"<< /Type /Catalog /Pages 2 0 R >>",
+				"<< /Type /Page /Annots [3 0 R] >>",
+				tt.annot,
+			)
+
+			_, _, _, err := ApplyAnnotationContentsEdit(input, 0, "fresh square", AnnotationContentsEditOptions{
 				RegenerateAppearance: true,
 			})
 			if err == nil {
@@ -809,6 +956,33 @@ func TestListAnnotationCandidatesReportsUnsafeAppearanceGenerationStatus(t *test
 		if !bytes.Contains(encoded, []byte(key)) {
 			t.Fatalf("encoded metadata missing %s: %s", key, encoded)
 		}
+	}
+}
+
+func TestListAnnotationCandidatesReportsUnsupportedBSAppearanceGenerationStatus(t *testing.T) {
+	input := testPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Page /Annots [3 0 R 4 0 R 5 0 R] >>",
+		"<< /Type /Annot /Subtype /Link /Rect [0 0 80 30] /Contents (solid link) /BS << /W 2 /S /S >> >>",
+		"<< /Type /Annot /Subtype /Link /Rect [0 0 80 30] /Contents (beveled link) /BS << /W 2 /S /B >> >>",
+		"<< /Type /Annot /Subtype /Square /Rect [0 0 80 30] /Contents (underline square) /BS << /W 1 /S /U >> >>",
+	)
+
+	candidates, err := ListAnnotationCandidates(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 3 {
+		t.Fatalf("candidate count = %d, want 3: %+v", len(candidates), candidates)
+	}
+	if candidates[0].AppearanceGenerationStatus != "approximate_supported" || len(candidates[0].AppearanceGenerationBlockers) != 0 {
+		t.Fatalf("solid /BS link appearance status = %q blockers %+v", candidates[0].AppearanceGenerationStatus, candidates[0].AppearanceGenerationBlockers)
+	}
+	for i := 1; i < len(candidates); i++ {
+		if candidates[i].AppearanceGenerationStatus != "unsupported" {
+			t.Fatalf("candidate %d appearance status = %q, want unsupported", i, candidates[i].AppearanceGenerationStatus)
+		}
+		assertStringSliceEqual(t, candidates[i].AppearanceGenerationBlockers, []string{"unsupported_bs_border_style"})
 	}
 }
 

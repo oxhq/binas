@@ -110,13 +110,24 @@ func ApplyFormFieldEditWithOptions(input []byte, fieldName, value string, option
 	appearanceStatus := "not_requested"
 	appearanceDetails := "appearance regeneration was not requested"
 	if isButtonFormField(matches[index]) {
+		generated := 0
+		if options.RegenerateAppearance {
+			generated, err = regenerateButtonFieldAppearances(graph, matches[index], value)
+			if err != nil {
+				return nil, FormFieldEditReport{}, FormFieldEditVerification{}, err
+			}
+		}
 		if err := applyButtonFormFieldEdit(graph, matches[index].dict, value); err != nil {
 			return nil, FormFieldEditReport{}, FormFieldEditVerification{}, err
 		}
 		if options.RegenerateAppearance {
 			appearanceRegenerated = true
 			appearanceStatus = "regenerated"
-			appearanceDetails = "selected proven button /AP state and synchronized /V and /AS"
+			if generated > 0 {
+				appearanceDetails = fmt.Sprintf("regenerated %d simple checkbox appearance stream(s) and synchronized /V and /AS", generated)
+			} else {
+				appearanceDetails = "selected proven button /AP state and synchronized /V and /AS"
+			}
 		}
 	} else if isChoiceFormField(matches[index]) {
 		appearanceValue, err := applyChoiceFormFieldEdit(graph, matches[index], value)
@@ -733,6 +744,225 @@ func stringInSlice(values []string, value string) bool {
 		}
 	}
 	return false
+}
+
+func regenerateButtonFieldAppearances(graph *pdfGraph, match formFieldMatch, value string) (int, error) {
+	if ap, ok := match.dict["AP"]; ok {
+		normal, err := buttonNormalAppearanceDict(ap)
+		if err != nil {
+			return 0, err
+		}
+		if _, err := singleButtonOnState(normal); err == nil {
+			return 0, nil
+		} else if _, hasRect := match.dict["Rect"]; !hasRect {
+			return 0, err
+		}
+	}
+	if _, hasWidgetRect := match.dict["Rect"]; !hasWidgetRect {
+		if _, hasKids := match.dict["Kids"]; !hasKids {
+			return 0, nil
+		}
+	}
+	if kids, ok := match.dict["Kids"].(pdfArray); ok && buttonKidsAlreadyHaveNormalAppearances(graph, kids) {
+		return 0, nil
+	}
+	flags, hasFlags := match.effectiveFlags()
+	if hasFlags && flags&(formFieldFlagBtnRadio|formFieldFlagBtnPushbutton|formFieldFlagBtnRadiosInUnison) != 0 {
+		return 0, nil
+	}
+	widget, err := checkboxAppearanceWidget(graph, match)
+	if err != nil {
+		return 0, err
+	}
+	if err := validateCheckboxAppearanceSynthesisInput(widget); err != nil {
+		return 0, err
+	}
+	onState, err := checkboxSynthesisOnState(match.dict, widget, value)
+	if err != nil {
+		return 0, err
+	}
+	if !checkboxNeedsAppearanceSynthesis(widget, onState) {
+		return 0, nil
+	}
+	rect, ok := formWidgetRect(widget)
+	if !ok {
+		return 0, errors.New("unsupported AcroForm checkbox appearance regeneration: widget /Rect is missing or not a direct numeric rectangle")
+	}
+	offStream, err := checkboxAppearanceStream(rect, false)
+	if err != nil {
+		return 0, err
+	}
+	onStream, err := checkboxAppearanceStream(rect, true)
+	if err != nil {
+		return 0, err
+	}
+	nextObjectNumber := nextPDFObjectNumber(graph)
+	offID := pdfObjectID{Number: nextObjectNumber, Generation: 0}
+	onID := pdfObjectID{Number: nextObjectNumber + 1, Generation: 0}
+	graph.Objects[offID] = &pdfIndirectObject{ID: offID, Value: offStream}
+	graph.Objects[onID] = &pdfIndirectObject{ID: onID, Value: onStream}
+	widget["AP"] = pdfDict{
+		"N": pdfDict{
+			"Off":   pdfRef{ID: offID},
+			onState: pdfRef{ID: onID},
+		},
+	}
+	return 2, nil
+}
+
+func buttonKidsAlreadyHaveNormalAppearances(graph *pdfGraph, kids pdfArray) bool {
+	if len(kids) == 0 {
+		return false
+	}
+	for _, kid := range kids {
+		widget, ok := resolvePDFDict(graph, kid)
+		if !ok {
+			return false
+		}
+		ap, ok := widget["AP"]
+		if !ok {
+			return false
+		}
+		normal, err := buttonNormalAppearanceDict(ap)
+		if err != nil {
+			return false
+		}
+		if _, err := singleButtonOnState(normal); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+func checkboxAppearanceWidget(graph *pdfGraph, match formFieldMatch) (pdfDict, error) {
+	if kids, ok := match.dict["Kids"].(pdfArray); ok {
+		if len(kids) != 1 {
+			return nil, errors.New("unsupported AcroForm checkbox appearance regeneration: radio/group button appearance synthesis is not supported")
+		}
+		widget, ok := resolvePDFDict(graph, kids[0])
+		if !ok {
+			return nil, errors.New("unsupported AcroForm checkbox appearance regeneration: widget kid is not a dictionary")
+		}
+		return widget, nil
+	}
+	if _, ok := match.dict["Rect"]; ok {
+		return match.dict, nil
+	}
+	return nil, errors.New("unsupported AcroForm checkbox appearance regeneration: widget /Rect is missing or not a direct numeric rectangle")
+}
+
+func checkboxNeedsAppearanceSynthesis(widget pdfDict, onState string) bool {
+	ap, ok := widget["AP"]
+	if !ok {
+		return true
+	}
+	normal, err := buttonNormalAppearanceDict(ap)
+	if err != nil {
+		return true
+	}
+	_, hasOff := normal["Off"]
+	_, hasOn := normal[onState]
+	return !hasOff || !hasOn
+}
+
+func validateCheckboxAppearanceSynthesisInput(widget pdfDict) error {
+	if _, hasMK := widget["MK"]; hasMK {
+		return errors.New("unsupported AcroForm checkbox appearance regeneration: widget appearance characteristics are not supported")
+	}
+	apValue, hasAP := widget["AP"]
+	if !hasAP {
+		return nil
+	}
+	ap, ok := apValue.(pdfDict)
+	if !ok {
+		return errors.New("unsupported AcroForm checkbox appearance regeneration: /AP is not a dictionary")
+	}
+	for key := range ap {
+		if key != "N" {
+			return errors.New("unsupported AcroForm checkbox appearance regeneration: rich /AP states are not supported")
+		}
+	}
+	if _, ok := ap["N"].(pdfDict); !ok {
+		return errors.New("unsupported AcroForm checkbox appearance regeneration: /AP /N is not a state dictionary")
+	}
+	return nil
+}
+
+func checkboxSynthesisOnState(field pdfDict, widget pdfDict, value string) (string, error) {
+	if explicitCheckboxOnStateValue(value) {
+		return value, nil
+	}
+	states := make(map[string]bool)
+	for _, dict := range []pdfDict{field, widget} {
+		for _, key := range []string{"V", "AS"} {
+			if state, ok := dict[key].(pdfName); ok && state != "Off" {
+				states[string(state)] = true
+			}
+		}
+	}
+	if len(states) != 1 {
+		return "", errors.New("unsupported AcroForm checkbox appearance regeneration: missing checked appearance state")
+	}
+	for state := range states {
+		if !safeSyntheticButtonStateName(state) {
+			return "", fmt.Errorf("unsupported AcroForm checkbox appearance regeneration: unsafe checked appearance state %q", state)
+		}
+		return state, nil
+	}
+	return "", errors.New("unsupported AcroForm checkbox appearance regeneration: missing checked appearance state")
+}
+
+func explicitCheckboxOnStateValue(value string) bool {
+	switch value {
+	case "", "true", "false", "Off", "On":
+		return false
+	default:
+		return safeSyntheticButtonStateName(value)
+	}
+}
+
+func safeSyntheticButtonStateName(value string) bool {
+	if value == "" || value == "Off" {
+		return false
+	}
+	for _, r := range value {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-' || r == '.' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func checkboxAppearanceStream(rect []float64, checked bool) (pdfStreamObject, error) {
+	width := rect[2] - rect[0]
+	height := rect[3] - rect[1]
+	if width < 6 || height < 6 {
+		return pdfStreamObject{}, errors.New("unsupported AcroForm checkbox appearance regeneration: widget /Rect is too small for safe checkbox drawing")
+	}
+	inset := 1.0
+	var data strings.Builder
+	data.WriteString("q\n")
+	data.WriteString("0 0 0 RG\n")
+	data.WriteString("0.75 w\n")
+	fmt.Fprintf(&data, "%s %s %s %s re S\n", pdfNumberToken(inset), pdfNumberToken(inset), pdfNumberToken(width-inset*2), pdfNumberToken(height-inset*2))
+	if checked {
+		fmt.Fprintf(&data, "%s %s m\n", pdfNumberToken(width*0.25), pdfNumberToken(height*0.5))
+		fmt.Fprintf(&data, "%s %s l\n", pdfNumberToken(width*0.42), pdfNumberToken(height*0.28))
+		fmt.Fprintf(&data, "%s %s l\n", pdfNumberToken(width*0.78), pdfNumberToken(height*0.74))
+		data.WriteString("S\n")
+	}
+	data.WriteString("Q")
+	return pdfStreamObject{
+		Dict: pdfDict{
+			"Type":      pdfName("XObject"),
+			"Subtype":   pdfName("Form"),
+			"FormType":  1,
+			"BBox":      pdfArray{0, 0, width, height},
+			"Resources": pdfDict{},
+		},
+		Data: []byte(data.String()),
+	}, nil
 }
 
 func applyButtonFormFieldEdit(graph *pdfGraph, field pdfDict, value string) error {

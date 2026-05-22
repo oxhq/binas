@@ -6,19 +6,26 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/md5"
+	"crypto/rand"
 	"crypto/rc4"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/ascii85"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCLIInspectAndQueryAcceptFileFirstFlags(t *testing.T) {
@@ -1184,6 +1191,80 @@ func TestCLIFormSetUpdatesChoiceWithRegeneratedAppearance(t *testing.T) {
 		if !bytes.Contains(written, want) {
 			t.Fatalf("choice output missing %q:\n%s", want, written)
 		}
+	}
+}
+
+func TestCLIFormSetUpdatesMultiSelectChoiceWithValues(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "multi-choice-form.pdf")
+	input := pdfFixture(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		fmt.Sprintf("<< /FT /Ch /T (payer.plans) /Ff %d /V [(basic)] /I [0] /Opt [(basic) [(pro) (Pro Plan)] (team)] >>", 1<<21),
+	)
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "multi-choice-form-out.pdf")
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{
+			"form", "set", path,
+			"--field", "payer.plans",
+			"--values", "Pro Plan",
+			"--values", "basic",
+			"-o", out,
+			"--json",
+		})
+	})
+	var result struct {
+		Verification struct {
+			FieldValueSet bool `json:"field_value_set"`
+		} `json:"verification"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.Verification.FieldValueSet {
+		t.Fatalf("result = %+v, want verified multi-select value", result)
+	}
+	written, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range [][]byte{[]byte("/V [(basic) (pro)]"), []byte("/I [0 1]")} {
+		if !bytes.Contains(written, want) {
+			t.Fatalf("multi-select output missing %q:\n%s", want, written)
+		}
+	}
+}
+
+func TestCLIFormSetRejectsMixedValueAndValues(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "multi-choice-form.pdf")
+	input := pdfFixture(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		fmt.Sprintf("<< /FT /Ch /T (payer.plans) /Ff %d /V [(basic)] /I [0] /Opt [(basic) (pro)] >>", 1<<21),
+	)
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "multi-choice-form-out.pdf")
+
+	_, err := captureStdoutAndError(t, func() error {
+		return run([]string{
+			"form", "set", path,
+			"--field", "payer.plans",
+			"--value", `["basic"]`,
+			"--values", "pro",
+			"-o", out,
+			"--json",
+		})
+	})
+	if err == nil {
+		t.Fatal("form set succeeded, want mixed value syntax error")
+	}
+	if !strings.Contains(err.Error(), "form set cannot combine --value with --values") {
+		t.Fatalf("error = %q, want mixed value syntax error", err)
 	}
 }
 
@@ -2998,6 +3079,48 @@ func TestCLISignatureInspectReportsExistingSignatureMetadataAsJSON(t *testing.T)
 	}
 }
 
+func TestCLISignatureInspectTrustRootValidatesExplicitRoot(t *testing.T) {
+	input, rootDER := writeCLISignedCMSFixtureInput(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "signed-cms.pdf")
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+	rootPath := filepath.Join(dir, "root.pem")
+	rootPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: rootDER})
+	if err := os.WriteFile(rootPath, rootPEM, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{"signature", "inspect", path, "--format", "pdf", "--trust-root", rootPath, "--json"})
+	})
+	var result struct {
+		ByteRangeDigestValidation        bool   `json:"byte_range_digest_validation"`
+		ByteRangeDigestValidationStatus  string `json:"byte_range_digest_validation_status"`
+		CertificateTrustValidation       bool   `json:"certificate_trust_validation"`
+		CertificateTrustValidationStatus string `json:"certificate_trust_validation_status"`
+		CryptographicValidationStatus    string `json:"cryptographic_validation_status"`
+		SignerCertificateSubject         string `json:"signer_certificate_subject"`
+		SignerCertificateIssuer          string `json:"signer_certificate_issuer"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.ByteRangeDigestValidation || result.ByteRangeDigestValidationStatus != "valid" {
+		t.Fatalf("byte-range digest validation = %t/%q, want true/valid", result.ByteRangeDigestValidation, result.ByteRangeDigestValidationStatus)
+	}
+	if !result.CertificateTrustValidation || result.CertificateTrustValidationStatus != "valid" {
+		t.Fatalf("certificate trust validation = %t/%q, want true/valid", result.CertificateTrustValidation, result.CertificateTrustValidationStatus)
+	}
+	if result.CryptographicValidationStatus != "byte_range_digest_valid" {
+		t.Fatalf("cryptographic validation status = %q, want byte_range_digest_valid", result.CryptographicValidationStatus)
+	}
+	if !strings.Contains(result.SignerCertificateSubject, "Binas CLI Test Signer") || !strings.Contains(result.SignerCertificateIssuer, "Binas CLI Test Root") {
+		t.Fatalf("signer certificate metadata = subject %q issuer %q", result.SignerCertificateSubject, result.SignerCertificateIssuer)
+	}
+}
+
 func TestCLISignatureInspectPlainTextIncludesNonCryptographicHints(t *testing.T) {
 	path := writeSignedTextFixture(t)
 
@@ -4248,6 +4371,204 @@ func writeSignedTextFixture(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func writeCLISignedCMSFixtureInput(t *testing.T) ([]byte, []byte) {
+	t.Helper()
+	rootDER, leafDER := cliTestCertificateChain(t)
+	certs := [][]byte{leafDER, rootDER}
+	zeroDigest := make([]byte, sha256.Size)
+	placeholderCMS := append(cliMinimalDetachedCMSWithMessageDigestAndCertificates(t, zeroDigest, certs), make([]byte, 8)...)
+	input, ranges := cliSignedPDFWithContentsPlaceholder(t, len(placeholderCMS))
+	digest := cliSHA256DigestForRanges(input, ranges)
+	cms := append(cliMinimalDetachedCMSWithMessageDigestAndCertificates(t, digest, certs), make([]byte, 8)...)
+	if len(cms) != len(placeholderCMS) {
+		t.Fatalf("CMS length changed from %d to %d", len(placeholderCMS), len(cms))
+	}
+	return cliReplaceSignatureContentsHex(t, input, cms), rootDER
+}
+
+func cliSignedPDFWithContentsPlaceholder(t *testing.T, contentsLen int) ([]byte, []signatureByteRangeForCLI) {
+	t.Helper()
+	placeholderHex := strings.Repeat("0", contentsLen*2)
+	byteRangePlaceholder := "[0000000000 0000000000 0000000000 0000000000]"
+	input := pdfFixture(
+		"<< /Type /Catalog /SigFlags 3 /AcroForm << /Fields [2 0 R] >> >>",
+		"<< /FT /Sig /T (Approval) /V 3 0 R >>",
+		fmt.Sprintf("<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange %s /Contents <%s> >>", byteRangePlaceholder, placeholderHex),
+	)
+	contentsStart := bytes.Index(input, []byte("<"+placeholderHex+">"))
+	if contentsStart < 0 {
+		t.Fatal("signature contents placeholder not found")
+	}
+	contentsEnd := contentsStart + 1 + len(placeholderHex) + 1
+	ranges := []signatureByteRangeForCLI{
+		{Offset: 0, Length: contentsStart},
+		{Offset: contentsEnd, Length: len(input) - contentsEnd},
+	}
+	byteRange := fmt.Sprintf("[%010d %010d %010d %010d]", ranges[0].Offset, ranges[0].Length, ranges[1].Offset, ranges[1].Length)
+	if len(byteRange) != len(byteRangePlaceholder) {
+		t.Fatalf("ByteRange replacement length = %d, want %d", len(byteRange), len(byteRangePlaceholder))
+	}
+	input = bytes.Replace(input, []byte(byteRangePlaceholder), []byte(byteRange), 1)
+	return input, ranges
+}
+
+type signatureByteRangeForCLI struct {
+	Offset int
+	Length int
+}
+
+func cliSHA256DigestForRanges(input []byte, ranges []signatureByteRangeForCLI) []byte {
+	h := sha256.New()
+	for _, r := range ranges {
+		h.Write(input[r.Offset : r.Offset+r.Length])
+	}
+	return h.Sum(nil)
+}
+
+func cliReplaceSignatureContentsHex(t *testing.T, input []byte, contents []byte) []byte {
+	t.Helper()
+	placeholder := []byte("<" + strings.Repeat("0", len(contents)*2) + ">")
+	replacement := []byte("<" + strings.ToUpper(hex.EncodeToString(contents)) + ">")
+	if !bytes.Contains(input, placeholder) {
+		t.Fatal("signature contents placeholder not found")
+	}
+	return bytes.Replace(input, placeholder, replacement, 1)
+}
+
+func cliMinimalDetachedCMSWithMessageDigestAndCertificates(t *testing.T, digest []byte, certificates [][]byte) []byte {
+	t.Helper()
+	messageDigestAttr := cliDERSeq(
+		cliDEROID(0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x04),
+		cliDERSet(cliDEROctetString(digest)),
+	)
+	signerInfo := cliDERSeq(
+		cliDERInteger(1),
+		cliMinimalCMSSignerIdentifier(t, certificates[0]),
+		cliDERAlgorithmIdentifier(cliDEROID(0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01)),
+		cliDERConstructed(0, messageDigestAttr),
+		cliDERAlgorithmIdentifier(cliDEROID(0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01)),
+		cliDEROctetString([]byte{0}),
+	)
+	signedData := cliDERSeq(
+		cliDERInteger(1),
+		cliDERSet(cliDERAlgorithmIdentifier(cliDEROID(0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01))),
+		cliDERSeq(cliDEROID(0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01)),
+		cliDERConstructed(0, bytes.Join(certificates, nil)),
+		cliDERSet(signerInfo),
+	)
+	return cliDERSeq(
+		cliDEROID(0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02),
+		cliDERConstructed(0, signedData),
+	)
+}
+
+func cliMinimalCMSSignerIdentifier(t *testing.T, certDER []byte) []byte {
+	t.Helper()
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cliDERSeq(cert.RawIssuer, cliDERIntegerBig(cert.SerialNumber))
+}
+
+func cliTestCertificateChain(t *testing.T) ([]byte, []byte) {
+	t.Helper()
+	rootKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notBefore := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	notAfter := time.Date(2036, 1, 1, 0, 0, 0, 0, time.UTC)
+	rootTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(101),
+		Subject:               pkix.Name{CommonName: "Binas CLI Test Root"},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	rootDER, err := x509.CreateCertificate(rand.Reader, rootTemplate, rootTemplate, &rootKey.PublicKey, rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := x509.ParseCertificate(rootDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(102),
+		Subject:      pkix.Name{CommonName: "Binas CLI Test Signer"},
+		NotBefore:    notBefore,
+		NotAfter:     notAfter,
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, root, &leafKey.PublicKey, rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rootDER, leafDER
+}
+
+func cliDERAlgorithmIdentifier(oid []byte) []byte {
+	return cliDERSeq(oid, []byte{0x05, 0x00})
+}
+
+func cliDERSeq(parts ...[]byte) []byte {
+	return cliDERTLV(0x30, bytes.Join(parts, nil))
+}
+
+func cliDERSet(parts ...[]byte) []byte {
+	return cliDERTLV(0x31, bytes.Join(parts, nil))
+}
+
+func cliDERInteger(value byte) []byte {
+	return cliDERTLV(0x02, []byte{value})
+}
+
+func cliDERIntegerBig(value *big.Int) []byte {
+	if value == nil {
+		return cliDERInteger(0)
+	}
+	encoded := value.Bytes()
+	if len(encoded) == 0 {
+		encoded = []byte{0}
+	}
+	if encoded[0]&0x80 != 0 {
+		encoded = append([]byte{0}, encoded...)
+	}
+	return cliDERTLV(0x02, encoded)
+}
+
+func cliDEROID(body ...byte) []byte {
+	return cliDERTLV(0x06, body)
+}
+
+func cliDEROctetString(value []byte) []byte {
+	return cliDERTLV(0x04, value)
+}
+
+func cliDERConstructed(tag byte, value []byte) []byte {
+	return cliDERTLV(0xa0+tag, value)
+}
+
+func cliDERTLV(tag byte, value []byte) []byte {
+	out := []byte{tag}
+	if len(value) < 0x80 {
+		out = append(out, byte(len(value)))
+	} else if len(value) <= 0xff {
+		out = append(out, 0x81, byte(len(value)))
+	} else {
+		out = append(out, 0x82, byte(len(value)>>8), byte(len(value)))
+	}
+	out = append(out, value...)
+	return out
 }
 
 func writeEncryptedFixture(t *testing.T) string {

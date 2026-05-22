@@ -9,6 +9,7 @@ import (
 	"encoding/asn1"
 	"errors"
 	"hash"
+	"math/big"
 	"strings"
 	"time"
 )
@@ -61,7 +62,17 @@ type signatureInfo struct {
 	CryptographicValidationStatus    string
 }
 
+type SignatureTrustOptions struct {
+	Roots         []*x509.Certificate
+	Intermediates []*x509.Certificate
+	CurrentTime   time.Time
+}
+
 func inspectSignatureInfo(input []byte) signatureInfo {
+	return inspectSignatureInfoWithOptions(input, signerCertificateTrustOptions{})
+}
+
+func inspectSignatureInfoWithOptions(input []byte, trust signerCertificateTrustOptions) signatureInfo {
 	info := signatureInfo{
 		HasSignatureMarker:               hasPDFSignatureBoundary(input),
 		ByteRangeStatus:                  signatureByteRangeStatusAbsent,
@@ -87,11 +98,11 @@ func inspectSignatureInfo(input []byte) signatureInfo {
 	info.ByteRanges = ranges
 	info.ByteRangeCount = len(ranges)
 	info.ByteRangeStatus = signatureByteRangeStatusValid
-	applySignatureCryptographicValidation(&info, input)
+	applySignatureCryptographicValidation(&info, input, trust)
 	return info
 }
 
-func applySignatureCryptographicValidation(info *signatureInfo, input []byte) {
+func applySignatureCryptographicValidation(info *signatureInfo, input []byte, trust signerCertificateTrustOptions) {
 	if info == nil || len(input) == 0 || info.ByteRangeStatus != signatureByteRangeStatusValid {
 		return
 	}
@@ -108,7 +119,7 @@ func applySignatureCryptographicValidation(info *signatureInfo, input []byte) {
 		}
 		attempted = true
 		cms, err := parseCMSDetachedSignature(contents)
-		applyCMSMetadata(info, cms)
+		applyCMSMetadata(info, cms, trust)
 		if err != nil || len(cms.MessageDigest) == 0 || cms.DigestAlgorithm == signatureDigestAlgorithmUnknown {
 			continue
 		}
@@ -151,7 +162,7 @@ func shouldAttemptCMSDigestValidation(info *signatureInfo, dict pdfDict, content
 	return signatureContainerFromContentsEnvelope(contents) == "pkcs7"
 }
 
-func applyCMSMetadata(info *signatureInfo, cms cmsDetachedSignature) {
+func applyCMSMetadata(info *signatureInfo, cms cmsDetachedSignature, trust signerCertificateTrustOptions) {
 	if info == nil {
 		return
 	}
@@ -172,7 +183,7 @@ func applyCMSMetadata(info *signatureInfo, cms cmsDetachedSignature) {
 		info.SignatureContainer = "pkcs7"
 	}
 	if cms.IsPKCS7SignedData {
-		info.CertificateTrustValidation, info.CertificateTrustValidationStatus = validateSignerCertificateTrust(cms, signerCertificateTrustOptions{})
+		info.CertificateTrustValidation, info.CertificateTrustValidationStatus = validateSignerCertificateTrust(cms, trust)
 	}
 }
 
@@ -337,6 +348,14 @@ type cmsDetachedSignature struct {
 	SignerCertificateSubject string
 	SignerCertificateIssuer  string
 	Certificates             []*x509.Certificate
+	SignerCertificate        *x509.Certificate
+	SignerIdentifierPresent  bool
+}
+
+type cmsSignerCertificateIdentifier struct {
+	IssuerRaw []byte
+	Serial    *big.Int
+	Present   bool
 }
 
 var (
@@ -382,7 +401,7 @@ func parseCMSDetachedSignature(contents []byte) (cmsDetachedSignature, error) {
 	for _, child := range signedDataChildren {
 		if child.Class == asn1.ClassContextSpecific && child.Tag == 0 && child.IsCompound {
 			out.Certificates = parseCMSCertificates(child.Bytes)
-			out.CertificateCount, out.SignerCertificateSubject, out.SignerCertificateIssuer = cmsCertificateMetadata(out.Certificates)
+			out.CertificateCount, out.SignerCertificateSubject, out.SignerCertificateIssuer = cmsCertificateMetadata(out.Certificates, nil, false)
 		}
 	}
 	if len(signedDataChildren) == 0 {
@@ -397,10 +416,13 @@ func parseCMSDetachedSignature(contents []byte) (cmsDetachedSignature, error) {
 		return out, firstDERError(err)
 	}
 	for _, signer := range signers {
-		digestAlgorithm, messageDigest, ok := parseCMSSignerInfoMessageDigest(signer)
+		digestAlgorithm, messageDigest, signerID, ok := parseCMSSignerInfoMessageDigest(signer)
 		if !ok {
 			continue
 		}
+		out.SignerCertificate = cmsSignerCertificate(out.Certificates, signerID)
+		out.SignerIdentifierPresent = signerID.Present
+		out.CertificateCount, out.SignerCertificateSubject, out.SignerCertificateIssuer = cmsCertificateMetadata(out.Certificates, out.SignerCertificate, signerID.Present)
 		out.DigestAlgorithm = digestAlgorithm
 		out.MessageDigest = messageDigest
 		return out, nil
@@ -408,14 +430,16 @@ func parseCMSDetachedSignature(contents []byte) (cmsDetachedSignature, error) {
 	return out, asn1.SyntaxError{Msg: "CMS messageDigest signed attribute is missing"}
 }
 
-func parseCMSSignerInfoMessageDigest(signer asn1.RawValue) (string, []byte, bool) {
+func parseCMSSignerInfoMessageDigest(signer asn1.RawValue) (string, []byte, cmsSignerCertificateIdentifier, bool) {
+	var signerID cmsSignerCertificateIdentifier
 	if signer.Class != asn1.ClassUniversal || signer.Tag != asn1.TagSequence || !signer.IsCompound {
-		return "", nil, false
+		return "", nil, signerID, false
 	}
 	children, err := parseDERChildren(signer.Bytes)
 	if err != nil || len(children) < 5 {
-		return "", nil, false
+		return "", nil, signerID, false
 	}
+	signerID = parseCMSSignerCertificateIdentifier(children[1])
 	digestAlgorithm := digestAlgorithmNameFromAlgorithmIdentifier(children[2])
 	for _, child := range children[3:] {
 		if child.Class != asn1.ClassContextSpecific || child.Tag != 0 || !child.IsCompound {
@@ -423,10 +447,35 @@ func parseCMSSignerInfoMessageDigest(signer asn1.RawValue) (string, []byte, bool
 		}
 		messageDigest, ok := messageDigestFromSignedAttributes(child.Bytes)
 		if ok {
-			return digestAlgorithm, messageDigest, true
+			return digestAlgorithm, messageDigest, signerID, true
 		}
 	}
-	return "", nil, false
+	return "", nil, signerID, false
+}
+
+func parseCMSSignerCertificateIdentifier(input asn1.RawValue) cmsSignerCertificateIdentifier {
+	var out cmsSignerCertificateIdentifier
+	if input.Class != asn1.ClassUniversal || input.Tag != asn1.TagSequence || !input.IsCompound {
+		return out
+	}
+	children, err := parseDERChildren(input.Bytes)
+	if err != nil || len(children) != 2 {
+		return out
+	}
+	issuer := children[0]
+	if issuer.Class != asn1.ClassUniversal || issuer.Tag != asn1.TagSequence {
+		return out
+	}
+	var serial big.Int
+	rest, err := asn1.Unmarshal(children[1].FullBytes, &serial)
+	if err != nil || len(rest) != 0 {
+		return out
+	}
+	return cmsSignerCertificateIdentifier{
+		IssuerRaw: bytes.Clone(issuer.FullBytes),
+		Serial:    &serial,
+		Present:   true,
+	}
 }
 
 func messageDigestFromSignedAttributes(input []byte) ([]byte, bool) {
@@ -461,7 +510,7 @@ func messageDigestFromSignedAttributes(input []byte) ([]byte, bool) {
 }
 
 func parseCMSCertificateMetadata(input []byte) (int, string, string) {
-	return cmsCertificateMetadata(parseCMSCertificates(input))
+	return cmsCertificateMetadata(parseCMSCertificates(input), nil, false)
 }
 
 func parseCMSCertificates(input []byte) []*x509.Certificate {
@@ -483,9 +532,17 @@ func parseCMSCertificates(input []byte) []*x509.Certificate {
 	return out
 }
 
-func cmsCertificateMetadata(certs []*x509.Certificate) (int, string, string) {
+func cmsCertificateMetadata(certs []*x509.Certificate, signer *x509.Certificate, signerIDPresent bool) (int, string, string) {
 	subject := ""
 	issuer := ""
+	if signer != nil {
+		subject = signer.Subject.String()
+		issuer = signer.Issuer.String()
+		return len(certs), subject, issuer
+	}
+	if signerIDPresent {
+		return len(certs), subject, issuer
+	}
 	for _, cert := range certs {
 		if cert == nil {
 			continue
@@ -500,6 +557,21 @@ func cmsCertificateMetadata(certs []*x509.Certificate) (int, string, string) {
 	return len(certs), subject, issuer
 }
 
+func cmsSignerCertificate(certs []*x509.Certificate, signerID cmsSignerCertificateIdentifier) *x509.Certificate {
+	if !signerID.Present || signerID.Serial == nil {
+		return nil
+	}
+	for _, cert := range certs {
+		if cert == nil || cert.SerialNumber == nil {
+			continue
+		}
+		if cert.SerialNumber.Cmp(signerID.Serial) == 0 && bytes.Equal(cert.RawIssuer, signerID.IssuerRaw) {
+			return cert
+		}
+	}
+	return nil
+}
+
 type signerCertificateTrustOptions struct {
 	Roots         []*x509.Certificate
 	Intermediates []*x509.Certificate
@@ -507,7 +579,14 @@ type signerCertificateTrustOptions struct {
 }
 
 func validateSignerCertificateTrust(cms cmsDetachedSignature, opts signerCertificateTrustOptions) (bool, string) {
-	if len(cms.Certificates) == 0 || cms.Certificates[0] == nil {
+	signer := cms.SignerCertificate
+	if signer == nil && cms.SignerIdentifierPresent {
+		return false, signatureCertificateTrustValidationInsufficientCertificates
+	}
+	if signer == nil && len(cms.Certificates) > 0 {
+		signer = cms.Certificates[0]
+	}
+	if signer == nil {
 		return false, signatureCertificateTrustValidationInsufficientCertificates
 	}
 	if len(opts.Roots) == 0 {
@@ -541,7 +620,7 @@ func validateSignerCertificateTrust(cms cmsDetachedSignature, opts signerCertifi
 	if !opts.CurrentTime.IsZero() {
 		verifyOptions.CurrentTime = opts.CurrentTime
 	}
-	if _, err := cms.Certificates[0].Verify(verifyOptions); err != nil {
+	if _, err := signer.Verify(verifyOptions); err != nil {
 		var unknownAuthority x509.UnknownAuthorityError
 		if errors.As(err, &unknownAuthority) {
 			return false, signatureCertificateTrustValidationInsufficientCertificates

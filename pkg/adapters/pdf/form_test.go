@@ -1192,6 +1192,123 @@ func TestApplyFormFieldEditUpdatesCheckboxFieldWithWidgetKid(t *testing.T) {
 	}
 }
 
+func TestApplyFormFieldEditRegeneratesMissingCheckboxWidgetAppearance(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /FT /Btn /Kids [4 0 R] /T (payer.opt_in) /V /Off >>",
+		"<< /AS /Off /Parent 3 0 R /Subtype /Widget /Rect [0 0 20 20] >>",
+	)
+
+	output, report, verification, err := ApplyFormFieldEditWithOptions(input, "payer.opt_in", "Yes", FormFieldEditOptions{RegenerateAppearance: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.AppearanceRegenerated || report.AppearanceGenerationStatus != "regenerated" {
+		t.Fatalf("report = %+v, want regenerated checkbox appearance status", report)
+	}
+	if !verification.ReparseOK || !verification.FieldValueSet || !verification.AppearanceRegenerated {
+		t.Fatalf("verification = %+v", verification)
+	}
+
+	graph, err := parsePDFGraph(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	field, ok := graph.Objects[pdfObjectID{Number: 3, Generation: 0}].Value.(pdfDict)
+	if !ok {
+		t.Fatal("field object was not a dictionary")
+	}
+	widget, ok := graph.Objects[pdfObjectID{Number: 4, Generation: 0}].Value.(pdfDict)
+	if !ok {
+		t.Fatal("widget object was not a dictionary")
+	}
+	if got := field["V"]; got != pdfName("Yes") {
+		t.Fatalf("field /V = %#v, want /Yes", got)
+	}
+	if got := widget["AS"]; got != pdfName("Yes") {
+		t.Fatalf("widget /AS = %#v, want /Yes", got)
+	}
+	normal := formTestButtonNormalAppearanceDict(t, widget)
+	off := formTestButtonAppearanceStateStream(t, graph, normal, "Off")
+	on := formTestButtonAppearanceStateStream(t, graph, normal, "Yes")
+	if strings.Contains(string(off.Data), " l\n") {
+		t.Fatalf("off appearance should not draw a check mark:\n%s", off.Data)
+	}
+	if !strings.Contains(string(on.Data), " l\n") {
+		t.Fatalf("on appearance should draw a check mark:\n%s", on.Data)
+	}
+}
+
+func TestApplyFormFieldEditRegeneratesIncompleteCheckboxWidgetAppearanceStates(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /FT /Btn /Kids [4 0 R] /T (payer.opt_in) /V /Off >>",
+		"<< /AP << /N <<>> >> /AS /Off /Parent 3 0 R /Subtype /Widget /Rect [0 0 20 20] >>",
+	)
+
+	output, _, verification, err := ApplyFormFieldEditWithOptions(input, "payer.opt_in", "Yes", FormFieldEditOptions{RegenerateAppearance: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.ReparseOK || !verification.FieldValueSet || !verification.AppearanceRegenerated {
+		t.Fatalf("verification = %+v", verification)
+	}
+
+	graph, err := parsePDFGraph(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	widget, ok := graph.Objects[pdfObjectID{Number: 4, Generation: 0}].Value.(pdfDict)
+	if !ok {
+		t.Fatal("widget object was not a dictionary")
+	}
+	normal := formTestButtonNormalAppearanceDict(t, widget)
+	formTestButtonAppearanceStateStream(t, graph, normal, "Off")
+	formTestButtonAppearanceStateStream(t, graph, normal, "Yes")
+}
+
+func TestApplyFormFieldEditCheckboxAppearanceSynthesisFailsClosedWithoutStateOrRect(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		widget  string
+		wantErr string
+	}{
+		{
+			name:    "missing checked state",
+			value:   "true",
+			widget:  "<< /AS /Off /Parent 3 0 R /Subtype /Widget /Rect [0 0 20 20] >>",
+			wantErr: "missing checked appearance state",
+		},
+		{
+			name:    "missing rect",
+			value:   "Yes",
+			widget:  "<< /AS /Off /Parent 3 0 R /Subtype /Widget >>",
+			wantErr: "widget /Rect is missing or not a direct numeric rectangle",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			input := formTestPDF(
+				"<< /Type /Catalog /AcroForm 2 0 R >>",
+				"<< /Fields [3 0 R] >>",
+				"<< /FT /Btn /Kids [4 0 R] /T (payer.opt_in) /V /Off >>",
+				tc.widget,
+			)
+
+			_, _, _, err := ApplyFormFieldEditWithOptions(input, "payer.opt_in", tc.value, FormFieldEditOptions{RegenerateAppearance: true})
+			if err == nil {
+				t.Fatal("expected checkbox appearance synthesis to fail closed")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error = %q, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestApplyFormFieldEditSelectsRadioWidgetKid(t *testing.T) {
 	input := formTestPDF(
 		"<< /Type /Catalog /AcroForm 2 0 R >>",
@@ -1958,6 +2075,36 @@ func formTestAppearanceFontResources(t *testing.T, stream pdfStreamObject) pdfDi
 		t.Fatalf("appearance /Resources /Font = %#v, want dictionary", resources["Font"])
 	}
 	return fonts
+}
+
+func formTestButtonNormalAppearanceDict(t *testing.T, widget pdfDict) pdfDict {
+	t.Helper()
+	ap, ok := widget["AP"].(pdfDict)
+	if !ok {
+		t.Fatalf("widget /AP = %#v, want dictionary", widget["AP"])
+	}
+	normal, ok := ap["N"].(pdfDict)
+	if !ok {
+		t.Fatalf("widget /AP /N = %#v, want state dictionary", ap["N"])
+	}
+	return normal
+}
+
+func formTestButtonAppearanceStateStream(t *testing.T, graph *pdfGraph, normal pdfDict, state string) pdfStreamObject {
+	t.Helper()
+	ref, ok := normal[state].(pdfRef)
+	if !ok {
+		t.Fatalf("widget /AP /N /%s = %#v, want indirect stream ref", state, normal[state])
+	}
+	object, ok := graph.Objects[ref.ID]
+	if !ok {
+		t.Fatalf("appearance object %v missing", ref.ID)
+	}
+	stream, ok := object.Value.(pdfStreamObject)
+	if !ok {
+		t.Fatalf("appearance object = %#v, want stream", object.Value)
+	}
+	return stream
 }
 
 func formTestPDF(objects ...string) []byte {

@@ -212,9 +212,36 @@ func TestSignatureInfoCertificateTrustStatusIsNotPerformedWithoutCallerRoots(t *
 	}
 }
 
+func TestSecurityMetadataForInputWithOptionsValidatesExplicitSignatureTrustRoot(t *testing.T) {
+	rootDER, root, leafDER := testCertificateChain(t)
+	input := signedPDFWithCMSMessageDigestAndCertificates(t, nil, [][]byte{leafDER, rootDER})
+	now := time.Date(2026, 5, 22, 12, 0, 0, 0, time.UTC)
+
+	signature := SecurityMetadataForInputWithOptions(input, SecurityMetadataOptions{
+		SignatureTrust: SignatureTrustOptions{
+			Roots:       []*x509.Certificate{root},
+			CurrentTime: now,
+		},
+	}).Signature
+
+	if !signature.ByteRangeDigestValidation || signature.ByteRangeDigestValidationStatus != signatureByteRangeDigestValidationValid {
+		t.Fatalf("byte-range digest validation = %t/%q, want true/%q", signature.ByteRangeDigestValidation, signature.ByteRangeDigestValidationStatus, signatureByteRangeDigestValidationValid)
+	}
+	if !signature.CertificateTrustValidation || signature.CertificateTrustValidationStatus != signatureCertificateTrustValidationValid {
+		t.Fatalf("certificate trust validation = %t/%q, want true/%q", signature.CertificateTrustValidation, signature.CertificateTrustValidationStatus, signatureCertificateTrustValidationValid)
+	}
+	if signature.CryptographicValidationStatus != signatureCryptographicValidationByteRangeDigestValid {
+		t.Fatalf("cryptographic validation status = %q, want %q", signature.CryptographicValidationStatus, signatureCryptographicValidationByteRangeDigestValid)
+	}
+	if !strings.Contains(signature.SignerCertificateSubject, "Binas Test Signer") || !strings.Contains(signature.SignerCertificateIssuer, "Binas Test Root") {
+		t.Fatalf("signer certificate metadata = subject %q issuer %q", signature.SignerCertificateSubject, signature.SignerCertificateIssuer)
+	}
+}
+
 func TestValidateSignerCertificateTrustUsesOnlyCallerProvidedChain(t *testing.T) {
 	rootDER, root, leafDER := testCertificateChain(t)
-	cms := cmsDetachedSignature{Certificates: parseCMSCertificates(bytes.Join([][]byte{leafDER, rootDER}, nil))}
+	certs := parseCMSCertificates(bytes.Join([][]byte{leafDER, rootDER}, nil))
+	cms := cmsDetachedSignature{Certificates: certs, SignerCertificate: certs[0]}
 	now := time.Date(2026, 5, 22, 12, 0, 0, 0, time.UTC)
 
 	valid, status := validateSignerCertificateTrust(cms, signerCertificateTrustOptions{Roots: []*x509.Certificate{root}, CurrentTime: now})
@@ -225,6 +252,11 @@ func TestValidateSignerCertificateTrustUsesOnlyCallerProvidedChain(t *testing.T)
 	valid, status = validateSignerCertificateTrust(cmsDetachedSignature{}, signerCertificateTrustOptions{Roots: []*x509.Certificate{root}, CurrentTime: now})
 	if valid || status != signatureCertificateTrustValidationInsufficientCertificates {
 		t.Fatalf("trust validation without certs = %t/%q, want false/%q", valid, status, signatureCertificateTrustValidationInsufficientCertificates)
+	}
+
+	valid, status = validateSignerCertificateTrust(cmsDetachedSignature{Certificates: certs, SignerIdentifierPresent: true}, signerCertificateTrustOptions{Roots: []*x509.Certificate{root}, CurrentTime: now})
+	if valid || status != signatureCertificateTrustValidationInsufficientCertificates {
+		t.Fatalf("trust validation with unmatched signer id = %t/%q, want false/%q", valid, status, signatureCertificateTrustValidationInsufficientCertificates)
 	}
 
 	valid, status = validateSignerCertificateTrust(cms, signerCertificateTrustOptions{CurrentTime: now})
@@ -325,7 +357,7 @@ func minimalDetachedCMSWithMessageDigestAndCertificates(digest []byte, certifica
 	)
 	signerInfo := derSeq(
 		derInteger(1),
-		derSeq(derSeq(), derInteger(1)),
+		minimalCMSSignerIdentifier(certificates),
 		derAlgorithmIdentifier(derOID(0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01)),
 		derConstructed(0, messageDigestAttr),
 		derAlgorithmIdentifier(derOID(0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01)),
@@ -347,6 +379,17 @@ func minimalDetachedCMSWithMessageDigestAndCertificates(digest []byte, certifica
 	)
 }
 
+func minimalCMSSignerIdentifier(certificates [][]byte) []byte {
+	if len(certificates) == 0 {
+		return derSeq(derSeq(), derInteger(1))
+	}
+	cert, err := x509.ParseCertificate(certificates[0])
+	if err != nil {
+		return derSeq(derSeq(), derInteger(1))
+	}
+	return derSeq(cert.RawIssuer, derIntegerBig(cert.SerialNumber))
+}
+
 func testCertificateChain(t *testing.T) ([]byte, *x509.Certificate, []byte) {
 	t.Helper()
 
@@ -358,8 +401,8 @@ func testCertificateChain(t *testing.T) ([]byte, *x509.Certificate, []byte) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	notBefore := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	notAfter := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
+	notBefore := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	notAfter := time.Date(2036, 1, 1, 0, 0, 0, 0, time.UTC)
 	rootTemplate := &x509.Certificate{
 		SerialNumber:          big.NewInt(1),
 		Subject:               pkix.Name{CommonName: "Binas Test Root"},
@@ -405,6 +448,20 @@ func derSet(parts ...[]byte) []byte {
 
 func derInteger(value byte) []byte {
 	return derTLV(0x02, []byte{value})
+}
+
+func derIntegerBig(value *big.Int) []byte {
+	if value == nil {
+		return derInteger(0)
+	}
+	encoded := value.Bytes()
+	if len(encoded) == 0 {
+		encoded = []byte{0}
+	}
+	if encoded[0]&0x80 != 0 {
+		encoded = append([]byte{0}, encoded...)
+	}
+	return derTLV(0x02, encoded)
 }
 
 func derOID(body ...byte) []byte {

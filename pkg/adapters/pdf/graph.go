@@ -1548,6 +1548,8 @@ func writePDFValue(out *bytes.Buffer, value pdfValue) error {
 		out.WriteByte('<')
 		out.WriteString(string(v))
 		out.WriteByte('>')
+	case pdfRawObject:
+		out.Write(v)
 	case pdfRef:
 		fmt.Fprintf(out, "%d %d R", v.ID.Number, v.ID.Generation)
 	case pdfArray:

@@ -257,7 +257,7 @@ func buildBasicAnnotationAppearance(candidate annotationCandidate, contents stri
 	case "Link":
 		return basicLinkAnnotationAppearanceStream(candidate.Dict, candidate.Index, width, height)
 	case "Square", "Circle":
-		return basicShapeAnnotationAppearanceStream(subtype, width, height, annotationNumericArray(candidate.Dict, "C")), nil
+		return basicShapeAnnotationAppearanceStream(candidate.Dict, candidate.Index, subtype, width, height, annotationNumericArray(candidate.Dict, "C"))
 	case "Highlight", "Underline", "StrikeOut":
 		quadPoints, err := annotationQuadPoints(candidate.Dict, candidate.Index)
 		if err != nil {
@@ -306,6 +306,9 @@ func annotationAppearanceGenerationMetadata(dict pdfDict) (string, []string) {
 	if len(rect) != 4 || rect[2] <= rect[0] || rect[3] <= rect[1] {
 		return "unsupported", []string{"missing_usable_rect"}
 	}
+	if blockers := annotationAppearanceGenerationStyleBlockers(dict); len(blockers) > 0 {
+		return "unsupported", blockers
+	}
 	return "approximate_supported", nil
 }
 
@@ -324,6 +327,64 @@ func annotationAppearanceGenerationUnsafeBlockers(dict pdfDict) []string {
 		return nil
 	}
 	return blockers
+}
+
+func annotationAppearanceGenerationStyleBlockers(dict pdfDict) []string {
+	subtype := annotationSubtype(dict)
+	switch subtype {
+	case "Link":
+		if _, ok := dict["BS"]; ok {
+			return annotationBSGenerationBlockers(dict, subtype)
+		}
+		if _, err := annotationLinkBorderWidth(dict, 0); err != nil {
+			return []string{"unsupported_border"}
+		}
+	case "Square", "Circle":
+		return annotationBSGenerationBlockers(dict, subtype)
+	}
+	return nil
+}
+
+func annotationBSGenerationBlockers(dict pdfDict, subtype string) []string {
+	value, ok := dict["BS"]
+	if !ok {
+		return nil
+	}
+	bs, ok := value.(pdfDict)
+	if !ok {
+		return []string{"unsupported_bs_border_style"}
+	}
+	style := pdfName("S")
+	if widthValue, ok := bs["W"]; ok {
+		width, ok := pdfNumericValue(widthValue)
+		if !ok || width < 0 {
+			return []string{"unsupported_bs_width"}
+		}
+	}
+	if styleValue, ok := bs["S"]; ok {
+		styleName, ok := styleValue.(pdfName)
+		if !ok {
+			return []string{"unsupported_bs_border_style"}
+		}
+		style = styleName
+		switch style {
+		case "S", "D", "U":
+		default:
+			return []string{"unsupported_bs_border_style"}
+		}
+	}
+	if style == "U" && (subtype == "Square" || subtype == "Circle") {
+		return []string{"unsupported_bs_border_style"}
+	}
+	if style == "D" {
+		if dashValue, ok := bs["D"]; ok {
+			dashArray, ok := annotationDirectNumericArrayValue(dashValue)
+			if !ok || !annotationDashArraySupported(dashArray) {
+				return []string{"unsupported_bs_dash_array"}
+			}
+		}
+	}
+	return nil
 }
 
 func basicAnnotationAppearanceStream(width, height float64, contents string) (pdfStreamObject, error) {
@@ -355,10 +416,7 @@ func basicAnnotationAppearanceStream(width, height float64, contents string) (pd
 }
 
 func basicLinkAnnotationAppearanceStream(dict pdfDict, annotationIndex int, width, height float64) (pdfStreamObject, error) {
-	if _, ok := dict["BS"]; ok {
-		return pdfStreamObject{}, fmt.Errorf("cannot regenerate annotation appearance: annotation %d has unsupported /BS border style", annotationIndex)
-	}
-	borderWidth, err := annotationLinkBorderWidth(dict, annotationIndex)
+	borderStyle, err := annotationLinkBorderStyle(dict, annotationIndex)
 	if err != nil {
 		return pdfStreamObject{}, err
 	}
@@ -369,16 +427,21 @@ func basicLinkAnnotationAppearanceStream(dict pdfDict, annotationIndex int, widt
 
 	var data strings.Builder
 	data.WriteString("q\n")
-	if borderWidth > 0 {
-		fmt.Fprintf(&data, "%s w\n", pdfNumberToken(borderWidth))
+	if borderStyle.Width > 0 {
+		fmt.Fprintf(&data, "%s w\n", pdfNumberToken(borderStyle.Width))
+		writeBasicAnnotationDashPattern(&data, borderStyle.DashArray)
 		writeBasicAnnotationStrokeColor(&data, color)
-		inset := borderWidth / 2
-		rectWidth := width - borderWidth
-		rectHeight := height - borderWidth
+		inset := borderStyle.Width / 2
+		rectWidth := width - borderStyle.Width
+		rectHeight := height - borderStyle.Width
 		if rectWidth <= 0 || rectHeight <= 0 {
 			return pdfStreamObject{}, fmt.Errorf("cannot regenerate annotation appearance: annotation %d has /Border width larger than /Rect", annotationIndex)
 		}
-		fmt.Fprintf(&data, "%s %s %s %s re S\n", pdfNumberToken(inset), pdfNumberToken(inset), pdfNumberToken(rectWidth), pdfNumberToken(rectHeight))
+		if borderStyle.Style == "U" {
+			fmt.Fprintf(&data, "%s %s m\n%s %s l S\n", pdfNumberToken(inset), pdfNumberToken(inset), pdfNumberToken(width-inset), pdfNumberToken(inset))
+		} else {
+			fmt.Fprintf(&data, "%s %s %s %s re S\n", pdfNumberToken(inset), pdfNumberToken(inset), pdfNumberToken(rectWidth), pdfNumberToken(rectHeight))
+		}
 	}
 	data.WriteString("Q")
 
@@ -393,16 +456,33 @@ func basicLinkAnnotationAppearanceStream(dict pdfDict, annotationIndex int, widt
 	}, nil
 }
 
-func basicShapeAnnotationAppearanceStream(subtype string, width, height float64, color []float64) pdfStreamObject {
+func basicShapeAnnotationAppearanceStream(dict pdfDict, annotationIndex int, subtype string, width, height float64, color []float64) (pdfStreamObject, error) {
+	borderStyle, err := annotationShapeBorderStyle(dict, annotationIndex)
+	if err != nil {
+		return pdfStreamObject{}, err
+	}
+	if borderStyle.Style == "U" {
+		return pdfStreamObject{}, fmt.Errorf("cannot regenerate annotation appearance: annotation %d has unsupported /BS border style /S /U for /%s", annotationIndex, subtype)
+	}
+
 	var data strings.Builder
 	data.WriteString("q\n")
-	data.WriteString("1 w\n")
-	writeBasicAnnotationStrokeColor(&data, color)
-	switch subtype {
-	case "Circle":
-		writeBasicAnnotationEllipse(&data, width, height)
-	default:
-		fmt.Fprintf(&data, "0.5 0.5 %s %s re S\n", pdfNumberToken(width-1), pdfNumberToken(height-1))
+	if borderStyle.Width > 0 {
+		fmt.Fprintf(&data, "%s w\n", pdfNumberToken(borderStyle.Width))
+		writeBasicAnnotationDashPattern(&data, borderStyle.DashArray)
+		writeBasicAnnotationStrokeColor(&data, color)
+		inset := borderStyle.Width / 2
+		shapeWidth := width - borderStyle.Width
+		shapeHeight := height - borderStyle.Width
+		if shapeWidth <= 0 || shapeHeight <= 0 {
+			return pdfStreamObject{}, fmt.Errorf("cannot regenerate annotation appearance: annotation %d has /BS width larger than /Rect", annotationIndex)
+		}
+		switch subtype {
+		case "Circle":
+			writeBasicAnnotationEllipse(&data, width, height, borderStyle.Width)
+		default:
+			fmt.Fprintf(&data, "%s %s %s %s re S\n", pdfNumberToken(inset), pdfNumberToken(inset), pdfNumberToken(shapeWidth), pdfNumberToken(shapeHeight))
+		}
 	}
 	data.WriteString("Q")
 
@@ -414,7 +494,7 @@ func basicShapeAnnotationAppearanceStream(subtype string, width, height float64,
 			"BBox":     pdfArray{0, 0, width, height},
 		},
 		Data: []byte(data.String()),
-	}
+	}, nil
 }
 
 func basicTextMarkupAnnotationAppearanceStream(subtype string, rect []float64, width, height float64, color []float64, quadPoints []float64) pdfStreamObject {
@@ -514,12 +594,26 @@ func writeBasicAnnotationFillColor(data *strings.Builder, color []float64, defau
 	}
 }
 
-func writeBasicAnnotationEllipse(data *strings.Builder, width, height float64) {
+func writeBasicAnnotationDashPattern(data *strings.Builder, dashArray []float64) {
+	if len(dashArray) == 0 {
+		return
+	}
+	data.WriteString("[")
+	for i, dash := range dashArray {
+		if i > 0 {
+			data.WriteString(" ")
+		}
+		data.WriteString(pdfNumberToken(dash))
+	}
+	data.WriteString("] 0 d\n")
+}
+
+func writeBasicAnnotationEllipse(data *strings.Builder, width, height, borderWidth float64) {
 	const bezierCircleKappa = 0.5522847498
 	cx := width / 2
 	cy := height / 2
-	rx := (width - 1) / 2
-	ry := (height - 1) / 2
+	rx := (width - borderWidth) / 2
+	ry := (height - borderWidth) / 2
 	ox := rx * bezierCircleKappa
 	oy := ry * bezierCircleKappa
 	fmt.Fprintf(data, "%s %s m\n", pdfNumberToken(cx+rx), pdfNumberToken(cy))
@@ -967,6 +1061,91 @@ func annotationRect(dict pdfDict) []float64 {
 		rect = append(rect, number)
 	}
 	return rect
+}
+
+type annotationBorderStyle struct {
+	Width     float64
+	Style     string
+	DashArray []float64
+}
+
+func annotationLinkBorderStyle(dict pdfDict, annotationIndex int) (annotationBorderStyle, error) {
+	if _, ok := dict["BS"]; ok {
+		return annotationBorderStyleFromBSDict(dict, annotationIndex, 1)
+	}
+	borderWidth, err := annotationLinkBorderWidth(dict, annotationIndex)
+	if err != nil {
+		return annotationBorderStyle{}, err
+	}
+	return annotationBorderStyle{Width: borderWidth, Style: "S"}, nil
+}
+
+func annotationShapeBorderStyle(dict pdfDict, annotationIndex int) (annotationBorderStyle, error) {
+	if _, ok := dict["BS"]; ok {
+		return annotationBorderStyleFromBSDict(dict, annotationIndex, 1)
+	}
+	return annotationBorderStyle{Width: 1, Style: "S"}, nil
+}
+
+func annotationBorderStyleFromBSDict(dict pdfDict, annotationIndex int, defaultWidth float64) (annotationBorderStyle, error) {
+	bs, ok := dict["BS"].(pdfDict)
+	if !ok {
+		return annotationBorderStyle{}, fmt.Errorf("cannot regenerate annotation appearance: annotation %d has unsupported /BS border style", annotationIndex)
+	}
+	style := annotationBorderStyle{
+		Width: defaultWidth,
+		Style: "S",
+	}
+	if widthValue, ok := bs["W"]; ok {
+		width, ok := pdfNumericValue(widthValue)
+		if !ok {
+			return annotationBorderStyle{}, fmt.Errorf("cannot regenerate annotation appearance: annotation %d has unsupported /BS /W border width", annotationIndex)
+		}
+		if width < 0 {
+			return annotationBorderStyle{}, fmt.Errorf("cannot regenerate annotation appearance: annotation %d has negative /BS /W border width", annotationIndex)
+		}
+		style.Width = width
+	}
+	if styleValue, ok := bs["S"]; ok {
+		styleName, ok := styleValue.(pdfName)
+		if !ok {
+			return annotationBorderStyle{}, fmt.Errorf("cannot regenerate annotation appearance: annotation %d has unsupported /BS border style", annotationIndex)
+		}
+		switch styleName {
+		case "S", "D", "U":
+			style.Style = string(styleName)
+		default:
+			return annotationBorderStyle{}, fmt.Errorf("cannot regenerate annotation appearance: annotation %d has unsupported /BS border style /S /%s", annotationIndex, styleName)
+		}
+	}
+	if style.Style == "D" {
+		dashArray := []float64{3}
+		if dashValue, ok := bs["D"]; ok {
+			parsed, ok := annotationDirectNumericArrayValue(dashValue)
+			if !ok || !annotationDashArraySupported(parsed) {
+				return annotationBorderStyle{}, fmt.Errorf("cannot regenerate annotation appearance: annotation %d has unsupported /BS /D dash array", annotationIndex)
+			}
+			dashArray = parsed
+		}
+		style.DashArray = dashArray
+	}
+	return style, nil
+}
+
+func annotationDashArraySupported(dashArray []float64) bool {
+	if len(dashArray) == 0 {
+		return false
+	}
+	nonZero := false
+	for _, dash := range dashArray {
+		if dash < 0 {
+			return false
+		}
+		if dash > 0 {
+			nonZero = true
+		}
+	}
+	return nonZero
 }
 
 func annotationLinkBorderWidth(dict pdfDict, annotationIndex int) (float64, error) {

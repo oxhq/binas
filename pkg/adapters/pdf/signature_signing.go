@@ -1,7 +1,9 @@
 package pdf
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -45,6 +47,7 @@ type SignatureSigningCallbackMetadata struct {
 type SignatureSigningPlanOptions struct {
 	Callback         SignatureSigningCallback         `json:"-"`
 	CallbackMetadata SignatureSigningCallbackMetadata `json:"callback_metadata"`
+	ReservedBytes    int                              `json:"reserved_bytes,omitempty"`
 }
 
 type SignatureSigningPlan struct {
@@ -53,6 +56,18 @@ type SignatureSigningPlan struct {
 	CallbackMetadata  SignatureSigningCallbackMetadata `json:"callback_metadata,omitempty"`
 	Signature         SignatureMetadata                `json:"signature"`
 	ByteRanges        []SignatureByteRange             `json:"byte_ranges,omitempty"`
+}
+
+type SignatureReSigningVerification struct {
+	IncrementalUpdate                  bool                 `json:"incremental_update"`
+	ReparseOK                          bool                 `json:"reparse_ok"`
+	ByteRanges                         []SignatureByteRange `json:"byte_ranges,omitempty"`
+	ByteRangeDigestValidation          bool                 `json:"byte_range_digest_validation"`
+	ByteRangeDigestValidationStatus    string               `json:"byte_range_digest_validation_status"`
+	CertificateTrustValidation         bool                 `json:"certificate_trust_validation"`
+	CertificateTrustValidationStatus   string               `json:"certificate_trust_validation_status"`
+	CryptographicSignatureVerification bool                 `json:"cryptographic_signature_verification"`
+	CryptographicSignatureStatus       string               `json:"cryptographic_signature_status"`
 }
 
 func ValidateSignatureSigningPlan(options SignatureSigningPlanOptions) error {
@@ -84,6 +99,81 @@ func PlanIncrementalReSigning(input []byte, options SignatureSigningPlanOptions)
 	plan.Supported = true
 	plan.ByteRanges = publicSignatureByteRanges(ranges)
 	return plan, nil
+}
+
+func ApplyIncrementalReSigning(ctx context.Context, input []byte, options SignatureSigningPlanOptions) ([]byte, SignatureSigningPlan, SignatureReSigningVerification, error) {
+	metadata, err := validateSignatureSigningPlanOptions(options)
+	if err != nil {
+		return nil, SignatureSigningPlan{Supported: false, UnsupportedReason: err.Error()}, SignatureReSigningVerification{}, err
+	}
+	if err := validateIncrementalTextReplacementInput(input); err != nil {
+		return nil, SignatureSigningPlan{Supported: false, UnsupportedReason: err.Error(), CallbackMetadata: metadata}, SignatureReSigningVerification{}, err
+	}
+	signatureDict, err := firstIncrementallyReSignableSignatureDictionary(input)
+	if err != nil {
+		return nil, SignatureSigningPlan{Supported: false, UnsupportedReason: err.Error(), CallbackMetadata: metadata}, SignatureReSigningVerification{}, err
+	}
+	reservedBytes := signatureReservedBytes(options.ReservedBytes)
+	byteRangePlaceholder := "[0000000000 0000000000 0000000000 0000000000]"
+	contentsPlaceholder := "<" + strings.Repeat("0", reservedBytes*2) + ">"
+	draftObject := incrementalSignatureDictionaryBytes(signatureDict.Dict, metadata, byteRangePlaceholder, contentsPlaceholder)
+	draft, err := appendIncrementalUpdate(input, []incrementalObjectUpdate{{
+		ID:    *signatureDict.ObjectID,
+		Value: pdfRawObject(draftObject),
+	}}, nil)
+	if err != nil {
+		return nil, SignatureSigningPlan{Supported: false, UnsupportedReason: err.Error(), CallbackMetadata: metadata}, SignatureReSigningVerification{}, err
+	}
+	contentsStart := bytes.LastIndex(draft, []byte(contentsPlaceholder))
+	if contentsStart < 0 {
+		return nil, SignatureSigningPlan{Supported: false, UnsupportedReason: "signature contents placeholder not found", CallbackMetadata: metadata}, SignatureReSigningVerification{}, errors.New("signature contents placeholder not found")
+	}
+	contentsEnd := contentsStart + len(contentsPlaceholder)
+	ranges := []signatureByteRange{
+		{Offset: 0, Length: contentsStart},
+		{Offset: contentsEnd, Length: len(draft) - contentsEnd},
+	}
+	byteRange := fmt.Sprintf("[%010d %010d %010d %010d]", ranges[0].Offset, ranges[0].Length, ranges[1].Offset, ranges[1].Length)
+	if len(byteRange) != len(byteRangePlaceholder) {
+		return nil, SignatureSigningPlan{Supported: false, UnsupportedReason: "signature ByteRange placeholder overflow", CallbackMetadata: metadata}, SignatureReSigningVerification{}, errors.New("signature ByteRange placeholder overflow")
+	}
+	draft = bytes.Replace(draft, []byte(byteRangePlaceholder), []byte(byteRange), 1)
+	digest, ok := digestByteRanges(draft, ranges, metadata.DigestAlgorithm)
+	if !ok {
+		err := fmt.Errorf("unsupported digest algorithm %q", metadata.DigestAlgorithm)
+		return nil, SignatureSigningPlan{Supported: false, UnsupportedReason: err.Error(), CallbackMetadata: metadata}, SignatureReSigningVerification{}, err
+	}
+	publicRanges := publicSignatureByteRanges(ranges)
+	plan := SignatureSigningPlan{
+		Supported:        true,
+		CallbackMetadata: metadata,
+		Signature:        signatureMetadataFromInfo(inspectSignatureInfo(draft)),
+		ByteRanges:       publicRanges,
+	}
+	response, err := options.Callback(ctx, SignatureSigningRequest{
+		Digest:             digest,
+		DigestAlgorithm:    metadata.DigestAlgorithm,
+		SignatureContainer: metadata.SignatureContainer,
+		SubFilter:          metadata.SubFilter,
+		ByteRanges:         publicRanges,
+		Signature:          plan.Signature,
+	})
+	if err != nil {
+		return nil, plan, SignatureReSigningVerification{}, err
+	}
+	if len(response.Signature) == 0 {
+		return nil, plan, SignatureReSigningVerification{}, errors.New("signature signing callback returned an empty signature")
+	}
+	if len(response.Signature) > reservedBytes {
+		return nil, plan, SignatureReSigningVerification{}, fmt.Errorf("signature signing callback returned %d bytes, exceeding reserved /Contents size %d", len(response.Signature), reservedBytes)
+	}
+	signatureHex := strings.ToUpper(hex.EncodeToString(response.Signature)) + strings.Repeat("0", (reservedBytes-len(response.Signature))*2)
+	output := bytes.Replace(draft, []byte(contentsPlaceholder), []byte("<"+signatureHex+">"), 1)
+	verification, err := verifyIncrementalReSigningOutput(output, publicRanges)
+	if err != nil {
+		return nil, plan, verification, err
+	}
+	return output, plan, verification, nil
 }
 
 func validateSignatureSigningPlanOptions(options SignatureSigningPlanOptions) (SignatureSigningCallbackMetadata, error) {
@@ -127,6 +217,62 @@ func normalizeSignatureSigningCallbackMetadata(metadata SignatureSigningCallback
 		}
 	}
 	return metadata, nil
+}
+
+func firstIncrementallyReSignableSignatureDictionary(input []byte) (signatureDictionaryInfo, error) {
+	for _, signatureDict := range signatureDictionariesForInput(input) {
+		if signatureDict.ObjectID != nil {
+			return signatureDict, nil
+		}
+	}
+	return signatureDictionaryInfo{}, errors.New("unsupported PDF: incremental re-signing requires an indirect signature dictionary")
+}
+
+func signatureReservedBytes(value int) int {
+	if value > 0 {
+		return value
+	}
+	return 8192
+}
+
+func incrementalSignatureDictionaryBytes(existing pdfDict, metadata SignatureSigningCallbackMetadata, byteRange, contents string) []byte {
+	filter := "Adobe.PPKLite"
+	if existingFilter, ok := dictPDFName(existing, "Filter"); ok && existingFilter != "" {
+		filter = existingFilter
+	}
+	subFilter := metadata.SubFilter
+	if subFilter == "" {
+		if existingSubFilter, ok := dictPDFName(existing, "SubFilter"); ok {
+			subFilter = existingSubFilter
+		}
+	}
+	if subFilter == "" {
+		subFilter = "adbe.pkcs7.detached"
+	}
+	return []byte(fmt.Sprintf("<< /Type /Sig /Filter /%s /SubFilter /%s /ByteRange %s /Contents %s >>", filter, subFilter, byteRange, contents))
+}
+
+func verifyIncrementalReSigningOutput(output []byte, ranges []SignatureByteRange) (SignatureReSigningVerification, error) {
+	info := inspectSignatureInfo(output)
+	verification := SignatureReSigningVerification{
+		IncrementalUpdate:                  true,
+		ReparseOK:                          false,
+		ByteRanges:                         ranges,
+		ByteRangeDigestValidation:          info.ByteRangeDigestValidation,
+		ByteRangeDigestValidationStatus:    info.ByteRangeDigestValidationStatus,
+		CertificateTrustValidation:         info.CertificateTrustValidation,
+		CertificateTrustValidationStatus:   info.CertificateTrustValidationStatus,
+		CryptographicSignatureVerification: false,
+		CryptographicSignatureStatus:       "not_performed",
+	}
+	if _, err := parsePDFGraphWithOptions(output, pdfGraphParseOptions{AllowSignature: true}); err != nil {
+		return verification, err
+	}
+	verification.ReparseOK = true
+	if !info.ByteRangeDigestValidation || info.ByteRangeDigestValidationStatus != signatureByteRangeDigestValidationValid {
+		return verification, fmt.Errorf("incremental re-signing byte-range digest validation status = %q", info.ByteRangeDigestValidationStatus)
+	}
+	return verification, nil
 }
 
 func invalidSignatureSigningCallbackMetadata(format string, args ...any) error {

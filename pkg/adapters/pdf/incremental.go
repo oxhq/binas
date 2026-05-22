@@ -13,6 +13,8 @@ type incrementalObjectUpdate struct {
 	Value pdfValue
 }
 
+type pdfRawObject []byte
+
 func appendIncrementalUpdate(input []byte, updates []incrementalObjectUpdate, trailerOverrides pdfDict) ([]byte, error) {
 	if !bytes.HasPrefix(input, []byte("%PDF-")) {
 		return nil, errors.New("not a PDF file")
