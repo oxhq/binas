@@ -286,6 +286,81 @@ func TestListXFATemplateDatasetMappingsDoesNotOpenUnsupportedEditBoundary(t *tes
 	}
 }
 
+func TestInspectXFASemanticsClassifiesStaticTemplateDatasets(t *testing.T) {
+	input := testPDF("<< /Type /Catalog /AcroForm << /XFA [(template) (<template><subform name=\"form\"><field name=\"name\"/></subform></template>) (datasets) (<datasets><data><form><name>Alice</name></form></data></datasets>)] >> >>")
+
+	semantics, err := InspectXFASemantics(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if semantics.Classification != "static_datasets_template" || semantics.RequiresRendering || !semantics.DatasetSemanticEditsSupported {
+		t.Fatalf("semantics = %+v", semantics)
+	}
+	if len(semantics.DynamicMarkers) != 0 || len(semantics.Warnings) != 0 || semantics.RefusalReason != "" {
+		t.Fatalf("unexpected dynamic metadata = %+v", semantics)
+	}
+}
+
+func TestInspectXFASemanticsReportsDynamicTemplateAndConfigMarkers(t *testing.T) {
+	input := testPDF("<< /Type /Catalog /AcroForm << /XFA [(template) (<template><subform name=\"rows\" layout=\"flowed\"><occur max=\"-1\"/></subform></template>) (config) (<config><present><pdf><dynamicRender>required</dynamicRender></pdf></present></config>) (datasets) (<datasets><data><rows><name>Alice</name></rows></data></datasets>)] >> >>")
+
+	semantics, err := InspectXFASemantics(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if semantics.Classification != "dynamic_rendering_required" || !semantics.RequiresRendering || semantics.DatasetSemanticEditsSupported {
+		t.Fatalf("semantics = %+v", semantics)
+	}
+	if semantics.RefusalReason != "unsupported PDF: dynamic XFA requires renderer semantics; xfa dataset-set refuses semantic edits" {
+		t.Fatalf("refusal reason = %q", semantics.RefusalReason)
+	}
+	want := []XFADynamicMarker{
+		{PacketIndex: 0, Label: "template", PacketKind: "template", Path: "template.subform", Reason: `template layout="flowed"`},
+		{PacketIndex: 0, Label: "template", PacketKind: "template", Path: "template.subform.occur", Reason: "template occur allows repeatable content"},
+		{PacketIndex: 1, Label: "config", PacketKind: "config", Path: "config.present.pdf.dynamicRender", Reason: `config dynamicRender="required"`},
+	}
+	if len(semantics.DynamicMarkers) != len(want) {
+		t.Fatalf("dynamic markers = %+v, want %+v", semantics.DynamicMarkers, want)
+	}
+	for i := range want {
+		if semantics.DynamicMarkers[i] != want[i] {
+			t.Fatalf("dynamic marker %d = %+v, want %+v", i, semantics.DynamicMarkers[i], want[i])
+		}
+	}
+	if len(semantics.Warnings) != 1 || semantics.Warnings[0] != "XFA dynamic rendering markers detected; renderer-grade XFA layout is not implemented" {
+		t.Fatalf("warnings = %+v", semantics.Warnings)
+	}
+}
+
+func TestApplyXFADatasetFieldUpdateRefusesDynamicXFA(t *testing.T) {
+	input := testPDF("<< /Type /Catalog /AcroForm << /XFA [(template) (<template><subform layout=\"flowed\"><field name=\"name\"/></subform></template>) (datasets) (<datasets><data><name>Alice</name></data></datasets>)] >> >>")
+
+	output, report, verification, err := ApplyXFADatasetFieldUpdate(input, "name", "Ana")
+	if err == nil {
+		t.Fatal("expected dynamic XFA dataset update to fail closed")
+	}
+	if err.Error() != "unsupported PDF: dynamic XFA requires renderer semantics; xfa dataset-set refuses semantic edits" {
+		t.Fatalf("error = %q", err)
+	}
+	if output != nil || report.FallbackUsed || verification.ReparseOK {
+		t.Fatalf("dynamic XFA refusal leaked output/report/verification: output=%q report=%+v verification=%+v", output, report, verification)
+	}
+}
+
+func TestApplyXFADatasetFieldUpdateRefusesUnknownXFAFamilies(t *testing.T) {
+	input := testPDF("<< /Type /Catalog /AcroForm << /XFA [(config) (<config><present/></config>) (datasets) (<datasets><data><name>Alice</name></data></datasets>)] >> >>")
+
+	_, _, _, err := ApplyXFADatasetFieldUpdate(input, "name", "Ana")
+	if err == nil {
+		t.Fatal("expected non-static XFA family to fail closed")
+	}
+	if err.Error() != "unsupported PDF: XFA semantics are not limited to static template/datasets packets; xfa dataset-set refuses semantic edits" {
+		t.Fatalf("error = %q", err)
+	}
+}
+
 func TestXFADatasetReadDoesNotOpenUnsupportedEditBoundary(t *testing.T) {
 	content := []byte("BT\n(old) Tj\nET\n")
 	input := testPDF(

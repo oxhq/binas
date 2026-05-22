@@ -28,6 +28,40 @@ type XFATemplateDatasetMapping struct {
 	Label               string `json:"label,omitempty"`
 }
 
+type XFASemanticMetadata struct {
+	Classification                string             `json:"classification"`
+	RequiresRendering             bool               `json:"requires_rendering"`
+	DatasetSemanticEditsSupported bool               `json:"dataset_semantic_edits_supported"`
+	DynamicMarkers                []XFADynamicMarker `json:"dynamic_markers,omitempty"`
+	Warnings                      []string           `json:"warnings"`
+	RefusalReason                 string             `json:"refusal_reason,omitempty"`
+}
+
+type XFADynamicMarker struct {
+	PacketIndex int    `json:"packet_index"`
+	Label       string `json:"label,omitempty"`
+	PacketKind  string `json:"packet_kind"`
+	Path        string `json:"path"`
+	Reason      string `json:"reason"`
+}
+
+const (
+	xfaClassificationNone              = "none"
+	xfaClassificationStaticDatasets    = "static_datasets_template"
+	xfaClassificationDynamicRendering  = "dynamic_rendering_required"
+	xfaClassificationUnknown           = "unknown"
+	xfaDynamicSemanticEditRefusalError = "unsupported PDF: dynamic XFA requires renderer semantics; xfa dataset-set refuses semantic edits"
+	xfaUnknownSemanticEditRefusalError = "unsupported PDF: XFA semantics are not limited to static template/datasets packets; xfa dataset-set refuses semantic edits"
+)
+
+func InspectXFASemantics(input []byte) (XFASemanticMetadata, error) {
+	graph, err := parsePDFGraphWithOptions(input, pdfGraphParseOptions{AllowXFA: true})
+	if err != nil {
+		return XFASemanticMetadata{}, err
+	}
+	return inspectXFASemanticsFromGraph(graph), nil
+}
+
 func ListXFADatasetFields(input []byte) ([]XFADatasetField, error) {
 	return ListXFADatasetFieldsWithOptions(input, XFADatasetFieldListOptions{})
 }
@@ -126,6 +160,10 @@ func ApplyXFADatasetFieldUpdateWithOptions(input []byte, path, value string, opt
 	if err != nil {
 		return nil, core.Report{}, core.Verification{}, err
 	}
+	semantics := inspectXFASemanticsFromGraph(graph)
+	if semantics.Classification != xfaClassificationNone && !semantics.DatasetSemanticEditsSupported && semantics.RefusalReason != "" {
+		return nil, core.Report{}, core.Verification{}, errors.New(semantics.RefusalReason)
+	}
 	packets := xfaPackets(graph, "")
 	matches := make([]xfaDatasetFieldUpdateMatch, 0, 1)
 	containerMatches := 0
@@ -184,6 +222,248 @@ func ApplyXFADatasetFieldUpdateWithOptions(input []byte, path, value string, opt
 		NodesModified: 1,
 		Invariants:    []core.Invariant{core.InvariantReparse, core.InvariantNoFallbackUsed},
 	}), verification, nil
+}
+
+func inspectXFASemanticsFromGraph(graph *pdfGraph) XFASemanticMetadata {
+	metadata := xfaPacketMetadataFromGraph(graph)
+	out := XFASemanticMetadata{
+		Classification:                xfaClassificationNone,
+		DatasetSemanticEditsSupported: false,
+		Warnings:                      []string{},
+	}
+	if len(metadata) == 0 {
+		return out
+	}
+	out.Classification = xfaClassificationUnknown
+
+	for i, packet := range xfaPackets(graph, "") {
+		out.DynamicMarkers = append(out.DynamicMarkers, xfaDynamicMarkersFromPacket(i, packet)...)
+	}
+	if len(out.DynamicMarkers) > 0 {
+		out.Classification = xfaClassificationDynamicRendering
+		out.RequiresRendering = true
+		out.DatasetSemanticEditsSupported = false
+		out.RefusalReason = xfaDynamicSemanticEditRefusalError
+		out.Warnings = append(out.Warnings, "XFA dynamic rendering markers detected; renderer-grade XFA layout is not implemented")
+		return out
+	}
+
+	if xfaPacketsAreStaticTemplateDatasets(metadata) {
+		out.Classification = xfaClassificationStaticDatasets
+		out.DatasetSemanticEditsSupported = xfaPacketMetadataContainsSemanticKind(metadata, "datasets")
+		return out
+	}
+
+	out.Warnings = append(out.Warnings, "XFA packet family is not limited to static template/datasets packets; renderer-grade XFA layout is not implemented")
+	if !xfaPacketMetadataHasDiagnostics(metadata) {
+		out.RefusalReason = xfaUnknownSemanticEditRefusalError
+	}
+	return out
+}
+
+func xfaPacketMetadataFromGraph(graph *pdfGraph) []XFAPacketMetadata {
+	packets := make([]XFAPacketMetadata, 0)
+	for _, acroForm := range acroFormDictionaries(graph) {
+		value, ok := acroForm["XFA"]
+		if !ok {
+			continue
+		}
+		packets = appendXFAPacketMetadata(packets, graph, value, "")
+	}
+	for i := range packets {
+		packets[i].Index = i
+	}
+	return packets
+}
+
+func xfaPacketsAreStaticTemplateDatasets(packets []XFAPacketMetadata) bool {
+	if len(packets) == 0 {
+		return false
+	}
+	hasTemplateOrDatasets := false
+	for _, packet := range packets {
+		if packet.HasDecodeError || packet.UnsafeXML || packet.XMLParseError != "" {
+			return false
+		}
+		switch xfaSemanticPacketKind(packet) {
+		case "template", "datasets":
+			hasTemplateOrDatasets = true
+		default:
+			return false
+		}
+	}
+	return hasTemplateOrDatasets
+}
+
+func xfaPacketMetadataContainsSemanticKind(packets []XFAPacketMetadata, kind string) bool {
+	for _, packet := range packets {
+		if xfaSemanticPacketKind(packet) == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func xfaSemanticPacketKind(packet XFAPacketMetadata) string {
+	if packet.PacketKind == "template" || packet.PacketKind == "datasets" {
+		return packet.PacketKind
+	}
+	if packet.RootElement == "" {
+		return packet.PacketKind
+	}
+	return classifyXFAPacketKindToken(packet.RootElement)
+}
+
+func xfaPacketMetadataHasDiagnostics(packets []XFAPacketMetadata) bool {
+	for _, packet := range packets {
+		if packet.HasDecodeError || packet.UnsafeXML || packet.XMLParseError != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func xfaDynamicMarkersFromPacket(packetIndex int, packet xfaPacket) []XFADynamicMarker {
+	decoder := xml.NewDecoder(strings.NewReader(packet.text))
+	stack := make([]xfaDynamicFrame, 0)
+	markers := make([]XFADynamicMarker, 0)
+	for {
+		token, err := decoder.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return markers
+		}
+		switch t := token.(type) {
+		case xml.StartElement:
+			path := xfaDynamicPath(stack, t.Name.Local)
+			if xfaDynamicFrameInside(stack, "template") {
+				markers = append(markers, xfaTemplateDynamicMarkers(packetIndex, packet, t, path)...)
+			}
+			stack = append(stack, xfaDynamicFrame{localName: t.Name.Local, path: path})
+		case xml.CharData:
+			if len(stack) > 0 {
+				stack[len(stack)-1].text.Write([]byte(t))
+			}
+		case xml.EndElement:
+			if len(stack) == 0 {
+				return markers
+			}
+			frame := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			if frame.localName == "dynamicRender" {
+				value := strings.TrimSpace(frame.text.String())
+				if xfaDynamicRenderRequiresRenderer(value) {
+					markers = append(markers, XFADynamicMarker{
+						PacketIndex: packetIndex,
+						Label:       packet.label,
+						PacketKind:  packet.kind,
+						Path:        frame.path,
+						Reason:      fmt.Sprintf("config dynamicRender=%q", value),
+					})
+				}
+			}
+		case xml.Directive:
+			directive := strings.TrimSpace(strings.ToUpper(string(t)))
+			if strings.HasPrefix(directive, "DOCTYPE") || strings.HasPrefix(directive, "ENTITY") {
+				return markers
+			}
+		}
+	}
+	return markers
+}
+
+type xfaDynamicFrame struct {
+	localName string
+	path      string
+	text      strings.Builder
+}
+
+func xfaTemplateDynamicMarkers(packetIndex int, packet xfaPacket, element xml.StartElement, path string) []XFADynamicMarker {
+	markers := make([]XFADynamicMarker, 0, 1)
+	switch element.Name.Local {
+	case "subform":
+		layout := xfaXMLAttr(element, "layout")
+		if strings.EqualFold(layout, "flowed") {
+			markers = append(markers, XFADynamicMarker{
+				PacketIndex: packetIndex,
+				Label:       packet.label,
+				PacketKind:  packet.kind,
+				Path:        path,
+				Reason:      `template layout="flowed"`,
+			})
+		}
+	case "occur":
+		if xfaOccurAllowsDynamicContent(element) {
+			markers = append(markers, XFADynamicMarker{
+				PacketIndex: packetIndex,
+				Label:       packet.label,
+				PacketKind:  packet.kind,
+				Path:        path,
+				Reason:      "template occur allows repeatable content",
+			})
+		}
+	case "break", "breakBefore", "breakAfter", "overflow":
+		markers = append(markers, XFADynamicMarker{
+			PacketIndex: packetIndex,
+			Label:       packet.label,
+			PacketKind:  packet.kind,
+			Path:        path,
+			Reason:      "template pagination/layout node requires XFA renderer semantics",
+		})
+	}
+	return markers
+}
+
+func xfaDynamicFrameInside(stack []xfaDynamicFrame, localName string) bool {
+	for _, frame := range stack {
+		if frame.localName == localName {
+			return true
+		}
+	}
+	return false
+}
+
+func xfaDynamicPath(stack []xfaDynamicFrame, localName string) string {
+	parts := make([]string, 0, len(stack)+1)
+	for _, frame := range stack {
+		if frame.localName != "" {
+			parts = append(parts, frame.localName)
+		}
+	}
+	if localName != "" {
+		parts = append(parts, localName)
+	}
+	return strings.Join(parts, ".")
+}
+
+func xfaXMLAttr(element xml.StartElement, name string) string {
+	for _, attr := range element.Attr {
+		if attr.Name.Local == name {
+			return strings.TrimSpace(attr.Value)
+		}
+	}
+	return ""
+}
+
+func xfaOccurAllowsDynamicContent(element xml.StartElement) bool {
+	for _, name := range []string{"max", "initial", "min"} {
+		value := xfaXMLAttr(element, name)
+		if value != "" && value != "1" {
+			return true
+		}
+	}
+	return false
+}
+
+func xfaDynamicRenderRequiresRenderer(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "0", "false", "forbidden", "static", "none":
+		return false
+	default:
+		return true
+	}
 }
 
 func xfaPacketMayContainDatasets(packet xfaPacket) bool {

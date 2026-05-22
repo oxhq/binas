@@ -79,6 +79,45 @@ func parseSimpleFontEncoding(value pdfValue) (*pdfSimpleFontEncoding, bool) {
 	}
 }
 
+func defaultSimpleFontEncodingForFont(dict pdfDict) (*pdfSimpleFontEncoding, bool) {
+	subtype, ok := pdfNameValue(dict["Subtype"])
+	if !ok || subtype != "Type1" {
+		return nil, false
+	}
+	baseFont, ok := pdfNameValue(dict["BaseFont"])
+	if !ok {
+		return nil, false
+	}
+	baseFont = stripPDFSubsetFontPrefix(baseFont)
+	if !isStandardEncodingBaseFont(baseFont) {
+		return nil, false
+	}
+	return standardSimpleFontEncoding(), true
+}
+
+func stripPDFSubsetFontPrefix(name string) string {
+	if len(name) <= 7 || name[6] != '+' {
+		return name
+	}
+	for _, r := range name[:6] {
+		if r < 'A' || r > 'Z' {
+			return name
+		}
+	}
+	return name[7:]
+}
+
+func isStandardEncodingBaseFont(name string) bool {
+	switch name {
+	case "Courier", "Courier-Bold", "Courier-Oblique", "Courier-BoldOblique",
+		"Helvetica", "Helvetica-Bold", "Helvetica-Oblique", "Helvetica-BoldOblique",
+		"Times-Roman", "Times-Bold", "Times-Italic", "Times-BoldItalic":
+		return true
+	default:
+		return false
+	}
+}
+
 func simpleFontEncodingFromDict(dict pdfDict) (*pdfSimpleFontEncoding, bool) {
 	baseName := "StandardEncoding"
 	if base, ok := dict["BaseEncoding"].(pdfName); ok {

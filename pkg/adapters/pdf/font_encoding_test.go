@@ -212,6 +212,58 @@ func TestFontEncodingStandardDecodesAndEditsHighByteHexText(t *testing.T) {
 	}
 }
 
+func TestFontEncodingDefaultStandardEncodingForType1BaseFontDecodesAndEditsHighByteHexText(t *testing.T) {
+	content := []byte("BT\n/F1 12 Tf\n<AEBB> Tj\nET\n")
+	input := testPDF(
+		"<< /Type /Catalog >>",
+		"<< /Type /Page /Contents 4 0 R /Resources << /Font << /F1 3 0 R >> >> >>",
+		"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
+	)
+	adapter := NewAdapter()
+	tree, err := adapter.Parse(input, core.ParseOptions{Strict: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	matches := tree.Query(core.Match{Kind: KindTextShow, Text: "\ufb01\u00bb"})
+	if len(matches) != 1 {
+		t.Fatalf("matches = %d, want 1", len(matches))
+	}
+	if matches[0].Meta["encoding"] != "hex-font-encoding" {
+		t.Fatalf("encoding meta = %v, want hex-font-encoding", matches[0].Meta["encoding"])
+	}
+	if matches[0].Meta["font_encoding_name"] != "StandardEncoding" {
+		t.Fatalf("font_encoding_name meta = %v, want StandardEncoding", matches[0].Meta["font_encoding_name"])
+	}
+
+	plan, err := adapter.PlanEdit(tree, core.Match{Kind: KindTextShow, Text: "\ufb01\u00bb"}, core.Mutation{Replace: "\u00bb\ufb01"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, _, err := adapter.Apply(input, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(output, []byte("<BBAE> Tj")) {
+		t.Fatalf("expected replacement to preserve inferred StandardEncoding bytes:\n%s", output)
+	}
+}
+
+func TestFontEncodingDefaultAbsentEncodingFailsClosedForUnsupportedBaseFonts(t *testing.T) {
+	cases := []pdfDict{
+		{"Subtype": pdfName("Type1"), "BaseFont": pdfName("Symbol")},
+		{"Subtype": pdfName("Type1"), "BaseFont": pdfName("ZapfDingbats")},
+		{"Subtype": pdfName("Type1"), "BaseFont": pdfName("CustomFont")},
+		{"Subtype": pdfName("TrueType"), "BaseFont": pdfName("Helvetica")},
+		{"Subtype": pdfName("Type1")},
+	}
+	for _, tc := range cases {
+		if encoding, ok := defaultSimpleFontEncodingForFont(tc); ok {
+			t.Fatalf("defaultSimpleFontEncodingForFont(%v) = %v, true; want fail-closed", tc, encoding.name)
+		}
+	}
+}
+
 func TestFontEncodingMacRomanDecodesAndEditsHighByteHexText(t *testing.T) {
 	content := []byte("BT\n/F1 12 Tf\n<80DB> Tj\nET\n")
 	input := testPDF(

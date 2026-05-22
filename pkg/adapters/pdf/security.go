@@ -76,6 +76,9 @@ type SignatureMetadata struct {
 	SignatureContainer            string `json:"signature_container,omitempty"`
 	DigestAlgorithm               string `json:"digest_algorithm,omitempty"`
 	DigestAlgorithmStatus         string `json:"digest_algorithm_status,omitempty"`
+	CertificateCount              int    `json:"certificate_count,omitempty"`
+	SignerCertificateSubject      string `json:"signer_certificate_subject,omitempty"`
+	SignerCertificateIssuer       string `json:"signer_certificate_issuer,omitempty"`
 	CryptographicValidation       bool   `json:"cryptographic_validation"`
 	CryptographicValidationStatus string `json:"cryptographic_validation_status"`
 }
@@ -153,6 +156,9 @@ func signatureMetadataFromInfo(info signatureInfo) SignatureMetadata {
 		SignatureContainer:            info.SignatureContainer,
 		DigestAlgorithm:               info.DigestAlgorithm,
 		DigestAlgorithmStatus:         info.DigestAlgorithmStatus,
+		CertificateCount:              info.CertificateCount,
+		SignerCertificateSubject:      info.SignerCertificateSubject,
+		SignerCertificateIssuer:       info.SignerCertificateIssuer,
 		CryptographicValidation:       info.CryptographicValidation,
 		CryptographicValidationStatus: info.CryptographicValidationStatus,
 	}
@@ -447,32 +453,8 @@ func signatureByteRanges(input []byte) ([]signatureByteRange, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrSignedPDFByteRangeProofRequired, err)
 		}
-		array, ok := value.(pdfArray)
-		if !ok || len(array) == 0 || len(array)%2 != 0 {
-			return nil, fmt.Errorf("%w: /ByteRange must be an array of offset/length pairs", ErrSignedPDFByteRangeProofRequired)
-		}
-		if pairCount := len(array) / 2; pairCount%2 != 0 {
-			return nil, fmt.Errorf("%w: /ByteRange must contain an even number of offset/length pairs", ErrSignedPDFByteRangeProofRequired)
-		}
-		listRanges := make([]signatureByteRange, 0, len(array)/2)
-		for i := 0; i < len(array); i += 2 {
-			offset, ok := pdfIntegerValue(array[i])
-			if !ok {
-				return nil, fmt.Errorf("%w: /ByteRange offset must be an integer", ErrSignedPDFByteRangeProofRequired)
-			}
-			length, ok := pdfIntegerValue(array[i+1])
-			if !ok {
-				return nil, fmt.Errorf("%w: /ByteRange length must be an integer", ErrSignedPDFByteRangeProofRequired)
-			}
-			if offset < 0 || length < 0 {
-				return nil, fmt.Errorf("%w: /ByteRange values must be nonnegative", ErrSignedPDFByteRangeProofRequired)
-			}
-			if offset > len(input) || length > len(input)-offset {
-				return nil, fmt.Errorf("%w: /ByteRange %d %d is outside the original file", ErrSignedPDFByteRangeProofRequired, offset, length)
-			}
-			listRanges = append(listRanges, signatureByteRange{Offset: offset, Length: length})
-		}
-		if err := validateSignatureByteRangeList(listRanges); err != nil {
+		listRanges, err := signatureByteRangesFromValue(input, value)
+		if err != nil {
 			return nil, err
 		}
 		ranges = append(ranges, listRanges...)
@@ -481,6 +463,38 @@ func signatureByteRanges(input []byte) ([]signatureByteRange, error) {
 		return nil, ErrSignedPDFByteRangeProofRequired
 	}
 	return ranges, nil
+}
+
+func signatureByteRangesFromValue(input []byte, value pdfValue) ([]signatureByteRange, error) {
+	array, ok := value.(pdfArray)
+	if !ok || len(array) == 0 || len(array)%2 != 0 {
+		return nil, fmt.Errorf("%w: /ByteRange must be an array of offset/length pairs", ErrSignedPDFByteRangeProofRequired)
+	}
+	if pairCount := len(array) / 2; pairCount%2 != 0 {
+		return nil, fmt.Errorf("%w: /ByteRange must contain an even number of offset/length pairs", ErrSignedPDFByteRangeProofRequired)
+	}
+	listRanges := make([]signatureByteRange, 0, len(array)/2)
+	for i := 0; i < len(array); i += 2 {
+		offset, ok := pdfIntegerValue(array[i])
+		if !ok {
+			return nil, fmt.Errorf("%w: /ByteRange offset must be an integer", ErrSignedPDFByteRangeProofRequired)
+		}
+		length, ok := pdfIntegerValue(array[i+1])
+		if !ok {
+			return nil, fmt.Errorf("%w: /ByteRange length must be an integer", ErrSignedPDFByteRangeProofRequired)
+		}
+		if offset < 0 || length < 0 {
+			return nil, fmt.Errorf("%w: /ByteRange values must be nonnegative", ErrSignedPDFByteRangeProofRequired)
+		}
+		if offset > len(input) || length > len(input)-offset {
+			return nil, fmt.Errorf("%w: /ByteRange %d %d is outside the original file", ErrSignedPDFByteRangeProofRequired, offset, length)
+		}
+		listRanges = append(listRanges, signatureByteRange{Offset: offset, Length: length})
+	}
+	if err := validateSignatureByteRangeList(listRanges); err != nil {
+		return nil, err
+	}
+	return listRanges, nil
 }
 
 func validateSignatureByteRangeList(ranges []signatureByteRange) error {

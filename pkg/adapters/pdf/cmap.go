@@ -492,7 +492,7 @@ func (g *pdfGraph) simpleEncodingForFont(fontID pdfObjectID) (*pdfSimpleFontEnco
 	}
 	encodingValue, ok := dict["Encoding"]
 	if !ok {
-		return nil, false
+		return defaultSimpleFontEncodingForFont(dict)
 	}
 	if ref, ok := encodingValue.(pdfRef); ok {
 		if resolved, ok := g.resolvePDFDict(ref); ok {

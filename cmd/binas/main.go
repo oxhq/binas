@@ -646,9 +646,16 @@ func xfaList(args []string) error {
 	if err != nil {
 		return err
 	}
-	result := map[string]any{"packets": packets, "count": len(packets)}
+	semantics, err := pdf.InspectXFASemantics(input)
+	if err != nil {
+		return err
+	}
+	result := map[string]any{"packets": packets, "count": len(packets), "semantics": semantics, "warnings": semantics.Warnings}
 	if *asJSON {
 		return writeJSON(result)
+	}
+	for _, warning := range semantics.Warnings {
+		fmt.Printf("warning=%q\n", warning)
 	}
 	for _, packet := range packets {
 		object := "direct"

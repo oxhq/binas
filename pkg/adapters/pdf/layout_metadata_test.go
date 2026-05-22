@@ -89,9 +89,9 @@ func TestLayoutMetadataReportIncludesDecodeFontEncodingAndWidthProof(t *testing.
 		t.Fatal(err)
 	}
 	assertLayoutReportMetadata(t, plan.Meta, map[string]any{
-		"encoding":           "literal",
-		"encoding_path":      "text_show/literal",
-		"text_decode_source": "pdf_literal_string",
+		"encoding":           "literal-font-encoding",
+		"encoding_path":      "text_show/literal/simple_font_encoding",
+		"text_decode_source": "simple_font_encoding",
 		"font_id":            "F1",
 		"layout_proof":       layoutProofStatusWidthProven,
 		"old_width_units":    1210,
@@ -104,9 +104,9 @@ func TestLayoutMetadataReportIncludesDecodeFontEncodingAndWidthProof(t *testing.
 		t.Fatal(err)
 	}
 	assertLayoutReportMetadata(t, report.Meta, map[string]any{
-		"encoding":           "literal",
-		"encoding_path":      "text_show/literal",
-		"text_decode_source": "pdf_literal_string",
+		"encoding":           "literal-font-encoding",
+		"encoding_path":      "text_show/literal/simple_font_encoding",
+		"text_decode_source": "simple_font_encoding",
 		"font_id":            "F1",
 		"layout_proof":       layoutProofStatusWidthProven,
 		"old_width_units":    1210,
@@ -138,9 +138,9 @@ func TestLayoutMetadataFailClosedErrorIncludesDecodeFontEncodingAndWidthProof(t 
 		"old_width_units=1200",
 		"new_width_units=1220",
 		"width_delta_units=20",
-		"text_decode_source=pdf_literal_string",
+		"text_decode_source=simple_font_encoding",
 		"font_id=F1",
-		"encoding_path=text_show/literal",
+		"encoding_path=text_show/literal/simple_font_encoding",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("error = %q, want metadata %q", got, want)

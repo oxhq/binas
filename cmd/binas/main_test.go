@@ -1999,6 +1999,54 @@ func TestCLIXFAListPlainTextIncludesSemanticMetadata(t *testing.T) {
 	}
 }
 
+func TestCLIXFAListJSONIncludesDynamicSemanticsWarnings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "xfa-list-dynamic.pdf")
+	input := pdfFixture(
+		"<< /Type /Catalog /AcroForm << /XFA [(template) (<template><subform layout=\"flowed\"><occur max=\"-1\"/></subform></template>) (datasets) (<datasets><data><field>Alice</field></data></datasets>)] >> >>",
+	)
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{"xfa", "list", path, "--format", "pdf", "--json"})
+	})
+	var result struct {
+		Warnings  []string `json:"warnings"`
+		Semantics struct {
+			Classification                string `json:"classification"`
+			RequiresRendering             bool   `json:"requires_rendering"`
+			DatasetSemanticEditsSupported bool   `json:"dataset_semantic_edits_supported"`
+			RefusalReason                 string `json:"refusal_reason"`
+			DynamicMarkers                []struct {
+				PacketIndex int    `json:"packet_index"`
+				Label       string `json:"label"`
+				PacketKind  string `json:"packet_kind"`
+				Path        string `json:"path"`
+				Reason      string `json:"reason"`
+			} `json:"dynamic_markers"`
+		} `json:"semantics"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Warnings) != 1 || result.Warnings[0] != "XFA dynamic rendering markers detected; renderer-grade XFA layout is not implemented" {
+		t.Fatalf("warnings = %+v", result.Warnings)
+	}
+	if result.Semantics.Classification != "dynamic_rendering_required" || !result.Semantics.RequiresRendering || result.Semantics.DatasetSemanticEditsSupported {
+		t.Fatalf("semantics = %+v", result.Semantics)
+	}
+	if result.Semantics.RefusalReason != "unsupported PDF: dynamic XFA requires renderer semantics; xfa dataset-set refuses semantic edits" {
+		t.Fatalf("refusal reason = %q", result.Semantics.RefusalReason)
+	}
+	if len(result.Semantics.DynamicMarkers) != 2 {
+		t.Fatalf("dynamic markers = %+v", result.Semantics.DynamicMarkers)
+	}
+	if result.Semantics.DynamicMarkers[0].Path != "template.subform" || result.Semantics.DynamicMarkers[0].Reason != `template layout="flowed"` {
+		t.Fatalf("first dynamic marker = %+v", result.Semantics.DynamicMarkers[0])
+	}
+}
+
 func TestCLIXFADatasetsEmitsJSONFields(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "xfa-datasets.pdf")
 	input := pdfFixture(
@@ -2416,9 +2464,9 @@ func TestCLIEditLayoutModePreserveWidthAllowsWidthProvenPlan(t *testing.T) {
 		t.Fatalf("report meta = %+v, want preserve-width width_proven", result.Report.Meta)
 	}
 	for key, want := range map[string]any{
-		"encoding":           "literal",
-		"encoding_path":      "text_show/literal",
-		"text_decode_source": "pdf_literal_string",
+		"encoding":           "literal-font-encoding",
+		"encoding_path":      "text_show/literal/simple_font_encoding",
+		"text_decode_source": "simple_font_encoding",
 		"font_id":            "F1",
 		"old_width_units":    float64(1210),
 		"new_width_units":    float64(1210),
@@ -2945,8 +2993,8 @@ func TestCLISignatureInspectReportsExistingSignatureMetadataAsJSON(t *testing.T)
 	if result.SignatureContainer != "pkcs7" || result.DigestAlgorithm != "unknown" || result.DigestAlgorithmStatus != "not_parsed" {
 		t.Fatalf("signature diagnostics = %+v, want pkcs7/unknown/not_parsed", result)
 	}
-	if result.CryptographicValidation || result.CryptographicValidationStatus != "not_performed" {
-		t.Fatalf("cryptographic validation = %t/%q, want false/not_performed", result.CryptographicValidation, result.CryptographicValidationStatus)
+	if result.CryptographicValidation || result.CryptographicValidationStatus != "unsupported" {
+		t.Fatalf("cryptographic validation = %t/%q, want false/unsupported", result.CryptographicValidation, result.CryptographicValidationStatus)
 	}
 }
 
@@ -2965,7 +3013,7 @@ func TestCLISignatureInspectPlainTextIncludesNonCryptographicHints(t *testing.T)
 		"signature_container=pkcs7",
 		"digest_algorithm=unknown",
 		"digest_algorithm_status=not_parsed",
-		"cryptographic_validation_status=not_performed",
+		"cryptographic_validation_status=unsupported",
 		"object=5 0 R",
 		"filter=Adobe.PPKLite",
 		"sub_filter=adbe.pkcs7.detached",

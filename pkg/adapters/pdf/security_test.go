@@ -232,8 +232,8 @@ func TestSecurityMetadataIncludesDirectSignatureDictionaryMetadata(t *testing.T)
 	if signature.SignatureContainer != "pkcs7" || signature.DigestAlgorithm != signatureDigestAlgorithmUnknown || signature.DigestAlgorithmStatus != signatureDigestAlgorithmNotParsed {
 		t.Fatalf("signature diagnostics = container %q digest %q/%q, want pkcs7/unknown/%q", signature.SignatureContainer, signature.DigestAlgorithm, signature.DigestAlgorithmStatus, signatureDigestAlgorithmNotParsed)
 	}
-	if signature.CryptographicValidation || signature.CryptographicValidationStatus != signatureCryptographicValidationNotPerformed {
-		t.Fatalf("cryptographic validation = %t/%q, want false/%q", signature.CryptographicValidation, signature.CryptographicValidationStatus, signatureCryptographicValidationNotPerformed)
+	if signature.CryptographicValidation || signature.CryptographicValidationStatus != signatureCryptographicValidationUnsupported {
+		t.Fatalf("cryptographic validation = %t/%q, want false/%q", signature.CryptographicValidation, signature.CryptographicValidationStatus, signatureCryptographicValidationUnsupported)
 	}
 }
 
@@ -250,8 +250,8 @@ func TestSecurityMetadataIncludesSignatureDigestDiagnostics(t *testing.T) {
 	if signature.DigestAlgorithm != "sha256" || signature.DigestAlgorithmStatus != signatureDigestAlgorithmContentsOIDHint {
 		t.Fatalf("digest algorithm = %q/%q, want sha256/%q", signature.DigestAlgorithm, signature.DigestAlgorithmStatus, signatureDigestAlgorithmContentsOIDHint)
 	}
-	if signature.CryptographicValidation || signature.CryptographicValidationStatus != signatureCryptographicValidationNotPerformed {
-		t.Fatalf("cryptographic validation = %t/%q, want false/%q", signature.CryptographicValidation, signature.CryptographicValidationStatus, signatureCryptographicValidationNotPerformed)
+	if signature.CryptographicValidation || signature.CryptographicValidationStatus != signatureCryptographicValidationUnsupported {
+		t.Fatalf("cryptographic validation = %t/%q, want false/%q", signature.CryptographicValidation, signature.CryptographicValidationStatus, signatureCryptographicValidationUnsupported)
 	}
 }
 

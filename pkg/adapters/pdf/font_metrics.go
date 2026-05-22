@@ -211,9 +211,11 @@ func textShowSimpleFontCodes(encoded string, encoding string) ([]byte, bool) {
 	switch encoding {
 	case "literal":
 		return []byte(decodeLiteralString(encoded)), true
-	case "hex", "hex-cmap":
+	case "literal-font-encoding":
+		return decodeLiteralBytes(encoded), true
+	case "hex", "hex-cmap", "hex-font-encoding":
 		return decodeHexBytes([]byte(encoded))
-	case "tj-array", "tj-array-cmap":
+	case "tj-array", "tj-array-cmap", "tj-array-font-encoding":
 		return simpleTJArrayFontCodes([]byte(encoded))
 	default:
 		return nil, false
