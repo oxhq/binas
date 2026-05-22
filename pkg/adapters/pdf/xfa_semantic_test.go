@@ -46,6 +46,35 @@ func TestListXFADatasetFieldsFindsDatasetsInsideXDP(t *testing.T) {
 	}
 }
 
+func TestListXFADatasetFieldsWithOptionsFiltersBySelector(t *testing.T) {
+	input := testPDF("<< /Type /Catalog /AcroForm << /XFA [(left) (<datasets><data><field>one</field></data></datasets>) /right (<datasets><data><field>two</field></data></datasets>) (xdp) (<xdp:xdp xmlns:xdp=\"http://ns.adobe.com/xdp/\"><datasets><data><field>three</field></data></datasets></xdp:xdp>)] >> >>")
+
+	fields, err := ListXFADatasetFieldsWithOptions(input, XFADatasetFieldListOptions{
+		Selector: XFASelector{Label: "right"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []XFADatasetField{{PacketIndex: 1, Label: "right", Path: "field", Value: "two"}}
+	if len(fields) != len(want) {
+		t.Fatalf("fields = %+v, want %d field", fields, len(want))
+	}
+	if fields[0] != want[0] {
+		t.Fatalf("field = %+v, want %+v", fields[0], want[0])
+	}
+
+	fields, err = ListXFADatasetFieldsWithOptions(input, XFADatasetFieldListOptions{
+		Selector: XFASelector{PacketKind: "xdp"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fields) != 1 || fields[0].PacketIndex != 2 || fields[0].Label != "xdp" || fields[0].Value != "three" {
+		t.Fatalf("xdp fields = %+v", fields)
+	}
+}
+
 func TestListXFADatasetFieldsRejectsUnsafeXML(t *testing.T) {
 	input := testPDF("<< /Type /Catalog /AcroForm << /XFA [(datasets) (<!DOCTYPE datasets [<!ENTITY secret SYSTEM \"file:///etc/passwd\">]><datasets><data><field>&secret;</field></data></datasets>)] >> >>")
 

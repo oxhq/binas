@@ -22,7 +22,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("expected command: inspect, query, edit, overlay, form, annot, xfa, signature, validate")
+		return errors.New("expected command: inspect, query, edit, overlay, ocr, form, annot, xfa, signature, validate")
 	}
 	switch args[0] {
 	case "inspect":
@@ -33,6 +33,8 @@ func run(args []string) error {
 		return edit(args[1:])
 	case "overlay":
 		return overlay(args[1:])
+	case "ocr":
+		return ocr(args[1:])
 	case "form":
 		return form(args[1:])
 	case "annot":
@@ -46,6 +48,72 @@ func run(args []string) error {
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func ocr(args []string) error {
+	if len(args) == 0 {
+		return errors.New("expected ocr command: text-layer-plan")
+	}
+	switch args[0] {
+	case "text-layer-plan":
+		return ocrTextLayerPlan(args[1:])
+	default:
+		return fmt.Errorf("unknown ocr command %q", args[0])
+	}
+}
+
+func ocrTextLayerPlan(args []string) error {
+	fs := flag.NewFlagSet("ocr text-layer-plan", flag.ContinueOnError)
+	format := fs.String("format", "pdf", "input format")
+	pageIndex := fs.Int("page-index", 0, "zero-based page index")
+	text := fs.String("text", "", "OCR text")
+	xMin := fs.Float64("x-min", 0, "OCR text bounding box minimum x")
+	yMin := fs.Float64("y-min", 0, "OCR text bounding box minimum y")
+	xMax := fs.Float64("x-max", 0, "OCR text bounding box maximum x")
+	yMax := fs.Float64("y-max", 0, "OCR text bounding box maximum y")
+	confidence := fs.Float64("confidence", 0, "OCR confidence from 0 to 1")
+	asJSON := fs.Bool("json", false, "write JSON")
+	if err := fs.Parse(reorderFlags(args, map[string]bool{"json": true}, map[string]bool{
+		"format":     true,
+		"page-index": true,
+		"text":       true,
+		"x-min":      true,
+		"y-min":      true,
+		"x-max":      true,
+		"y-max":      true,
+		"confidence": true,
+	})); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("ocr text-layer-plan requires one input file")
+	}
+	if strings.ToLower(*format) != "pdf" {
+		return fmt.Errorf("ocr text-layer-plan is unsupported for format %q", *format)
+	}
+	input, err := os.ReadFile(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	plan, err := pdf.PlanExplicitOCRTextLayer(input, pdf.OCRTextLayerOptions{
+		PageIndex: *pageIndex,
+		Text:      *text,
+		Box: pdf.OCRTextLayerBox{
+			XMin: *xMin,
+			YMin: *yMin,
+			XMax: *xMax,
+			YMax: *yMax,
+		},
+		Confidence: *confidence,
+	})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return writeJSON(plan)
+	}
+	fmt.Printf("planned %s page=%d confidence=%g\n", plan.Operation, plan.PageIndex, plan.Confidence)
+	return nil
 }
 
 func signature(args []string) error {
@@ -81,7 +149,33 @@ func signatureInspect(args []string) error {
 	if *asJSON {
 		return writeJSON(signature)
 	}
-	fmt.Printf("signature present=%t byte_range_count=%d cryptographic_validation_status=%s\n", signature.Present, signature.ByteRangeCount, signature.CryptographicValidationStatus)
+	parts := []string{
+		fmt.Sprintf("present=%t", signature.Present),
+		fmt.Sprintf("byte_range_status=%s", signature.ByteRangeStatus),
+		fmt.Sprintf("byte_range_count=%d", signature.ByteRangeCount),
+		fmt.Sprintf("byte_range_total_ranges=%d", signature.ByteRangeTotalRanges),
+		fmt.Sprintf("byte_range_covered_bytes=%d", signature.ByteRangeCoveredBytes),
+		fmt.Sprintf("signature_container=%s", signature.SignatureContainer),
+		fmt.Sprintf("digest_algorithm=%s", signature.DigestAlgorithm),
+		fmt.Sprintf("digest_algorithm_status=%s", signature.DigestAlgorithmStatus),
+		fmt.Sprintf("cryptographic_validation_status=%s", signature.CryptographicValidationStatus),
+	}
+	if signature.ObjectNumber != nil && signature.ObjectGeneration != nil {
+		parts = append(parts, fmt.Sprintf("object=%d %d R", *signature.ObjectNumber, *signature.ObjectGeneration))
+	}
+	if signature.Filter != "" {
+		parts = append(parts, fmt.Sprintf("filter=%s", signature.Filter))
+	}
+	if signature.SubFilter != "" {
+		parts = append(parts, fmt.Sprintf("sub_filter=%s", signature.SubFilter))
+	}
+	if signature.ContentsByteLength != nil {
+		parts = append(parts, fmt.Sprintf("contents_byte_length=%d", *signature.ContentsByteLength))
+	}
+	if signature.SigningTime != "" {
+		parts = append(parts, fmt.Sprintf("signing_time=%q", signature.SigningTime))
+	}
+	fmt.Println("signature " + strings.Join(parts, " "))
 	return nil
 }
 
@@ -535,8 +629,10 @@ func xfaList(args []string) error {
 func xfaDatasets(args []string) error {
 	fs := flag.NewFlagSet("xfa datasets", flag.ContinueOnError)
 	format := fs.String("format", "pdf", "input format")
+	packetKind := fs.String("packet-kind", "", "filter XFA dataset packets by conservative packet kind")
+	label := fs.String("label", "", "filter XFA dataset packets by array label")
 	asJSON := fs.Bool("json", false, "write JSON")
-	if err := fs.Parse(reorderFlags(args, map[string]bool{"json": true}, map[string]bool{"format": true})); err != nil {
+	if err := fs.Parse(reorderFlags(args, map[string]bool{"json": true}, map[string]bool{"format": true, "packet-kind": true, "label": true})); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
@@ -549,7 +645,9 @@ func xfaDatasets(args []string) error {
 	if err != nil {
 		return err
 	}
-	fields, err := pdf.ListXFADatasetFields(input)
+	fields, err := pdf.ListXFADatasetFieldsWithOptions(input, pdf.XFADatasetFieldListOptions{
+		Selector: pdf.XFASelector{PacketKind: *packetKind, Label: *label},
+	})
 	if err != nil {
 		return err
 	}

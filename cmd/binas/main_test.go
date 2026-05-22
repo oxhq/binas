@@ -2036,6 +2036,39 @@ func TestCLIXFADatasetsEmitsJSONFields(t *testing.T) {
 	}
 }
 
+func TestCLIXFADatasetsSelectorFiltersJSONFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "xfa-datasets-filtered.pdf")
+	input := pdfFixture(
+		"<< /Type /Catalog /AcroForm << /XFA [(left) (<datasets><data><form><name>Left</name></form></data></datasets>) (datasets) (<datasets><data><form><name>Datasets</name></form></data></datasets>) (xdp) (<xdp:xdp xmlns:xdp=\"http://ns.adobe.com/xdp/\"><datasets><data><form><name>XDP</name></form></data></datasets></xdp:xdp>)] >> >>",
+	)
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{"xfa", "datasets", path, "--format", "pdf", "--packet-kind", "datasets", "--label", "datasets", "--json"})
+	})
+	var result struct {
+		Count  int `json:"count"`
+		Fields []struct {
+			PacketIndex int    `json:"packet_index"`
+			Label       string `json:"label"`
+			Path        string `json:"path"`
+			Value       string `json:"value"`
+		} `json:"fields"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Count != 1 || len(result.Fields) != 1 {
+		t.Fatalf("result = %+v, want one filtered field", result)
+	}
+	field := result.Fields[0]
+	if field.PacketIndex != 1 || field.Label != "datasets" || field.Path != "form.name" || field.Value != "Datasets" {
+		t.Fatalf("filtered field = %+v", field)
+	}
+}
+
 func TestCLIXFADatasetsPlainTextPrintsPathValueLines(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "xfa-datasets-text.pdf")
 	input := pdfFixture(
@@ -2516,6 +2549,127 @@ func TestCLIOverlayTextWritesExplicitFallbackJSON(t *testing.T) {
 	assertCLIQueryCount(t, queryOut, 1)
 }
 
+func TestCLIOCRTextLayerPlanWritesExplicitFallbackJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ocr-plan.pdf")
+	input := pdfFixture(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /Resources << >> >>",
+	)
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{
+			"ocr", "text-layer-plan", path,
+			"--format", "pdf",
+			"--page-index", "0",
+			"--text", "External OCR text",
+			"--x-min", "1",
+			"--y-min", "2",
+			"--x-max", "3",
+			"--y-max", "4",
+			"--confidence", "0.9",
+			"--json",
+		})
+	})
+	var result struct {
+		Operation  string  `json:"operation"`
+		PageIndex  int     `json:"page_index"`
+		Text       string  `json:"text"`
+		Confidence float64 `json:"confidence"`
+		Box        struct {
+			XMin float64 `json:"x_min"`
+			YMin float64 `json:"y_min"`
+			XMax float64 `json:"x_max"`
+			YMax float64 `json:"y_max"`
+		} `json:"box"`
+		Policy struct {
+			Fallback string `json:"fallback"`
+			Mode     string `json:"mode"`
+		} `json:"policy"`
+		Report struct {
+			Edit           string `json:"edit"`
+			FallbackUsed   bool   `json:"fallback_used"`
+			FallbackKind   string `json:"fallback_kind"`
+			FallbackPolicy struct {
+				Fallback string `json:"fallback"`
+				Mode     string `json:"mode"`
+			} `json:"fallback_policy"`
+			NodesModified int `json:"nodes_modified"`
+			MatchIndex    int `json:"match_index"`
+			Meta          struct {
+				Operation   string  `json:"operation"`
+				PlannedOnly bool    `json:"planned_only"`
+				PageIndex   int     `json:"page_index"`
+				Text        string  `json:"text"`
+				Confidence  float64 `json:"confidence"`
+			} `json:"meta"`
+		} `json:"report"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Operation != "pdf.ocr_text_layer_explicit_plan" || result.Report.Edit != result.Operation {
+		t.Fatalf("operation = %q report edit = %q, want OCR text-layer plan", result.Operation, result.Report.Edit)
+	}
+	if result.PageIndex != 0 || result.Text != "External OCR text" || result.Confidence != 0.9 {
+		t.Fatalf("plan = %+v, want caller-provided OCR options", result)
+	}
+	if result.Box.XMin != 1 || result.Box.YMin != 2 || result.Box.XMax != 3 || result.Box.YMax != 4 {
+		t.Fatalf("box = %+v, want caller-provided bounds", result.Box)
+	}
+	if result.Policy.Fallback != "ocr_text_layer" || result.Policy.Mode != "explicit" {
+		t.Fatalf("policy = %+v, want ocr_text_layer/explicit", result.Policy)
+	}
+	if !result.Report.FallbackUsed || result.Report.FallbackKind != "ocr_text_layer" || result.Report.FallbackPolicy.Fallback != "ocr_text_layer" || result.Report.FallbackPolicy.Mode != "explicit" {
+		t.Fatalf("report fallback = used %v kind %q policy %+v, want ocr_text_layer/explicit", result.Report.FallbackUsed, result.Report.FallbackKind, result.Report.FallbackPolicy)
+	}
+	if result.Report.NodesModified != 0 || result.Report.MatchIndex != 0 {
+		t.Fatalf("report = %+v, want planning-only zero modifications", result.Report)
+	}
+	if result.Report.Meta.Operation != "ocr_text_layer" || !result.Report.Meta.PlannedOnly || result.Report.Meta.PageIndex != 0 || result.Report.Meta.Text != "External OCR text" || result.Report.Meta.Confidence != 0.9 {
+		t.Fatalf("meta = %+v, want planning-only OCR metadata", result.Report.Meta)
+	}
+}
+
+func TestCLIOCRTextLayerPlanFailsClosedForInvalidInput(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ocr-plan.pdf")
+	input := pdfFixture(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /Resources << >> >>",
+	)
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, err := captureStdoutAndError(t, func() error {
+		return run([]string{
+			"ocr", "text-layer-plan", path,
+			"--format", "pdf",
+			"--page-index", "0",
+			"--text", "External OCR text",
+			"--x-min", "1",
+			"--y-min", "2",
+			"--x-max", "1",
+			"--y-max", "4",
+			"--confidence", "0.9",
+			"--json",
+		})
+	})
+	if err == nil {
+		t.Fatal("ocr text-layer-plan succeeded, want invalid box error")
+	}
+	if err.Error() != "ocr text-layer bounding box must have positive width and height" {
+		t.Fatalf("error = %q, want invalid bounding box error", err)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want no JSON on invalid OCR plan input", stdout)
+	}
+}
+
 func TestCLIEditPreserveStructureTableXrefUsesAdapterWriterMode(t *testing.T) {
 	path := writeFixture(t)
 	out := filepath.Join(t.TempDir(), "preserve-structure.pdf")
@@ -2623,9 +2777,17 @@ func TestCLISignatureInspectReportsExistingSignatureMetadataAsJSON(t *testing.T)
 	var result struct {
 		Present                       bool   `json:"present"`
 		ByteRangeCount                int    `json:"byte_range_count"`
+		ByteRangeTotalRanges          int    `json:"byte_range_total_ranges"`
+		ByteRangeCoveredBytes         int    `json:"byte_range_covered_bytes"`
+		ByteRangeStatus               string `json:"byte_range_status"`
 		ContentsByteLength            *int   `json:"contents_byte_length"`
+		ObjectNumber                  *int   `json:"object_number"`
+		ObjectGeneration              *int   `json:"object_generation"`
 		Filter                        string `json:"filter"`
 		SubFilter                     string `json:"sub_filter"`
+		SignatureContainer            string `json:"signature_container"`
+		DigestAlgorithm               string `json:"digest_algorithm"`
+		DigestAlgorithmStatus         string `json:"digest_algorithm_status"`
 		CryptographicValidation       bool   `json:"cryptographic_validation"`
 		CryptographicValidationStatus string `json:"cryptographic_validation_status"`
 	}
@@ -2635,14 +2797,80 @@ func TestCLISignatureInspectReportsExistingSignatureMetadataAsJSON(t *testing.T)
 	if !result.Present || result.ByteRangeCount != 2 {
 		t.Fatalf("signature metadata = %+v, want present with two byte ranges", result)
 	}
+	if result.ByteRangeTotalRanges != 2 || result.ByteRangeCoveredBytes != 4 || result.ByteRangeStatus != "valid" {
+		t.Fatalf("byte range summary = count %d covered %d status %q, want 2/4/valid", result.ByteRangeTotalRanges, result.ByteRangeCoveredBytes, result.ByteRangeStatus)
+	}
+	if result.ObjectNumber == nil || *result.ObjectNumber != 5 || result.ObjectGeneration == nil || *result.ObjectGeneration != 0 {
+		t.Fatalf("signature object = %v %v, want 5 0", result.ObjectNumber, result.ObjectGeneration)
+	}
 	if result.ContentsByteLength == nil || *result.ContentsByteLength != 1 {
 		t.Fatalf("contents byte length = %v, want 1", result.ContentsByteLength)
 	}
 	if result.Filter != "Adobe.PPKLite" || result.SubFilter != "adbe.pkcs7.detached" {
 		t.Fatalf("signature filter metadata = %+v", result)
 	}
+	if result.SignatureContainer != "pkcs7" || result.DigestAlgorithm != "unknown" || result.DigestAlgorithmStatus != "not_parsed" {
+		t.Fatalf("signature diagnostics = %+v, want pkcs7/unknown/not_parsed", result)
+	}
 	if result.CryptographicValidation || result.CryptographicValidationStatus != "not_performed" {
 		t.Fatalf("cryptographic validation = %t/%q, want false/not_performed", result.CryptographicValidation, result.CryptographicValidationStatus)
+	}
+}
+
+func TestCLISignatureInspectPlainTextIncludesNonCryptographicHints(t *testing.T) {
+	path := writeSignedTextFixture(t)
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{"signature", "inspect", path, "--format", "pdf"})
+	})
+
+	for _, want := range []string{
+		"signature present=true",
+		"byte_range_status=valid",
+		"byte_range_total_ranges=2",
+		"byte_range_covered_bytes=4",
+		"signature_container=pkcs7",
+		"digest_algorithm=unknown",
+		"digest_algorithm_status=not_parsed",
+		"cryptographic_validation_status=not_performed",
+		"object=5 0 R",
+		"filter=Adobe.PPKLite",
+		"sub_filter=adbe.pkcs7.detached",
+		"contents_byte_length=1",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("signature inspect output = %q, want %q", stdout, want)
+		}
+	}
+}
+
+func TestCLISignatureInspectPlainTextReportsMalformedByteRangeWithoutValidationClaim(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "malformed-signed.pdf")
+	input := pdfFixture(
+		"<< /Type /Catalog /SigFlags 3 >>",
+		"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /ETSI.RFC3161 /ByteRange [0 1 999999 10] /Contents <00> >>",
+	)
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{"signature", "inspect", path, "--format", "pdf"})
+	})
+
+	for _, want := range []string{
+		"signature present=true",
+		"byte_range_status=malformed",
+		"byte_range_count=0",
+		"signature_container=unknown",
+		"digest_algorithm=unknown",
+		"cryptographic_validation_status=not_performed",
+		"object=2 0 R",
+		"sub_filter=ETSI.RFC3161",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("signature inspect output = %q, want %q", stdout, want)
+		}
 	}
 }
 

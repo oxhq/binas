@@ -66,10 +66,13 @@ type SignatureMetadata struct {
 	ByteRangeCount                int    `json:"byte_range_count,omitempty"`
 	ByteRangeTotalRanges          int    `json:"byte_range_total_ranges,omitempty"`
 	ByteRangeCoveredBytes         int    `json:"byte_range_covered_bytes,omitempty"`
+	ByteRangeStatus               string `json:"byte_range_status,omitempty"`
 	ContentsByteLength            *int   `json:"contents_byte_length,omitempty"`
 	SubFilter                     string `json:"sub_filter,omitempty"`
 	Filter                        string `json:"filter,omitempty"`
 	SigningTime                   string `json:"signing_time,omitempty"`
+	ObjectNumber                  *int   `json:"object_number,omitempty"`
+	ObjectGeneration              *int   `json:"object_generation,omitempty"`
 	SignatureContainer            string `json:"signature_container,omitempty"`
 	DigestAlgorithm               string `json:"digest_algorithm,omitempty"`
 	DigestAlgorithmStatus         string `json:"digest_algorithm_status,omitempty"`
@@ -140,10 +143,13 @@ func signatureMetadataFromInfo(info signatureInfo) SignatureMetadata {
 		ByteRangeCount:                info.ByteRangeCount,
 		ByteRangeTotalRanges:          len(info.ByteRanges),
 		ByteRangeCoveredBytes:         byteRangeCoveredBytes,
+		ByteRangeStatus:               info.ByteRangeStatus,
 		ContentsByteLength:            info.ContentsByteLength,
 		SubFilter:                     info.SubFilter,
 		Filter:                        info.Filter,
 		SigningTime:                   info.SigningTime,
+		ObjectNumber:                  info.ObjectNumber,
+		ObjectGeneration:              info.ObjectGeneration,
 		SignatureContainer:            info.SignatureContainer,
 		DigestAlgorithm:               info.DigestAlgorithm,
 		DigestAlgorithmStatus:         info.DigestAlgorithmStatus,

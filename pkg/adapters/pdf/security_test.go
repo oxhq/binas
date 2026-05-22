@@ -210,12 +210,18 @@ func TestSecurityMetadataIncludesDirectSignatureDictionaryMetadata(t *testing.T)
 	if signature.ByteRangeCoveredBytes != 40 {
 		t.Fatalf("ByteRangeCoveredBytes = %d, want 40", signature.ByteRangeCoveredBytes)
 	}
+	if signature.ByteRangeStatus != signatureByteRangeStatusValid {
+		t.Fatalf("ByteRangeStatus = %q, want %q", signature.ByteRangeStatus, signatureByteRangeStatusValid)
+	}
+	if signature.ObjectNumber == nil || *signature.ObjectNumber != 3 || signature.ObjectGeneration == nil || *signature.ObjectGeneration != 0 {
+		t.Fatalf("signature object = %v %v, want 3 0", signature.ObjectNumber, signature.ObjectGeneration)
+	}
 	data, err := json.Marshal(metadata)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := string(data); !strings.Contains(got, `"byte_range_total_ranges":2`) || !strings.Contains(got, `"byte_range_covered_bytes":40`) {
-		t.Fatalf("security JSON = %s, want byte range summary fields", got)
+	if got := string(data); !strings.Contains(got, `"byte_range_total_ranges":2`) || !strings.Contains(got, `"byte_range_covered_bytes":40`) || !strings.Contains(got, `"byte_range_status":"valid"`) || !strings.Contains(got, `"object_number":3`) {
+		t.Fatalf("security JSON = %s, want byte range summary and signature object fields", got)
 	}
 	if signature.ContentsByteLength == nil || *signature.ContentsByteLength != 3 {
 		t.Fatalf("ContentsByteLength = %v, want 3", signature.ContentsByteLength)

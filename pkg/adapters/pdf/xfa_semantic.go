@@ -15,7 +15,15 @@ type XFADatasetFieldUpdateOptions struct {
 	Selector XFASelector
 }
 
+type XFADatasetFieldListOptions struct {
+	Selector XFASelector
+}
+
 func ListXFADatasetFields(input []byte) ([]XFADatasetField, error) {
+	return ListXFADatasetFieldsWithOptions(input, XFADatasetFieldListOptions{})
+}
+
+func ListXFADatasetFieldsWithOptions(input []byte, options XFADatasetFieldListOptions) ([]XFADatasetField, error) {
 	graph, err := parsePDFGraphWithOptions(input, pdfGraphParseOptions{AllowXFA: true})
 	if err != nil {
 		return nil, err
@@ -23,7 +31,7 @@ func ListXFADatasetFields(input []byte) ([]XFADatasetField, error) {
 	packets := xfaPackets(graph, "")
 	fields := make([]XFADatasetField, 0)
 	for i, packet := range packets {
-		if !xfaPacketMayContainDatasets(packet) {
+		if !xfaPacketMayContainDatasets(packet) || !options.Selector.matches(packet.label, packet.kind) {
 			continue
 		}
 		packetFields, err := xfaDatasetFieldsFromPacket(packet.text)

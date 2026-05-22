@@ -11,15 +11,21 @@ const signatureDigestAlgorithmUnknown = "unknown"
 const signatureDigestAlgorithmNotParsed = "not_parsed"
 const signatureDigestAlgorithmSubFilterHint = "sub_filter_hint"
 const signatureDigestAlgorithmContentsOIDHint = "contents_oid_hint"
+const signatureByteRangeStatusAbsent = "absent"
+const signatureByteRangeStatusValid = "valid"
+const signatureByteRangeStatusMalformed = "malformed"
 
 type signatureInfo struct {
 	HasSignatureMarker            bool
 	ByteRanges                    []signatureByteRange
 	ByteRangeCount                int
+	ByteRangeStatus               string
 	ContentsByteLength            *int
 	SubFilter                     string
 	Filter                        string
 	SigningTime                   string
+	ObjectNumber                  *int
+	ObjectGeneration              *int
 	SignatureContainer            string
 	DigestAlgorithm               string
 	DigestAlgorithmStatus         string
@@ -31,6 +37,7 @@ type signatureInfo struct {
 func inspectSignatureInfo(input []byte) signatureInfo {
 	info := signatureInfo{
 		HasSignatureMarker:            hasPDFSignatureBoundary(input),
+		ByteRangeStatus:               signatureByteRangeStatusAbsent,
 		SignatureContainer:            signatureContainerUnknown,
 		DigestAlgorithm:               signatureDigestAlgorithmUnknown,
 		DigestAlgorithmStatus:         signatureDigestAlgorithmNotParsed,
@@ -44,11 +51,13 @@ func inspectSignatureInfo(input []byte) signatureInfo {
 	ranges, err := signatureByteRanges(input)
 	if err != nil {
 		info.MalformedByteRangeError = err
+		info.ByteRangeStatus = signatureByteRangeStatusMalformed
 		return info
 	}
 
 	info.ByteRanges = ranges
 	info.ByteRangeCount = len(ranges)
+	info.ByteRangeStatus = signatureByteRangeStatusValid
 	return info
 }
 
@@ -56,7 +65,14 @@ func applySignatureDictionaryMetadata(info *signatureInfo, input []byte) {
 	if info == nil || len(input) == 0 {
 		return
 	}
-	for _, dict := range signatureDictionariesForInput(input) {
+	for _, signatureDict := range signatureDictionariesForInput(input) {
+		dict := signatureDict.Dict
+		if info.ObjectNumber == nil && signatureDict.ObjectID != nil {
+			number := signatureDict.ObjectID.Number
+			generation := signatureDict.ObjectID.Generation
+			info.ObjectNumber = &number
+			info.ObjectGeneration = &generation
+		}
 		contents, hasContents := signatureContentsBytes(dict)
 		if info.ContentsByteLength == nil {
 			if hasContents {
@@ -80,13 +96,18 @@ func applySignatureDictionaryMetadata(info *signatureInfo, input []byte) {
 			}
 		}
 		applySignatureDigestHints(info, contents, hasContents)
-		if info.ContentsByteLength != nil && info.SubFilter != "" && info.Filter != "" && info.SigningTime != "" && info.SignatureContainer != signatureContainerUnknown && info.DigestAlgorithm != signatureDigestAlgorithmUnknown {
+		if info.ObjectNumber != nil && info.ContentsByteLength != nil && info.SubFilter != "" && info.Filter != "" && info.SigningTime != "" && info.SignatureContainer != signatureContainerUnknown && info.DigestAlgorithm != signatureDigestAlgorithmUnknown {
 			return
 		}
 	}
 }
 
-func signatureDictionariesForInput(input []byte) []pdfDict {
+type signatureDictionaryInfo struct {
+	Dict     pdfDict
+	ObjectID *pdfObjectID
+}
+
+func signatureDictionariesForInput(input []byte) []signatureDictionaryInfo {
 	graph, err := parsePDFGraphWithOptions(input, pdfGraphParseOptions{
 		AllowSignature: true,
 		AllowXFA:       true,
@@ -94,32 +115,40 @@ func signatureDictionariesForInput(input []byte) []pdfDict {
 	if err != nil || graph == nil {
 		return nil
 	}
-	dicts := make([]pdfDict, 0)
+	dicts := make([]signatureDictionaryInfo, 0)
 	for _, object := range sortedPDFObjects(graph.Objects) {
-		collectSignatureDictionaries(object.Value, &dicts, 0)
+		collectSignatureDictionaries(object.Value, &dicts, &object.ID, true, 0)
 	}
 	return dicts
 }
 
-func collectSignatureDictionaries(value pdfValue, out *[]pdfDict, depth int) {
+func collectSignatureDictionaries(value pdfValue, out *[]signatureDictionaryInfo, objectID *pdfObjectID, topLevel bool, depth int) {
 	if depth > 32 {
 		return
 	}
 	switch v := value.(type) {
 	case pdfDict:
 		if isSignatureDictionary(v) {
-			*out = append(*out, v)
+			*out = append(*out, signatureDictionaryInfo{Dict: v, ObjectID: indirectObjectIDForSignatureDictionary(objectID, topLevel)})
 		}
 		for _, child := range v {
-			collectSignatureDictionaries(child, out, depth+1)
+			collectSignatureDictionaries(child, out, nil, false, depth+1)
 		}
 	case pdfArray:
 		for _, child := range v {
-			collectSignatureDictionaries(child, out, depth+1)
+			collectSignatureDictionaries(child, out, nil, false, depth+1)
 		}
 	case pdfStreamObject:
-		collectSignatureDictionaries(v.Dict, out, depth+1)
+		collectSignatureDictionaries(v.Dict, out, objectID, topLevel, depth+1)
 	}
+}
+
+func indirectObjectIDForSignatureDictionary(objectID *pdfObjectID, topLevel bool) *pdfObjectID {
+	if objectID == nil || !topLevel {
+		return nil
+	}
+	id := *objectID
+	return &id
 }
 
 func isSignatureDictionary(dict pdfDict) bool {

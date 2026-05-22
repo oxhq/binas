@@ -14,6 +14,9 @@ func TestSignatureInfoNoSignature(t *testing.T) {
 	if info.ByteRangeCount != 0 || len(info.ByteRanges) != 0 {
 		t.Fatalf("byte ranges = count %d values %+v, want none", info.ByteRangeCount, info.ByteRanges)
 	}
+	if info.ByteRangeStatus != signatureByteRangeStatusAbsent {
+		t.Fatalf("ByteRangeStatus = %q, want %q", info.ByteRangeStatus, signatureByteRangeStatusAbsent)
+	}
 	if info.MalformedByteRangeError != nil {
 		t.Fatalf("MalformedByteRangeError = %v, want nil", info.MalformedByteRangeError)
 	}
@@ -33,6 +36,9 @@ func TestSignatureInfoValidByteRange(t *testing.T) {
 	}
 	if info.ByteRangeCount != 2 {
 		t.Fatalf("ByteRangeCount = %d, want 2", info.ByteRangeCount)
+	}
+	if info.ByteRangeStatus != signatureByteRangeStatusValid {
+		t.Fatalf("ByteRangeStatus = %q, want %q", info.ByteRangeStatus, signatureByteRangeStatusValid)
 	}
 	if len(info.ByteRanges) != 2 {
 		t.Fatalf("ByteRanges length = %d, want 2", len(info.ByteRanges))
@@ -66,6 +72,9 @@ func TestSignatureInfoDirectSignatureDictionaryMetadata(t *testing.T) {
 	}
 	if info.ContentsByteLength == nil || *info.ContentsByteLength != 3 {
 		t.Fatalf("ContentsByteLength = %v, want 3", info.ContentsByteLength)
+	}
+	if info.ObjectNumber == nil || *info.ObjectNumber != 3 || info.ObjectGeneration == nil || *info.ObjectGeneration != 0 {
+		t.Fatalf("signature object = %v %v, want 3 0", info.ObjectNumber, info.ObjectGeneration)
 	}
 	if info.SubFilter != "adbe.pkcs7.detached" {
 		t.Fatalf("SubFilter = %q, want adbe.pkcs7.detached", info.SubFilter)
@@ -199,6 +208,9 @@ func TestSignatureInfoMalformedByteRange(t *testing.T) {
 	}
 	if info.ByteRangeCount != 0 || len(info.ByteRanges) != 0 {
 		t.Fatalf("byte ranges = count %d values %+v, want none", info.ByteRangeCount, info.ByteRanges)
+	}
+	if info.ByteRangeStatus != signatureByteRangeStatusMalformed {
+		t.Fatalf("ByteRangeStatus = %q, want %q", info.ByteRangeStatus, signatureByteRangeStatusMalformed)
 	}
 	if !errors.Is(info.MalformedByteRangeError, ErrSignedPDFByteRangeProofRequired) {
 		t.Fatalf("MalformedByteRangeError = %v, want ErrSignedPDFByteRangeProofRequired", info.MalformedByteRangeError)
