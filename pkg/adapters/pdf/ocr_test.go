@@ -126,6 +126,99 @@ func TestOCRTextLayerFallbackRemainsSeparateFromTrueEdit(t *testing.T) {
 	}
 }
 
+func TestPlanExplicitOCRTextLayerJSONPlansArrayItems(t *testing.T) {
+	input := testPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+		"<< /Type /Page /Parent 2 0 R /Resources << >> >>",
+		"<< /Type /Page /Parent 2 0 R /Resources << >> >>",
+	)
+	jsonInput := []byte(`[
+		{"page_index":0,"text":"First page OCR","box":{"x_min":10,"y_min":20,"x_max":110,"y_max":45},"confidence":0.82},
+		{"page_index":1,"text":"Second page OCR","box":{"x_min":5,"y_min":6,"x_max":50,"y_max":60},"confidence":1}
+	]`)
+
+	plans, err := PlanExplicitOCRTextLayerJSON(input, jsonInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(plans) != 2 {
+		t.Fatalf("plans len = %d, want 2", len(plans))
+	}
+	if plans[0].PageIndex != 0 || plans[0].Text != "First page OCR" || plans[1].PageIndex != 1 || plans[1].Text != "Second page OCR" {
+		t.Fatalf("plans = %+v, want OCR plans in input order", plans)
+	}
+	for _, plan := range plans {
+		if plan.Operation != explicitOCRTextLayerOperation {
+			t.Fatalf("operation = %q, want %q", plan.Operation, explicitOCRTextLayerOperation)
+		}
+		if plan.Policy.Fallback != string(FallbackOCRTextLayer) || plan.Policy.Mode != string(FallbackModeExplicit) {
+			t.Fatalf("plan policy = %+v, want ocr_text_layer/explicit", plan.Policy)
+		}
+		if plan.Report.NodesModified != 0 || !plan.Report.FallbackUsed || plan.Report.FallbackKind != string(FallbackOCRTextLayer) {
+			t.Fatalf("report = %+v, want planning-only explicit OCR fallback metadata", plan.Report)
+		}
+	}
+}
+
+func TestPlanExplicitOCRTextLayerJSONPlansWrapperItems(t *testing.T) {
+	input := testPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /Resources << >> >>",
+	)
+	jsonInput := []byte(`{"items":[
+		{"page_index":0,"text":"Wrapped OCR","box":{"x_min":1,"y_min":2,"x_max":3,"y_max":4},"confidence":0}
+	]}`)
+
+	plans, err := PlanExplicitOCRTextLayerJSON(input, jsonInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(plans) != 1 {
+		t.Fatalf("plans len = %d, want 1", len(plans))
+	}
+	if plans[0].Text != "Wrapped OCR" || plans[0].Policy.Fallback != string(FallbackOCRTextLayer) {
+		t.Fatalf("plan = %+v, want wrapped explicit OCR text-layer plan", plans[0])
+	}
+}
+
+func TestPlanExplicitOCRTextLayerJSONRejectsBadPayloads(t *testing.T) {
+	input := testPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /Resources << >> >>",
+	)
+
+	tests := []struct {
+		name      string
+		jsonInput string
+	}{
+		{name: "empty input", jsonInput: ""},
+		{name: "malformed json", jsonInput: `{"items":[`},
+		{name: "unknown top-level shape", jsonInput: `{"rows":[]}`},
+		{name: "empty array", jsonInput: `[]`},
+		{name: "empty wrapper items", jsonInput: `{"items":[]}`},
+		{name: "missing confidence", jsonInput: `[{"page_index":0,"text":"OCR","box":{"x_min":1,"y_min":2,"x_max":3,"y_max":4}}]`},
+		{name: "missing box coordinate", jsonInput: `[{"page_index":0,"text":"OCR","box":{"x_min":1,"y_min":2,"x_max":3},"confidence":1}]`},
+		{name: "negative page index", jsonInput: `[{"page_index":-1,"text":"OCR","box":{"x_min":1,"y_min":2,"x_max":3,"y_max":4},"confidence":1}]`},
+		{name: "out of range page index", jsonInput: `[{"page_index":1,"text":"OCR","box":{"x_min":1,"y_min":2,"x_max":3,"y_max":4},"confidence":1}]`},
+		{name: "blank text", jsonInput: `[{"page_index":0,"text":" \t\n","box":{"x_min":1,"y_min":2,"x_max":3,"y_max":4},"confidence":1}]`},
+		{name: "invalid box", jsonInput: `[{"page_index":0,"text":"OCR","box":{"x_min":1,"y_min":2,"x_max":1,"y_max":4},"confidence":1}]`},
+		{name: "bad confidence", jsonInput: `[{"page_index":0,"text":"OCR","box":{"x_min":1,"y_min":2,"x_max":3,"y_max":4},"confidence":1.01}]`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := PlanExplicitOCRTextLayerJSON(input, []byte(tt.jsonInput)); err == nil {
+				t.Fatal("expected OCR JSON ingestion to fail closed")
+			}
+		})
+	}
+}
+
 func withOCROption(opts OCRTextLayerOptions, mutate func(*OCRTextLayerOptions)) OCRTextLayerOptions {
 	mutate(&opts)
 	return opts

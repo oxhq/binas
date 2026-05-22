@@ -1,8 +1,11 @@
 package pdf
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"strings"
 
@@ -33,6 +36,76 @@ type OCRTextLayerPlan struct {
 	Confidence float64             `json:"confidence"`
 	Report     core.Report         `json:"report"`
 	Policy     core.FallbackPolicy `json:"policy"`
+}
+
+type ocrTextLayerJSONItem struct {
+	PageIndex  *int                 `json:"page_index"`
+	Text       *string              `json:"text"`
+	Box        *ocrTextLayerJSONBox `json:"box"`
+	Confidence *float64             `json:"confidence"`
+}
+
+type ocrTextLayerJSONBox struct {
+	XMin *float64 `json:"x_min"`
+	YMin *float64 `json:"y_min"`
+	XMax *float64 `json:"x_max"`
+	YMax *float64 `json:"y_max"`
+}
+
+func ParseOCRTextLayerJSON(input []byte) ([]OCRTextLayerOptions, error) {
+	trimmed := bytes.TrimSpace(input)
+	if len(trimmed) == 0 {
+		return nil, errors.New("ocr text-layer JSON input cannot be empty")
+	}
+
+	var items []ocrTextLayerJSONItem
+	switch trimmed[0] {
+	case '[':
+		if err := decodeOCRTextLayerJSON(trimmed, &items); err != nil {
+			return nil, err
+		}
+	case '{':
+		var wrapper struct {
+			Items []ocrTextLayerJSONItem `json:"items"`
+		}
+		if err := decodeOCRTextLayerJSON(trimmed, &wrapper); err != nil {
+			return nil, err
+		}
+		items = wrapper.Items
+	default:
+		return nil, errors.New("ocr text-layer JSON must be an array or object with items")
+	}
+
+	if len(items) == 0 {
+		return nil, errors.New("ocr text-layer JSON must contain at least one item")
+	}
+
+	opts := make([]OCRTextLayerOptions, 0, len(items))
+	for i, item := range items {
+		opt, err := item.toOptions()
+		if err != nil {
+			return nil, fmt.Errorf("ocr text-layer item %d: %w", i, err)
+		}
+		opts = append(opts, opt)
+	}
+	return opts, nil
+}
+
+func PlanExplicitOCRTextLayerJSON(pdfBytes, jsonBytes []byte) ([]OCRTextLayerPlan, error) {
+	opts, err := ParseOCRTextLayerJSON(jsonBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	plans := make([]OCRTextLayerPlan, 0, len(opts))
+	for i, opt := range opts {
+		plan, err := PlanExplicitOCRTextLayer(pdfBytes, opt)
+		if err != nil {
+			return nil, fmt.Errorf("ocr text-layer item %d: %w", i, err)
+		}
+		plans = append(plans, plan)
+	}
+	return plans, nil
 }
 
 func PlanExplicitOCRTextLayer(input []byte, opts OCRTextLayerOptions) (OCRTextLayerPlan, error) {
@@ -105,4 +178,62 @@ func (b OCRTextLayerBox) validate() error {
 		return errors.New("ocr text-layer bounding box must have positive width and height")
 	}
 	return nil
+}
+
+func decodeOCRTextLayerJSON(input []byte, v any) error {
+	decoder := json.NewDecoder(bytes.NewReader(input))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(v); err != nil {
+		return fmt.Errorf("invalid ocr text-layer JSON: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("invalid ocr text-layer JSON: multiple top-level values")
+	}
+	return nil
+}
+
+func (item ocrTextLayerJSONItem) toOptions() (OCRTextLayerOptions, error) {
+	if item.PageIndex == nil {
+		return OCRTextLayerOptions{}, errors.New("page_index is required")
+	}
+	if item.Text == nil {
+		return OCRTextLayerOptions{}, errors.New("text is required")
+	}
+	if item.Box == nil {
+		return OCRTextLayerOptions{}, errors.New("box is required")
+	}
+	if item.Confidence == nil {
+		return OCRTextLayerOptions{}, errors.New("confidence is required")
+	}
+	box, err := item.Box.toBox()
+	if err != nil {
+		return OCRTextLayerOptions{}, err
+	}
+	return OCRTextLayerOptions{
+		PageIndex:  *item.PageIndex,
+		Text:       *item.Text,
+		Box:        box,
+		Confidence: *item.Confidence,
+	}, nil
+}
+
+func (b ocrTextLayerJSONBox) toBox() (OCRTextLayerBox, error) {
+	if b.XMin == nil {
+		return OCRTextLayerBox{}, errors.New("box.x_min is required")
+	}
+	if b.YMin == nil {
+		return OCRTextLayerBox{}, errors.New("box.y_min is required")
+	}
+	if b.XMax == nil {
+		return OCRTextLayerBox{}, errors.New("box.x_max is required")
+	}
+	if b.YMax == nil {
+		return OCRTextLayerBox{}, errors.New("box.y_max is required")
+	}
+	return OCRTextLayerBox{
+		XMin: *b.XMin,
+		YMin: *b.YMin,
+		XMax: *b.XMax,
+		YMax: *b.YMax,
+	}, nil
 }

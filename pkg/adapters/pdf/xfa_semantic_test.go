@@ -186,6 +186,106 @@ func TestApplyXFADatasetFieldUpdateWithOptionsRejectsContainerPath(t *testing.T)
 	}
 }
 
+func TestListXFATemplateDatasetMappingsMapsExactTemplatePath(t *testing.T) {
+	input := testPDF("<< /Type /Catalog /AcroForm << /XFA [(template) (<template><subform name=\"form1\"><field name=\"form1.payer.name\"/></subform></template>) (datasets) (<datasets><data><form1><payer><name>David</name></payer><amount>42</amount></form1></data></datasets>)] >> >>")
+
+	mappings, err := ListXFATemplateDatasetMappings(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []XFATemplateDatasetMapping{{
+		FieldName:           "form1.payer.name",
+		DatasetPath:         "form1.payer.name",
+		Value:               "David",
+		TemplatePacketIndex: 0,
+		DatasetPacketIndex:  1,
+		Label:               "template",
+	}}
+	if len(mappings) != len(want) {
+		t.Fatalf("mappings = %+v, want %d mapping", mappings, len(want))
+	}
+	if mappings[0] != want[0] {
+		t.Fatalf("mapping = %+v, want %+v", mappings[0], want[0])
+	}
+}
+
+func TestListXFATemplateDatasetMappingsMapsUniqueLeafName(t *testing.T) {
+	input := testPDF("<< /Type /Catalog /AcroForm << /XFA [(template) (<template><field name=\"email\"/></template>) (datasets) (<datasets><data><form1><payer><name>David</name><email>david@example.test</email></payer></form1></data></datasets>)] >> >>")
+
+	mappings, err := ListXFATemplateDatasetMappings(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(mappings) != 1 {
+		t.Fatalf("mappings = %+v, want one mapping", mappings)
+	}
+	if mappings[0].FieldName != "email" || mappings[0].DatasetPath != "form1.payer.email" || mappings[0].Value != "david@example.test" {
+		t.Fatalf("mapping = %+v", mappings[0])
+	}
+}
+
+func TestListXFATemplateDatasetMappingsOmitsAmbiguousLeafName(t *testing.T) {
+	input := testPDF("<< /Type /Catalog /AcroForm << /XFA [(template) (<template><field name=\"name\"/><field name=\"form1.payer.email\"/></template>) (datasets) (<datasets><data><form1><payer><name>David</name><email>david@example.test</email></payer><recipient><name>Ana</name></recipient></form1></data></datasets>)] >> >>")
+
+	mappings, err := ListXFATemplateDatasetMappings(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(mappings) != 1 {
+		t.Fatalf("mappings = %+v, want one non-ambiguous mapping", mappings)
+	}
+	if mappings[0].FieldName != "form1.payer.email" || mappings[0].DatasetPath != "form1.payer.email" {
+		t.Fatalf("mapping = %+v", mappings[0])
+	}
+}
+
+func TestListXFATemplateDatasetMappingsRejectsUnsafeTemplateXML(t *testing.T) {
+	input := testPDF("<< /Type /Catalog /AcroForm << /XFA [(template) (<!DOCTYPE template [<!ENTITY secret SYSTEM \"file:///etc/passwd\">]><template><field name=\"field\"/></template>) (datasets) (<datasets><data><field>old</field></data></datasets>)] >> >>")
+
+	_, err := ListXFATemplateDatasetMappings(input)
+	if err == nil {
+		t.Fatal("expected unsafe template XML to fail closed")
+	}
+	if err.Error() != "XFA template packet 0: unsafe XML declaration: DOCTYPE and ENTITY are not supported" {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestListXFATemplateDatasetMappingsDoesNotOpenUnsupportedEditBoundary(t *testing.T) {
+	content := []byte("BT\n(old) Tj\nET\n")
+	input := testPDF(
+		"<< /Type /Catalog /AcroForm << /XFA [(template) (<template><field name=\"field\"/></template>) (datasets) (<datasets><data><field>old</field></data></datasets>)] /Fields [] >> >>",
+		string(bytes.Join([][]byte{
+			[]byte("<< /Length 15 >>"),
+			[]byte("stream"),
+			content,
+			[]byte("endstream"),
+		}, []byte("\n"))),
+	)
+
+	mappings, err := ListXFATemplateDatasetMappings(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mappings) != 1 || mappings[0].DatasetPath != "field" || mappings[0].Value != "old" {
+		t.Fatalf("mappings = %+v", mappings)
+	}
+
+	output, report, verification, err := ApplyCanonicalEdit(input, core.Match{Kind: KindTextShow, Text: "old"}, core.Mutation{Replace: "new"}, nil)
+	if err == nil {
+		t.Fatal("expected canonical edit to keep refusing XFA")
+	}
+	if err.Error() != "unsupported PDF: XFA forms are not implemented" {
+		t.Fatalf("error = %q", err)
+	}
+	if output != nil || report.FallbackUsed || verification.ReparseOK {
+		t.Fatalf("generic XFA refusal leaked output/report/verification: output=%q report=%+v verification=%+v", output, report, verification)
+	}
+}
+
 func TestXFADatasetReadDoesNotOpenUnsupportedEditBoundary(t *testing.T) {
 	content := []byte("BT\n(old) Tj\nET\n")
 	input := testPDF(

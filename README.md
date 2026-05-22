@@ -27,6 +27,17 @@ python -m http.server 8765
 # Open http://127.0.0.1:8765/cmd/binas-wasm/editor.html
 ```
 
+Go consumers can use the v0 API without shelling out:
+
+```go
+output, report, verification, err := pdfapi.New(input).
+	Rewrite(pdfapi.RewriteModeAuto).
+	FindText("Invoice #1234").
+	ReplaceWith("Invoice #5678").
+	Verify("reparse", "old-gone", "new-selectable", "page-count-unchanged", "no-fallback").
+	Bytes()
+```
+
 The main `edit` mode rewrites direct PDF literal-string text, supported hex-string text, and literal/hex `TJ` array text inside raw/uncompressed content streams, direct `/Filter /FlateDecode`, `/Filter /LZWDecode`, `/Filter /ASCIIHexDecode`, `/Filter /ASCII85Decode`, and `/Filter /RunLengthDecode` streams, their standard abbreviations `/Fl`, `/LZW`, `/AHx`, `/A85`, and `/RL`, and filter arrays made only from those reversible filters after abbreviation normalization. Non-null `/DecodeParms` support is implemented for Flate and LZW filter positions, including resolved indirect parameter dictionaries/arrays and resolved indirect dictionary/null entries inside parameter arrays. Edits can rewrite to a different encoded length, update the direct length or referenced length object, rebuild a basic xref table/trailer, and reparse the output for verification. It does not use overlay, stamp, or OCR fallback.
 
 See [docs/release-surface.md](docs/release-surface.md) for the current CLI output contract, validation behavior, inspect metadata, and failure modes. See [docs/pdf-semantic-boundaries.md](docs/pdf-semantic-boundaries.md) for the semantic guardrails around encryption, signatures, XFA, AcroForm, annotations, and font/CMap markers. See [docs/w8ben-variable-length-rewrite.md](docs/w8ben-variable-length-rewrite.md) for the W-8BEN proof commands, current support boundaries, and incremental roadmap.
@@ -64,7 +75,8 @@ Current residual boundaries:
 
 - `pkg/core`: span-preserving tree, selector, adapter, edit plan, report, and verification types.
 - `pkg/adapters/pdf`: PDF detection, object graph parsing, xref summary helpers, stream scanning with encoded/decoded length metadata, text-show node parsing, `TJ` array parsing/rewrite, variable-length literal-string rewrite, direct and indirect `/Length` update, generation-aware xref rebuild, incremental-update helpers with a public append-only signed text-edit path for parseable `/ByteRange` shapes, supported ASCIIHexDecode, ASCII85Decode, RunLengthDecode, FlateDecode, LZWDecode plus standard abbreviation aliases, direct and resolved indirect `/DecodeParms` handling for Flate/LZW predictors and LZW EarlyChange, explicit-password Standard Security RC4/AESV2 graph parse/edit/re-encryption for supported R2/R3/R4 files, conservative simple-font width metadata, AcroForm/XFA/annotation semantic helpers with simple appearance generation paths, page font-scoped ToUnicode CMap support including CMap-backed hex `TJ` arrays, and verification.
-- `cmd/binas`: CLI for `inspect`, `validate`, `query`, `edit`, `form`, `annot`, and `xfa`.
+- `pkg/pdfapi`: v0 Go API and fluent DSL for inspect, validate, query, and verified text rewrite over PDF bytes. `RewriteModeAuto` currently uses the canonical rewrite path; this is an integration foundation, not a completed GoPDF consumer proof.
+- `cmd/binas`: CLI for `inspect`, `validate`, `query`, `edit`, `overlay`, `ocr`, `form`, `annot`, `xfa`, and `signature`.
 - `cmd/binas-wasm`: browser/WASM entrypoint exposing inspect, query, and verified text edit helpers over `Uint8Array` PDF bytes, plus local `smoke.html` and a rendered `editor.html` browser editor. The editor loads Go WASM, loads PDF.js from a pinned CDN or manually selected local files, renders pages to canvas, navigates pages, zooms, overlays exact text highlights from PDF.js text content, runs verified WASM edits, rerenders edited bytes, and downloads the edited PDF.
 
 ## Verification
