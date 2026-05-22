@@ -193,7 +193,7 @@ func TestApplyFormFieldEditFailsClosedForComplexKidTreeSynchronization(t *testin
 	if err == nil {
 		t.Fatal("expected complex child tree synchronization error")
 	}
-	if !strings.Contains(err.Error(), "complex child field tree has nested /Kids") {
+	if err.Error() != "unsupported AcroForm field edit: nested_kids, named_non_widget_kid" {
 		t.Fatalf("error = %q", err)
 	}
 }
@@ -482,6 +482,100 @@ func TestListFormFieldsReportsAppearanceGenerationStatus(t *testing.T) {
 		if !bytes.Contains(encoded, []byte(key)) {
 			t.Fatalf("encoded metadata missing %s: %s", key, encoded)
 		}
+	}
+}
+
+func TestListFormFieldsReportsFillCapabilityBlockers(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R 4 0 R 5 0 R 6 0 R] >>",
+		"<< /FT /Tx /T (payer.name) /V (Old Name) /Rect [0 0 120 20] >>",
+		"<< /FT /Tx /T (payer.rich) /V (Old Name) /RV (<b>Old Name</b>) /Rect [0 0 120 20] >>",
+		"<< /FT /Tx /T (payer.action) /V (Old Name) /Rect [0 0 120 20] /A << /S /JavaScript /JS (app.alert\\(1\\)) >> >>",
+		"<< /FT /Btn /T (payer.accept) /V /Off /AS /Off /AP << /N << /Off <<>> /Yes <<>> >> >> >>",
+	)
+
+	fields, err := ListFormFields(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fields) != 4 {
+		t.Fatalf("field count = %d, want 4: %+v", len(fields), fields)
+	}
+	if fields[0].FillStatus != "supported" || len(fields[0].FillBlockers) != 0 {
+		t.Fatalf("plain fill metadata = %q blockers %+v", fields[0].FillStatus, fields[0].FillBlockers)
+	}
+	if fields[1].FillStatus != "unsafe" {
+		t.Fatalf("rich fill status = %q, want unsafe", fields[1].FillStatus)
+	}
+	assertStringSliceEqual(t, fields[1].FillBlockers, []string{"rich_text_value"})
+	if fields[2].FillStatus != "unsafe" {
+		t.Fatalf("action fill status = %q, want unsafe", fields[2].FillStatus)
+	}
+	assertStringSliceEqual(t, fields[2].FillBlockers, []string{"field_action", "field_javascript_action"})
+	if fields[3].FillStatus != "supported" || len(fields[3].FillBlockers) != 0 {
+		t.Fatalf("button fill metadata = %q blockers %+v", fields[3].FillStatus, fields[3].FillBlockers)
+	}
+
+	encoded, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{`"fill_status":"supported"`, `"fill_status":"unsafe"`, `"fill_blockers":["field_action","field_javascript_action"]`} {
+		if !bytes.Contains(encoded, []byte(key)) {
+			t.Fatalf("encoded metadata missing %s: %s", key, encoded)
+		}
+	}
+}
+
+func TestApplyFormFieldEditRejectsRichTextWithoutRegeneration(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /FT /Tx /T (payer.name) /V (Old Name) /RV (<b>Old Name</b>) /Rect [0 0 120 20] >>",
+	)
+
+	_, _, _, err := ApplyFormFieldEdit(input, "payer.name", "New Name")
+	if err == nil {
+		t.Fatal("expected rich text fail-closed error")
+	}
+	if err.Error() != "unsupported AcroForm field edit: rich_text_value" {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestApplyFormFieldEditRejectsActionBackedWidget(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /FT /Tx /T (payer.name) /V (Old Name) /Kids [4 0 R] >>",
+		"<< /Subtype /Widget /Parent 3 0 R /Rect [0 0 120 20] /AA << /Fo << /S /JavaScript /JS (app.alert\\(1\\)) >> >> >>",
+	)
+
+	_, _, _, err := ApplyFormFieldEdit(input, "payer.name", "New Name")
+	if err == nil {
+		t.Fatal("expected action-backed widget fail-closed error")
+	}
+	if err.Error() != "unsupported AcroForm field edit: widget_additional_actions, widget_javascript_action" {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestApplyFormFieldEditRejectsUnsafeFieldTreeBeforeWriting(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R] >>",
+		"<< /FT /Tx /T (payer.address) /V (Old Parent) /Kids [4 0 R] >>",
+		"<< /T (payer.address) /V (Old Complex Child) /Kids [5 0 R] /Parent 3 0 R >>",
+		"<< /Subtype /Widget /V (Old Widget) /Parent 4 0 R >>",
+	)
+
+	_, _, _, err := ApplyFormFieldEdit(input, "payer.address", "New Address")
+	if err == nil {
+		t.Fatal("expected unsafe field tree fail-closed error")
+	}
+	if err.Error() != "unsupported AcroForm field edit: nested_kids, named_non_widget_kid" {
+		t.Fatalf("error = %q", err)
 	}
 }
 

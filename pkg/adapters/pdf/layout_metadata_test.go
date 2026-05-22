@@ -1,6 +1,7 @@
 package pdf
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -132,6 +133,15 @@ func TestLayoutMetadataFailClosedErrorIncludesDecodeFontEncodingAndWidthProof(t 
 	if err == nil {
 		t.Fatal("expected replacement requiring reflow to fail closed")
 	}
+	unsupported := requireTextReplacementUnsupportedError(t, err, textReplacementUnsupportedReflowRequired)
+	assertLayoutReportMetadata(t, unsupported.Metadata, map[string]any{
+		"text_editability_status": textEditabilityStatusUnsupported,
+		"unsupported_reason":      textReplacementUnsupportedReflowRequired,
+		"width_proof":             textWidthProofStatusReflowRequired,
+		"reflow_required":         true,
+		"font_metrics_source":     "simple_font_widths",
+		"width_source":            "/Widths",
+	})
 	got := err.Error()
 	for _, want := range []string{
 		"layout_proof=reflow_required",
@@ -146,6 +156,39 @@ func TestLayoutMetadataFailClosedErrorIncludesDecodeFontEncodingAndWidthProof(t 
 			t.Fatalf("error = %q, want metadata %q", got, want)
 		}
 	}
+}
+
+func TestLayoutMetadataSharedFormXObjectRefusalIsMachineReadable(t *testing.T) {
+	err := sharedFormXObjectIsolationError(map[string]any{
+		"form_object_number":               7,
+		"form_invocation_count":            2,
+		"form_invoked_page_object_numbers": []int{3, 4},
+		"shared_form_xobject":              true,
+	})
+
+	unsupported := requireTextReplacementUnsupportedError(t, err, textReplacementUnsupportedSharedFormXObject)
+	assertLayoutReportMetadata(t, unsupported.Metadata, map[string]any{
+		"text_editability_status": textEditabilityStatusUnsupported,
+		"unsupported_reason":      textReplacementUnsupportedSharedFormXObject,
+		"shared_form_xobject":     true,
+		"form_object_number":      7,
+		"form_invocation_count":   2,
+	})
+	if !strings.Contains(err.Error(), "shared Form XObject edit isolation") {
+		t.Fatalf("error = %q, want shared Form XObject refusal", err)
+	}
+}
+
+func requireTextReplacementUnsupportedError(t *testing.T, err error, wantReason string) *TextReplacementUnsupportedError {
+	t.Helper()
+	var unsupported *TextReplacementUnsupportedError
+	if !errors.As(err, &unsupported) {
+		t.Fatalf("error %T %[1]v, want TextReplacementUnsupportedError", err)
+	}
+	if unsupported.Reason != wantReason {
+		t.Fatalf("unsupported reason = %q, want %q; metadata=%+v", unsupported.Reason, wantReason, unsupported.Metadata)
+	}
+	return unsupported
 }
 
 func assertLayoutReportMetadata(t *testing.T, got map[string]any, want map[string]any) {

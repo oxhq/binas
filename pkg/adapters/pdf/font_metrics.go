@@ -91,6 +91,9 @@ func enrichTextShowFontWidthMetadata(meta map[string]any, font string, encoded s
 	annotateTextShowLayoutProofMetadata(meta, &widthUnits, nil)
 	meta["font_first_char"] = metrics.FirstChar
 	meta["font_widths"] = append([]int(nil), metrics.Widths...)
+	meta["width_proof"] = textWidthProofStatusKnown
+	meta["font_metrics_source"] = "simple_font_widths"
+	meta["text_editability_status"] = textEditabilityStatusReplaceableCandidate
 	if missingUsed {
 		meta["width_source"] = "/Widths+/MissingWidth"
 		meta["missing_width_used"] = true
@@ -119,12 +122,14 @@ func textShowReplacementLayoutProofMetadata(nodeMeta map[string]any, newEncoded 
 	if !ok {
 		return map[string]any{
 			"layout_proof": layoutProofStatusWidthUnproven,
+			"width_proof":  textWidthProofStatusUnproven,
 		}
 	}
 	newWidth, missingUsed, ok := metrics.widthUnits(codes)
 	if !ok {
 		return map[string]any{
 			"layout_proof": layoutProofStatusWidthUnproven,
+			"width_proof":  textWidthProofStatusUnproven,
 		}
 	}
 	out := map[string]any{

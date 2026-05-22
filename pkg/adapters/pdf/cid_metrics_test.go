@@ -40,6 +40,9 @@ func TestCIDFontWidthsAttachMetadataForType0CMapHexText(t *testing.T) {
 	if meta["width_source"] != "/DescendantFonts/W" {
 		t.Fatalf("width_source = %v, want /DescendantFonts/W", meta["width_source"])
 	}
+	if meta["width_proof"] != textWidthProofStatusKnown || meta["font_metrics_source"] != "cid_font_widths" || meta["text_editability_status"] != textEditabilityStatusReplaceableCandidate {
+		t.Fatalf("editability width metadata = width_proof:%v source:%v status:%v", meta["width_proof"], meta["font_metrics_source"], meta["text_editability_status"])
+	}
 	if meta["cid_encoding"] != "Identity-H" {
 		t.Fatalf("cid_encoding = %v, want Identity-H", meta["cid_encoding"])
 	}
@@ -201,6 +204,9 @@ func TestPlanEditReportsReplacementWidthProofForType0CMap(t *testing.T) {
 	if plan.Meta["old_width_units"] != 1110 || plan.Meta["new_width_units"] != 1110 || plan.Meta["width_delta_units"] != 0 {
 		t.Fatalf("plan width proof meta = %+v, want equal 1110 widths", plan.Meta)
 	}
+	if plan.Meta["text_editability_status"] != textEditabilityStatusReplaceable || plan.Meta["width_proof"] != textWidthProofStatusEqual || plan.Meta["font_metrics_source"] != "cid_font_widths" {
+		t.Fatalf("plan editability metadata = %+v", plan.Meta)
+	}
 	_, report, err := adapter.Apply(input, plan)
 	if err != nil {
 		t.Fatal(err)
@@ -229,6 +235,10 @@ func TestPlanEditFailsClosedWhenType0CMapTJArrayReplacementRequiresReflow(t *tes
 	_, err = adapter.PlanEdit(tree, core.Match{Kind: KindTextShow, Text: "AA"}, core.Mutation{Replace: "BB"})
 	if err == nil {
 		t.Fatal("expected replacement requiring reflow to fail closed")
+	}
+	unsupported := requireTextReplacementUnsupportedError(t, err, textReplacementUnsupportedReflowRequired)
+	if unsupported.Metadata["width_proof"] != textWidthProofStatusReflowRequired || unsupported.Metadata["font_metrics_source"] != "cid_font_widths" || unsupported.Metadata["reflow_required"] != true {
+		t.Fatalf("unsupported metadata = %+v, want reflow width proof and CID metrics source", unsupported.Metadata)
 	}
 	got := err.Error()
 	for _, want := range []string{"layout_proof=reflow_required", "old_width_units=1000", "new_width_units=1220", "width_delta_units=220"} {

@@ -13,9 +13,43 @@ const (
 	layoutProofStatusReflowRequired = "reflow_required"
 )
 
+const (
+	textEditabilityStatusReplaceableCandidate = "replaceable_candidate"
+	textEditabilityStatusReplaceable          = "replaceable"
+	textEditabilityStatusUnsupported          = "unsupported"
+
+	textWidthProofStatusKnown          = "known"
+	textWidthProofStatusEqual          = "equal"
+	textWidthProofStatusNarrower       = "narrower"
+	textWidthProofStatusReflowRequired = "reflow_required"
+	textWidthProofStatusUnproven       = "unproven"
+	textWidthProofStatusUnknown        = "unknown"
+
+	textReplacementUnsupportedReflowRequired               = "reflow_required"
+	textReplacementUnsupportedWidthUnproven                = "width_unproven"
+	textReplacementUnsupportedCMapMultiByteNeedsWidthProof = "cmap_multibyte_requires_width_proof"
+	textReplacementUnsupportedCMapUnrepresentable          = "cmap_unrepresentable"
+	textReplacementUnsupportedFontEncodingUnrepresentable  = "font_encoding_unrepresentable"
+	textReplacementUnsupportedEncoding                     = "unsupported_encoding"
+	textReplacementUnsupportedSharedFormXObject            = "shared_form_xobject"
+)
+
 type textReplacementEncodingProof struct {
 	CMapReverseEncoded bool
 	MaxCMapCodeBytes   int
+}
+
+type TextReplacementUnsupportedError struct {
+	Reason   string
+	Metadata map[string]any
+	message  string
+}
+
+func (e *TextReplacementUnsupportedError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.message
 }
 
 func annotateTextShowLayoutProofMetadata(meta map[string]any, oldWidthUnits, newWidthUnits *int) {
@@ -24,6 +58,7 @@ func annotateTextShowLayoutProofMetadata(meta map[string]any, oldWidthUnits, new
 	}
 	if oldWidthUnits == nil || newWidthUnits == nil {
 		meta["layout_proof"] = layoutProofStatusUnknown
+		meta["width_proof"] = textWidthProofStatusUnknown
 		delete(meta, "width_delta_units")
 		return
 	}
@@ -32,13 +67,19 @@ func annotateTextShowLayoutProofMetadata(meta map[string]any, oldWidthUnits, new
 	meta["width_delta_units"] = delta
 	if delta == 0 {
 		meta["layout_proof"] = layoutProofStatusWidthProven
+		meta["width_proof"] = textWidthProofStatusEqual
+		meta["reflow_required"] = false
 		return
 	}
 	if delta < 0 {
 		meta["layout_proof"] = layoutProofStatusWidthNarrower
+		meta["width_proof"] = textWidthProofStatusNarrower
+		meta["reflow_required"] = false
 		return
 	}
 	meta["layout_proof"] = layoutProofStatusReflowRequired
+	meta["width_proof"] = textWidthProofStatusReflowRequired
+	meta["reflow_required"] = true
 }
 
 func textShowReplacementReportMetadata(nodeMeta map[string]any, layoutMeta map[string]any) map[string]any {
@@ -46,6 +87,7 @@ func textShowReplacementReportMetadata(nodeMeta map[string]any, layoutMeta map[s
 	if out == nil {
 		out = map[string]any{
 			"layout_proof": layoutProofStatusUnknown,
+			"width_proof":  textWidthProofStatusUnknown,
 		}
 	}
 	enrichTextDecodeReportMetadata(out, nodeMeta)
@@ -74,6 +116,12 @@ func enrichTextDecodeReportMetadata(out map[string]any, nodeMeta map[string]any)
 	}
 	if font, ok := nodeMeta["font"].(string); ok && font != "" {
 		out["font_id"] = font
+	}
+	if source, ok := nodeMeta["font_metrics_source"].(string); ok && source != "" {
+		out["font_metrics_source"] = source
+	}
+	if widthSource, ok := nodeMeta["width_source"].(string); ok && widthSource != "" {
+		out["width_source"] = widthSource
 	}
 }
 
@@ -121,24 +169,73 @@ func rejectUnsupportedTextReplacementLayout(meta map[string]any, proof textRepla
 	layoutProof, _ := meta["layout_proof"].(string)
 	switch layoutProof {
 	case layoutProofStatusReflowRequired:
-		return fmt.Errorf(
+		message := fmt.Sprintf(
 			"unsupported PDF text replacement: replacement changes text width and requires layout/reflow support (%s)",
 			textReplacementLayoutMetadataSummary(meta),
 		)
+		return unsupportedTextReplacementError(textReplacementUnsupportedReflowRequired, message, meta)
 	case layoutProofStatusWidthUnproven:
-		return fmt.Errorf("unsupported PDF text replacement: replacement width cannot be proven without layout/reflow support (%s)", textReplacementLayoutMetadataSummary(meta))
+		message := fmt.Sprintf("unsupported PDF text replacement: replacement width cannot be proven without layout/reflow support (%s)", textReplacementLayoutMetadataSummary(meta))
+		return unsupportedTextReplacementError(textReplacementUnsupportedWidthUnproven, message, meta)
 	}
 	if proof.CMapReverseEncoded && proof.MaxCMapCodeBytes > 1 && layoutProof != layoutProofStatusWidthProven {
 		if layoutProof == "" {
 			layoutProof = layoutProofStatusUnknown
 		}
-		return fmt.Errorf(
+		meta = copyLayoutReportMetadata(meta)
+		if meta == nil {
+			meta = map[string]any{}
+		}
+		meta["cmap_reverse_encoding"] = true
+		meta["max_cmap_code_bytes"] = proof.MaxCMapCodeBytes
+		message := fmt.Sprintf(
 			"unsupported PDF text replacement: multi-byte CMap reverse encoding requires proven equal-width layout metadata (layout_proof=%s max_cmap_code_bytes=%d)",
 			layoutProof,
 			proof.MaxCMapCodeBytes,
 		)
+		return unsupportedTextReplacementError(textReplacementUnsupportedCMapMultiByteNeedsWidthProof, message, meta)
 	}
 	return nil
+}
+
+func markTextReplacementSupportedMetadata(meta map[string]any, proof textReplacementEncodingProof) {
+	if meta == nil {
+		return
+	}
+	meta["text_editability_status"] = textEditabilityStatusReplaceable
+	if proof.CMapReverseEncoded {
+		meta["cmap_reverse_encoding"] = true
+		meta["max_cmap_code_bytes"] = proof.MaxCMapCodeBytes
+	}
+}
+
+func unsupportedTextReplacementError(reason, message string, meta map[string]any) error {
+	out := copyLayoutReportMetadata(meta)
+	if out == nil {
+		out = map[string]any{}
+	}
+	out["text_editability_status"] = textEditabilityStatusUnsupported
+	out["unsupported_reason"] = reason
+	return &TextReplacementUnsupportedError{
+		Reason:   reason,
+		Metadata: out,
+		message:  message,
+	}
+}
+
+func unsupportedTextReplacementEncodingError(err error, meta map[string]any) error {
+	if err == nil {
+		return nil
+	}
+	reason := textReplacementUnsupportedEncoding
+	message := err.Error()
+	switch {
+	case strings.Contains(message, "ToUnicode"):
+		reason = textReplacementUnsupportedCMapUnrepresentable
+	case strings.Contains(message, "font encoding"):
+		reason = textReplacementUnsupportedFontEncodingUnrepresentable
+	}
+	return unsupportedTextReplacementError(reason, message, meta)
 }
 
 func textReplacementLayoutMetadataSummary(meta map[string]any) string {
@@ -152,6 +249,8 @@ func textReplacementLayoutMetadataSummary(meta map[string]any) string {
 		"width_delta_units",
 		"text_decode_source",
 		"font_id",
+		"font_metrics_source",
+		"width_source",
 		"encoding_path",
 	}
 	parts := make([]string, 0, len(keys))

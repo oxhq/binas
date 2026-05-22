@@ -703,7 +703,11 @@ func (g *pdfGraph) toTree(input []byte) *core.Tree {
 		}
 		imageXObject := isPDFImageXObjectStreamDict(stream.Dict)
 		var err error
-		if !pdfGraphStreamIsImagePassThrough(stream) {
+		if pdfGraphStreamIsImagePassThrough(stream) {
+			if reason := pdfStreamDecodeParmsUnsupportedReason(pdfGraphStreamFilterString(stream.Dict), g.pdfGraphDecodeParmsString(stream.Dict)); reason != "" {
+				err = errors.New(reason)
+			}
+		} else {
 			_, err = g.decodePDFGraphObjectStream(object.ID, stream)
 		}
 		streamMeta := map[string]any{

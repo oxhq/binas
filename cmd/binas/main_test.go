@@ -178,6 +178,46 @@ func TestCLIValidateReportsValidPDFAsJSON(t *testing.T) {
 	}
 }
 
+func TestCLIProfileReportsEditablePDFAsJSON(t *testing.T) {
+	path := writeFixture(t)
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{"profile", path, "--format", "pdf", "--json"})
+	})
+	var result struct {
+		Format                string `json:"format"`
+		Valid                 bool   `json:"valid"`
+		Editable              bool   `json:"editable"`
+		RewriteRecommendation string `json:"rewrite_recommendation"`
+		Text                  struct {
+			NodeCount int `json:"node_count"`
+		} `json:"text"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Format != "pdf" || !result.Valid || !result.Editable {
+		t.Fatalf("profile = %+v, want valid editable pdf", result)
+	}
+	if result.RewriteRecommendation != "canonical" {
+		t.Fatalf("rewrite recommendation = %q, want canonical", result.RewriteRecommendation)
+	}
+	if result.Text.NodeCount != 1 {
+		t.Fatalf("text node count = %d, want 1", result.Text.NodeCount)
+	}
+}
+
+func TestCLIProfileRejectsNonPDFFormat(t *testing.T) {
+	path := writeFixture(t)
+
+	_, err := captureStdoutAndError(t, func() error {
+		return run([]string{"profile", path, "--format", "txt", "--json"})
+	})
+	if err == nil || err.Error() != `profile is unsupported for format "txt"` {
+		t.Fatalf("error = %v, want unsupported format", err)
+	}
+}
+
 func TestCLIValidateReportsStrictParseErrorsAsJSON(t *testing.T) {
 	path := writeMalformedFixture(t)
 

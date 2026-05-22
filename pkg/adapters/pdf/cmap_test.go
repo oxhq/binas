@@ -291,6 +291,10 @@ func TestCMapMultiByteReverseEncodingWithoutLayoutProofFailsClosed(t *testing.T)
 	if err == nil {
 		t.Fatal("expected unsupported multi-byte CMap reverse encoding to fail closed")
 	}
+	unsupported := requireTextReplacementUnsupportedError(t, err, textReplacementUnsupportedCMapMultiByteNeedsWidthProof)
+	if unsupported.Metadata["cmap_reverse_encoding"] != true || unsupported.Metadata["max_cmap_code_bytes"] != 2 || unsupported.Metadata["encoding_path"] != "text_show/hex/to_unicode_cmap" {
+		t.Fatalf("unsupported metadata = %+v, want CMap reverse-encoding constraints", unsupported.Metadata)
+	}
 	for _, want := range []string{"multi-byte CMap reverse encoding", "layout_proof=unknown", "max_cmap_code_bytes=2"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error = %q, want %q", err, want)

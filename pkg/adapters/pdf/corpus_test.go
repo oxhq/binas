@@ -433,6 +433,58 @@ func TestCorpusP2ImageOnlyFiltersPassThroughWhileSupportedContentEdits(t *testin
 	assertCorpusTextMatches(t, reparsed, "P2-DONE", 1)
 }
 
+func TestCorpusP2UnsupportedImageDecodeParmsDoNotBlockSupportedContentEdit(t *testing.T) {
+	input := readCorpusPDF(t, "p2-image-decodeparms-unsupported-supported-content.pdf")
+	adapter := NewAdapter()
+
+	tree, err := adapter.Parse(input, core.ParseOptions{Strict: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	streams := tree.Query(core.Match{Kind: KindStream})
+	if len(streams) != 4 {
+		t.Fatalf("stream nodes = %d, want 4", len(streams))
+	}
+	assertCorpusTextMatches(t, tree, "P2-DECODEPARMS-TEXT", 1)
+
+	p2AssertEditableStreamMetadata(t, streams[0].Meta, false)
+	p2AssertPassThroughImageStreamMetadataWithUnsupported(t, streams[1].Meta, []string{"DCTDecode"}, "unsupported stream: /DecodeParms for /DCTDecode key /ColorTransform is not supported")
+	p2AssertPassThroughImageStreamMetadataWithUnsupported(t, streams[2].Meta, []string{"JBIG2Decode", "FlateDecode"}, "unsupported stream: /DecodeParms array entry 0 for /JBIG2Decode: /DecodeParms for /JBIG2Decode key /JBIG2Globals is not supported")
+	p2AssertPassThroughImageStreamMetadata(t, streams[3].Meta, []string{"DCTDecode"})
+
+	plan, err := adapter.PlanEdit(tree, core.Match{Kind: KindTextShow, Text: "P2-DECODEPARMS-TEXT"}, core.Mutation{Replace: "P2-DECODEPARMS-DONE"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, report, err := adapter.Apply(input, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.FallbackUsed {
+		t.Fatal("unexpected fallback")
+	}
+	verification, err := adapter.Verify(output, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.ReparseOK || !verification.OldTextRemoved || !verification.NewSelectable || !verification.PageUnchanged {
+		t.Fatalf("verification failed: %+v", verification)
+	}
+	if bytes.Count(output, []byte("p2 image bytes")) != 3 {
+		t.Fatal("image stream bytes changed during supported content edit")
+	}
+
+	reparsed, err := adapter.Parse(output, core.ParseOptions{Strict: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertCorpusTextMatches(t, reparsed, "P2-DECODEPARMS-DONE", 1)
+	reparsedStreams := reparsed.Query(core.Match{Kind: KindStream})
+	if got := reparsedStreams[1].Meta["unsupported"]; got != "unsupported stream: /DecodeParms for /DCTDecode key /ColorTransform is not supported" {
+		t.Fatalf("reparsed image unsupported metadata = %q", got)
+	}
+}
+
 func TestCorpusP2UnsupportedNonImageFilterFailsClosedButSupportedContentEdits(t *testing.T) {
 	input := readCorpusPDF(t, "p2-unsupported-nonimage-filter-text.pdf")
 	adapter := NewAdapter()
@@ -899,6 +951,22 @@ func p2AssertEditableStreamMetadata(t *testing.T, meta map[string]any, wantFilte
 
 func p2AssertPassThroughImageStreamMetadata(t *testing.T, meta map[string]any, wantChain []string) {
 	t.Helper()
+	p2AssertPassThroughImageStreamMetadataBase(t, meta, wantChain)
+	if _, ok := meta["unsupported"]; ok {
+		t.Fatalf("unsupported metadata present for image pass-through stream: %+v", meta)
+	}
+}
+
+func p2AssertPassThroughImageStreamMetadataWithUnsupported(t *testing.T, meta map[string]any, wantChain []string, wantUnsupported string) {
+	t.Helper()
+	p2AssertPassThroughImageStreamMetadataBase(t, meta, wantChain)
+	if got := meta["unsupported"]; got != wantUnsupported {
+		t.Fatalf("unsupported metadata = %q, want %q; meta=%+v", got, wantUnsupported, meta)
+	}
+}
+
+func p2AssertPassThroughImageStreamMetadataBase(t *testing.T, meta map[string]any, wantChain []string) {
+	t.Helper()
 	if meta["image_xobject"] != true {
 		t.Fatalf("image_xobject = %v, want true; meta=%+v", meta["image_xobject"], meta)
 	}
@@ -907,9 +975,6 @@ func p2AssertPassThroughImageStreamMetadata(t *testing.T, meta map[string]any, w
 	}
 	if meta["filter_editable"] != false || meta["filter_pass_through"] != true || meta["filter_target"] != false {
 		t.Fatalf("filter metadata = editable:%v pass_through:%v target:%v, want false/true/false; meta=%+v", meta["filter_editable"], meta["filter_pass_through"], meta["filter_target"], meta)
-	}
-	if _, ok := meta["unsupported"]; ok {
-		t.Fatalf("unsupported metadata present for image pass-through stream: %+v", meta)
 	}
 	if _, ok := meta["decoded_length"]; ok {
 		t.Fatalf("decoded_length present for image pass-through stream: %+v", meta)

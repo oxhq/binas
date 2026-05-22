@@ -163,6 +163,9 @@ func enrichTextShowCIDWidthMetadata(meta map[string]any, font string, encoded st
 	meta["width_units"] = widthUnits
 	annotateTextShowLayoutProofMetadata(meta, &widthUnits, nil)
 	meta["width_source"] = metrics.widthSource(defaultWidthUsed)
+	meta["width_proof"] = textWidthProofStatusKnown
+	meta["font_metrics_source"] = "cid_font_widths"
+	meta["text_editability_status"] = textEditabilityStatusReplaceableCandidate
 	if defaultWidthUsed {
 		meta["cid_default_width_used"] = true
 		if metrics.DefaultWidth != nil {
@@ -197,11 +200,17 @@ func textShowCIDReplacementLayoutProofMetadata(nodeMeta map[string]any, newEncod
 	encoding, _ := nodeMeta["encoding"].(string)
 	cids, ok := textShowCIDFontCodes(newEncoded, encoding, metrics.Encoding)
 	if !ok {
-		return map[string]any{"layout_proof": layoutProofStatusWidthUnproven}
+		return map[string]any{
+			"layout_proof": layoutProofStatusWidthUnproven,
+			"width_proof":  textWidthProofStatusUnproven,
+		}
 	}
 	newWidth, defaultWidthUsed, ok := metrics.widthUnits(cids)
 	if !ok {
-		return map[string]any{"layout_proof": layoutProofStatusWidthUnproven}
+		return map[string]any{
+			"layout_proof": layoutProofStatusWidthUnproven,
+			"width_proof":  textWidthProofStatusUnproven,
+		}
 	}
 	out := map[string]any{
 		"old_width_units": oldWidth,

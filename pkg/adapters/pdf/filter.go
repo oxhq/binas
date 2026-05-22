@@ -684,6 +684,21 @@ func parsePDFStreamDecodeParms(filters []string, decodeParms string) ([]pdfStrea
 	return nil, fmt.Errorf("unsupported stream: /DecodeParms must be a dictionary, array, or null")
 }
 
+func pdfStreamDecodeParmsUnsupportedReason(filter, decodeParms string) string {
+	decodeParms = strings.TrimSpace(decodeParms)
+	if decodeParms == "" {
+		return ""
+	}
+	filters := parsePDFStreamFilterChain(filter)
+	if len(filters) == 0 && decodeParms != "null" {
+		return "unsupported stream: /DecodeParms requires /Filter"
+	}
+	if _, err := parsePDFStreamDecodeParms(filters, decodeParms); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
 func pdfDecodeParmsArrayEntryError(index int, filter string, err error) error {
 	message := strings.TrimPrefix(err.Error(), "unsupported stream: ")
 	return fmt.Errorf("unsupported stream: /DecodeParms array entry %d for /%s: %s", index, filter, message)

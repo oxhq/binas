@@ -18,6 +18,7 @@ import (
 
 	"github.com/oxhq/binas/pkg/adapters/pdf"
 	"github.com/oxhq/binas/pkg/core"
+	"github.com/oxhq/binas/pkg/pdfapi"
 )
 
 func main() {
@@ -29,7 +30,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("expected command: inspect, query, edit, overlay, ocr, form, annot, xfa, signature, validate")
+		return errors.New("expected command: inspect, query, edit, overlay, ocr, form, annot, xfa, signature, validate, profile")
 	}
 	switch args[0] {
 	case "inspect":
@@ -52,6 +53,8 @@ func run(args []string) error {
 		return signature(args[1:])
 	case "validate":
 		return validate(args[1:])
+	case "profile":
+		return profile(args[1:])
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
@@ -1334,6 +1337,51 @@ func validationFailureError(result validationResult) error {
 		return errors.New("validation failed")
 	}
 	return fmt.Errorf("validation failed: %s", strings.Join(result.Errors, "; "))
+}
+
+func profile(args []string) error {
+	fs := flag.NewFlagSet("profile", flag.ContinueOnError)
+	format := fs.String("format", "pdf", "input format")
+	password := fs.String("password", "", "PDF password for explicit encrypted-PDF parsing")
+	rewrite := fs.String("rewrite", "", "requested rewrite mode")
+	signatureMode := fs.String("signature-mode", "", "signature handling mode")
+	asJSON := fs.Bool("json", false, "write JSON")
+	if err := fs.Parse(reorderFlags(args, map[string]bool{"json": true}, map[string]bool{"format": true, "password": true, "rewrite": true, "signature-mode": true})); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("profile requires one input file")
+	}
+	if strings.ToLower(*format) != "pdf" {
+		return fmt.Errorf("profile is unsupported for format %q", *format)
+	}
+	input, err := os.ReadFile(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	result, err := pdfapi.Profile(input, pdfapi.ProfileOptions{
+		Options: pdfapi.Options{
+			Password:      *password,
+			Rewrite:       pdfapi.RewriteMode(*rewrite),
+			SignatureMode: *signatureMode,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return writeJSON(result)
+	}
+	fmt.Printf("pdf valid=%t editable=%t fillable=%t rewrite=%s text_nodes=%d fields=%d unsupported=%d\n",
+		result.Valid,
+		result.Editable,
+		result.Fillable,
+		result.RewriteRecommendation,
+		result.Text.NodeCount,
+		result.Forms.FieldCount,
+		len(result.UnsupportedReasons),
+	)
+	return nil
 }
 
 func parseInputWithPassword(adapter core.Adapter, input []byte, format string, opts core.ParseOptions, password string) (*core.Tree, error) {

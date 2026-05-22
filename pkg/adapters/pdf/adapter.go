@@ -187,14 +187,16 @@ func (Adapter) PlanEdit(tree *core.Tree, selector core.Match, mutation core.Muta
 	if !ok || oldEncoded == "" {
 		return nil, errors.New("matched text node has no editable encoded span")
 	}
+	initialReplacementMeta := textShowReplacementReportMetadata(target.Meta, nil)
 	newEncoded, replacementProof, err := encodeTextShowReplacement(target, mutation.Replace)
 	if err != nil {
-		return nil, err
+		return nil, unsupportedTextReplacementEncodingError(err, initialReplacementMeta)
 	}
 	layoutProofMeta := textShowReplacementReportMetadata(target.Meta, textShowReplacementLayoutProofMetadata(target.Meta, newEncoded))
 	if err := rejectUnsupportedTextReplacementLayout(layoutProofMeta, replacementProof); err != nil {
 		return nil, err
 	}
+	markTextReplacementSupportedMetadata(layoutProofMeta, replacementProof)
 	if filter, _ := target.Meta["stream_filter"].(string); !isPassthroughPDFStreamFilter(filter) {
 		decodeParms, _ := target.Meta["stream_decode_parms"].(string)
 		streamBytes, ok := target.Meta["stream_encoded"].([]byte)
@@ -300,9 +302,14 @@ func sharedFormXObjectIsolationError(meta map[string]any) error {
 	invocations, _ := metaInt(meta, "form_invocation_count")
 	pages := fmt.Sprint(meta["form_invoked_page_object_numbers"])
 	if formObject > 0 && invocations > 0 {
-		return fmt.Errorf("shared Form XObject edit isolation: form object %d is invoked %d times across page objects %s; refusing context-specific text edit because isolated form stream cloning is not implemented", formObject, invocations, pages)
+		message := fmt.Sprintf("shared Form XObject edit isolation: form object %d is invoked %d times across page objects %s; refusing context-specific text edit because isolated form stream cloning is not implemented", formObject, invocations, pages)
+		return unsupportedTextReplacementError(textReplacementUnsupportedSharedFormXObject, message, meta)
 	}
-	return errors.New("shared Form XObject edit isolation: refusing context-specific text edit because isolated form stream cloning is not implemented")
+	return unsupportedTextReplacementError(
+		textReplacementUnsupportedSharedFormXObject,
+		"shared Form XObject edit isolation: refusing context-specific text edit because isolated form stream cloning is not implemented",
+		meta,
+	)
 }
 
 func (Adapter) Apply(input []byte, plan *core.EditPlan) ([]byte, core.Report, error) {
@@ -602,6 +609,9 @@ func parseStreams(input []byte, tree *core.Tree, root core.NodeID, cmapContext p
 			streamMeta["filter_chain"] = filterChain
 		}
 		if stream.imageXObject && markPDFImageXObjectFilterPassThrough(streamMeta, stream.filter) {
+			if reason := pdfStreamDecodeParmsUnsupportedReason(stream.filter, stream.decodeParms); reason != "" {
+				streamMeta["unsupported"] = reason
+			}
 			streamID := tree.AddNode(core.Node{
 				Kind: KindStream,
 				Span: core.Span{Start: int64(stream.dataStart), End: int64(stream.dataEnd)},

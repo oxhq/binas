@@ -33,6 +33,8 @@ type FormFieldMetadata struct {
 	SelectedIndexes              []int    `json:"selected_indexes,omitempty"`
 	AppearanceGenerationStatus   string   `json:"appearance_generation_status,omitempty"`
 	AppearanceGenerationBlockers []string `json:"appearance_generation_blockers,omitempty"`
+	FillStatus                   string   `json:"fill_status,omitempty"`
+	FillBlockers                 []string `json:"fill_blockers,omitempty"`
 }
 
 type FormFieldEditOptions struct {
@@ -105,6 +107,9 @@ func ApplyFormFieldEditWithOptions(input []byte, fieldName, value string, option
 		selected = &selectedValue
 	} else if len(matches) > 1 {
 		return nil, FormFieldEditReport{}, FormFieldEditVerification{}, fmt.Errorf("field %q matched %d dictionaries; pass --match-index N (zero-based, 0..%d) to choose one", fieldName, len(matches), len(matches)-1)
+	}
+	if blockers := formFieldEditBlockers(graph, matches[index].dict, matches[index].context(), options.RegenerateAppearance); len(blockers) > 0 {
+		return nil, FormFieldEditReport{}, FormFieldEditVerification{}, fmt.Errorf("unsupported AcroForm field edit: %s", strings.Join(blockers, ", "))
 	}
 	appearanceRegenerated := false
 	appearanceStatus := "not_requested"
@@ -1176,6 +1181,18 @@ type formFieldMatch struct {
 	inheritedDefaultResources     pdfDict
 }
 
+func (match formFieldMatch) context() formFieldContext {
+	return formFieldContext{
+		fieldType:            match.inheritedFT,
+		hasFT:                match.hasInheritedFT,
+		flags:                match.inheritedFlags,
+		hasFlags:             match.hasFlags,
+		defaultAppearance:    match.inheritedDefaultAppearance,
+		hasDefaultAppearance: match.hasInheritedDefaultAppearance,
+		defaultResources:     match.inheritedDefaultResources,
+	}
+}
+
 func (match formFieldMatch) fieldType() (pdfName, bool) {
 	if ft, ok := match.dict["FT"].(pdfName); ok {
 		return ft, true
@@ -1277,6 +1294,7 @@ func collectFormFieldMetadata(graph *pdfGraph, value pdfValue, context formField
 				fieldType = string(ft)
 			}
 			appearanceGenerationStatus, appearanceGenerationBlockers := formFieldAppearanceGenerationMetadata(graph, v, context, fieldType)
+			fillStatus, fillBlockers := formFieldFillMetadata(graph, v, context, fieldType)
 			fields = append(fields, FormFieldMetadata{
 				Name:                         fullName,
 				FieldType:                    fieldType,
@@ -1297,6 +1315,8 @@ func collectFormFieldMetadata(graph *pdfGraph, value pdfValue, context formField
 				SelectedIndexes:              formFieldChoiceSelectedIndexes(v, fieldType),
 				AppearanceGenerationStatus:   appearanceGenerationStatus,
 				AppearanceGenerationBlockers: appearanceGenerationBlockers,
+				FillStatus:                   fillStatus,
+				FillBlockers:                 fillBlockers,
 			})
 			childContext.nameSegments = append(append([]string{}, context.nameSegments...), name)
 		}
@@ -1456,14 +1476,148 @@ func formFieldAppearanceGenerationMetadata(graph *pdfGraph, dict pdfDict, contex
 	}
 }
 
+func formFieldFillMetadata(graph *pdfGraph, dict pdfDict, context formFieldContext, fieldType string) (string, []string) {
+	blockers := formFieldFillBlockers(graph, dict, context)
+	if len(blockers) > 0 {
+		return "unsafe", blockers
+	}
+	switch fieldType {
+	case "Tx":
+		return "supported", nil
+	case "Ch":
+		if flags, ok := effectiveFormFieldFlags(dict, context); ok && flags&formFieldFlagChMultiSelect != 0 {
+			if len(formFieldChoiceOptionEntries(dict, fieldType)) == 0 {
+				return "unsupported", []string{"multi_select_missing_options"}
+			}
+		}
+		return "supported", nil
+	case "Btn":
+		if formFieldButtonAppearanceProof(graph, dict, fieldType) {
+			return "supported", nil
+		}
+		return "unsupported", []string{"missing_or_ambiguous_button_appearance_states"}
+	case "":
+		return "unsupported", []string{"unknown_field_type"}
+	default:
+		return "unsupported", []string{"unsupported_field_type"}
+	}
+}
+
+func formFieldFillBlockers(graph *pdfGraph, dict pdfDict, context formFieldContext) []string {
+	blockers := formFieldAppearanceGenerationBlockers(dict, context)
+	blockers = append(blockers, formFieldActionBlockers(graph, dict)...)
+	blockers = append(blockers, formFieldTreeShapeBlockers(graph, dict)...)
+	return uniqueStringsPreserveOrder(blockers)
+}
+
+func formFieldEditBlockers(graph *pdfGraph, dict pdfDict, context formFieldContext, regenerateAppearance bool) []string {
+	blockers := make([]string, 0)
+	if !regenerateAppearance {
+		blockers = append(blockers, formFieldAppearanceGenerationBlockers(dict, context)...)
+	}
+	blockers = append(blockers, formFieldActionBlockers(graph, dict)...)
+	blockers = append(blockers, formFieldTreeShapeBlockers(graph, dict)...)
+	return uniqueStringsPreserveOrder(blockers)
+}
+
 func formFieldAppearanceGenerationBlockers(dict pdfDict, context formFieldContext) []string {
+	blockers := make([]string, 0, 2)
 	if _, hasRichValue := dict["RV"]; hasRichValue {
-		return []string{"rich_text_value"}
+		blockers = append(blockers, "rich_text_value")
+		return blockers
 	}
 	if flags, ok := effectiveFormFieldFlags(dict, context); ok && flags&formFieldFlagTxRichText != 0 {
-		return []string{"rich_text_flag"}
+		blockers = append(blockers, "rich_text_flag")
 	}
-	return nil
+	return blockers
+}
+
+func formFieldActionBlockers(graph *pdfGraph, dict pdfDict) []string {
+	blockers := make([]string, 0)
+	blockers = append(blockers, actionBlockersForDict(dict, "field")...)
+	if kids, ok := dict["Kids"].(pdfArray); ok {
+		for _, kid := range kids {
+			widget, ok := resolvePDFDict(graph, kid)
+			if !ok {
+				continue
+			}
+			blockers = append(blockers, actionBlockersForDict(widget, "widget")...)
+		}
+	}
+	return blockers
+}
+
+func actionBlockersForDict(dict pdfDict, prefix string) []string {
+	blockers := make([]string, 0, 3)
+	if _, ok := dict["A"]; ok {
+		blockers = append(blockers, prefix+"_action")
+	}
+	if _, ok := dict["AA"]; ok {
+		blockers = append(blockers, prefix+"_additional_actions")
+	}
+	if pdfDictContainsJavaScriptAction(dict["A"]) || pdfDictContainsJavaScriptAction(dict["AA"]) {
+		blockers = append(blockers, prefix+"_javascript_action")
+	}
+	return blockers
+}
+
+func pdfDictContainsJavaScriptAction(value pdfValue) bool {
+	switch v := value.(type) {
+	case pdfDict:
+		if s, ok := v["S"].(pdfName); ok && s == "JavaScript" {
+			return true
+		}
+		for _, item := range v {
+			if pdfDictContainsJavaScriptAction(item) {
+				return true
+			}
+		}
+	case pdfArray:
+		for _, item := range v {
+			if pdfDictContainsJavaScriptAction(item) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func formFieldTreeShapeBlockers(graph *pdfGraph, dict pdfDict) []string {
+	kids, ok := dict["Kids"].(pdfArray)
+	if !ok {
+		return nil
+	}
+	blockers := make([]string, 0)
+	for _, kid := range kids {
+		child, ok := resolvePDFDict(graph, kid)
+		if !ok {
+			blockers = append(blockers, "unresolved_kid")
+			continue
+		}
+		if _, hasGrandkids := child["Kids"]; hasGrandkids {
+			blockers = append(blockers, "nested_kids")
+		}
+		if _, hasName := pdfTextValue(child["T"]); hasName && child["Subtype"] != pdfName("Widget") {
+			blockers = append(blockers, "named_non_widget_kid")
+		}
+	}
+	return blockers
+}
+
+func uniqueStringsPreserveOrder(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
 }
 
 func formFieldHasDirectAppearanceWidgetRect(graph *pdfGraph, dict pdfDict) bool {
