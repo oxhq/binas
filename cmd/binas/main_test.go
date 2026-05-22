@@ -2087,6 +2087,61 @@ func TestCLIXFADatasetsPlainTextPrintsPathValueLines(t *testing.T) {
 	}
 }
 
+func TestCLIXFAMappingsEmitsJSONMappings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "xfa-mappings.pdf")
+	input := pdfFixture(
+		"<< /Type /Catalog /AcroForm << /XFA [(template) (<template><field name=\"form.name\"/></template>) (datasets) (<datasets><data><form><name>Alice</name></form></data></datasets>)] >> >>",
+	)
+	if err := os.WriteFile(path, input, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout := captureStdout(t, func() error {
+		return run([]string{"xfa", "mappings", path, "--format", "pdf", "--json"})
+	})
+	var result struct {
+		Count    int `json:"count"`
+		Mappings []struct {
+			FieldName           string `json:"field_name"`
+			DatasetPath         string `json:"dataset_path"`
+			Value               string `json:"value"`
+			TemplatePacketIndex int    `json:"template_packet_index"`
+			DatasetPacketIndex  int    `json:"dataset_packet_index"`
+			Label               string `json:"label"`
+		} `json:"mappings"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Count != 1 || len(result.Mappings) != 1 {
+		t.Fatalf("result = %+v, want one mapping", result)
+	}
+	mapping := result.Mappings[0]
+	if mapping.FieldName != "form.name" || mapping.DatasetPath != "form.name" || mapping.Value != "Alice" {
+		t.Fatalf("mapping value = %+v", mapping)
+	}
+	if mapping.TemplatePacketIndex != 0 || mapping.DatasetPacketIndex != 1 || mapping.Label != "template" {
+		t.Fatalf("mapping metadata = %+v", mapping)
+	}
+}
+
+func TestCLIXFAMappingsRejectsNonPDFFormat(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "xfa-mappings.txt")
+	if err := os.WriteFile(path, []byte("not a pdf"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := captureStdoutAndError(t, func() error {
+		return run([]string{"xfa", "mappings", path, "--format", "txt", "--json"})
+	})
+	if err == nil {
+		t.Fatal("xfa mappings succeeded, want unsupported format error")
+	}
+	if err.Error() != `xfa mappings is unsupported for format "txt"` {
+		t.Fatalf("error = %q", err)
+	}
+}
+
 func TestCLIXFADatasetSetWritesVerifiedFieldUpdate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "xfa-dataset-set.pdf")
 	input := pdfFixture(

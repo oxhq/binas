@@ -546,13 +546,15 @@ func annotSetContents(args []string) error {
 
 func xfa(args []string) error {
 	if len(args) == 0 {
-		return errors.New("expected xfa command: list, datasets, dataset-set, replace")
+		return errors.New("expected xfa command: list, datasets, mappings, dataset-set, replace")
 	}
 	switch args[0] {
 	case "list":
 		return xfaList(args[1:])
 	case "datasets":
 		return xfaDatasets(args[1:])
+	case "mappings":
+		return xfaMappings(args[1:])
 	case "dataset-set":
 		return xfaDatasetSet(args[1:])
 	case "replace":
@@ -657,6 +659,48 @@ func xfaDatasets(args []string) error {
 	}
 	for _, field := range fields {
 		fmt.Printf("%s=%s\n", field.Path, field.Value)
+	}
+	return nil
+}
+
+func xfaMappings(args []string) error {
+	fs := flag.NewFlagSet("xfa mappings", flag.ContinueOnError)
+	format := fs.String("format", "pdf", "input format")
+	asJSON := fs.Bool("json", false, "write JSON")
+	if err := fs.Parse(reorderFlags(args, map[string]bool{"json": true}, map[string]bool{"format": true})); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("xfa mappings requires one input file")
+	}
+	if strings.ToLower(*format) != "pdf" {
+		return fmt.Errorf("xfa mappings is unsupported for format %q", *format)
+	}
+	input, err := os.ReadFile(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	mappings, err := pdf.ListXFATemplateDatasetMappings(input)
+	if err != nil {
+		return err
+	}
+	result := map[string]any{"mappings": mappings, "count": len(mappings)}
+	if *asJSON {
+		return writeJSON(result)
+	}
+	for _, mapping := range mappings {
+		label := "-"
+		if mapping.Label != "" {
+			label = mapping.Label
+		}
+		fmt.Printf("%s=%s field=%s template_packet=%d dataset_packet=%d label=%s\n",
+			mapping.DatasetPath,
+			mapping.Value,
+			mapping.FieldName,
+			mapping.TemplatePacketIndex,
+			mapping.DatasetPacketIndex,
+			label,
+		)
 	}
 	return nil
 }

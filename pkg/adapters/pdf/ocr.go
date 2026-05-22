@@ -3,10 +3,12 @@ package pdf
 import (
 	"bytes"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"math"
+	"strconv"
 	"strings"
 
 	"github.com/oxhq/binas/pkg/core"
@@ -50,6 +52,73 @@ type ocrTextLayerJSONBox struct {
 	YMin *float64 `json:"y_min"`
 	XMax *float64 `json:"x_max"`
 	YMax *float64 `json:"y_max"`
+}
+
+func ParseOCRTextLayerALTOXML(input []byte) ([]OCRTextLayerOptions, error) {
+	trimmed := bytes.TrimSpace(input)
+	if len(trimmed) == 0 {
+		return nil, errors.New("ocr text-layer ALTO XML input cannot be empty")
+	}
+
+	decoder := xml.NewDecoder(bytes.NewReader(trimmed))
+	pageIndex := -1
+	pageDepth := 0
+	opts := make([]OCRTextLayerOptions, 0)
+	for {
+		token, err := decoder.Token()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("invalid ocr text-layer ALTO XML: %w", err)
+		}
+
+		switch token := token.(type) {
+		case xml.StartElement:
+			if pageDepth > 0 {
+				pageDepth++
+			}
+			if token.Name.Local == "Page" {
+				pageIndex++
+				pageDepth = 1
+				continue
+			}
+			if token.Name.Local != "String" || pageDepth == 0 {
+				continue
+			}
+			opt, err := altoStringToOCRTextLayerOptions(token, pageIndex)
+			if err != nil {
+				return nil, fmt.Errorf("ocr text-layer ALTO page %d string %d: %w", pageIndex, len(opts), err)
+			}
+			opts = append(opts, opt)
+		case xml.EndElement:
+			if pageDepth > 0 {
+				pageDepth--
+			}
+		}
+	}
+
+	if len(opts) == 0 {
+		return nil, errors.New("ocr text-layer ALTO XML must contain at least one OCR string")
+	}
+	return opts, nil
+}
+
+func PlanExplicitOCRTextLayerALTOXML(pdfBytes, altoBytes []byte) ([]OCRTextLayerPlan, error) {
+	opts, err := ParseOCRTextLayerALTOXML(altoBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	plans := make([]OCRTextLayerPlan, 0, len(opts))
+	for i, opt := range opts {
+		plan, err := PlanExplicitOCRTextLayer(pdfBytes, opt)
+		if err != nil {
+			return nil, fmt.Errorf("ocr text-layer ALTO item %d: %w", i, err)
+		}
+		plans = append(plans, plan)
+	}
+	return plans, nil
 }
 
 func ParseOCRTextLayerJSON(input []byte) ([]OCRTextLayerOptions, error) {
@@ -178,6 +247,85 @@ func (b OCRTextLayerBox) validate() error {
 		return errors.New("ocr text-layer bounding box must have positive width and height")
 	}
 	return nil
+}
+
+func altoStringToOCRTextLayerOptions(element xml.StartElement, pageIndex int) (OCRTextLayerOptions, error) {
+	attrs := make(map[string]string, len(element.Attr))
+	for _, attr := range element.Attr {
+		attrs[attr.Name.Local] = attr.Value
+	}
+
+	text, ok := attrs["CONTENT"]
+	if !ok {
+		return OCRTextLayerOptions{}, errors.New("CONTENT is required")
+	}
+	if strings.TrimSpace(text) == "" {
+		return OCRTextLayerOptions{}, errors.New("CONTENT cannot be blank")
+	}
+
+	hpos, err := parseRequiredALTONumber(attrs, "HPOS")
+	if err != nil {
+		return OCRTextLayerOptions{}, err
+	}
+	vpos, err := parseRequiredALTONumber(attrs, "VPOS")
+	if err != nil {
+		return OCRTextLayerOptions{}, err
+	}
+	width, err := parseRequiredALTONumber(attrs, "WIDTH")
+	if err != nil {
+		return OCRTextLayerOptions{}, err
+	}
+	height, err := parseRequiredALTONumber(attrs, "HEIGHT")
+	if err != nil {
+		return OCRTextLayerOptions{}, err
+	}
+
+	confidence := 0.0
+	if wc, ok := attrs["WC"]; ok {
+		confidence, err = parseALTONumber("WC", wc)
+		if err != nil {
+			return OCRTextLayerOptions{}, err
+		}
+		if math.IsNaN(confidence) || math.IsInf(confidence, 0) || confidence < 0 || confidence > 1 {
+			return OCRTextLayerOptions{}, errors.New("WC confidence must be between 0 and 1")
+		}
+	}
+
+	box := OCRTextLayerBox{
+		XMin: hpos,
+		YMin: vpos,
+		XMax: hpos + width,
+		YMax: vpos + height,
+	}
+	if err := box.validate(); err != nil {
+		return OCRTextLayerOptions{}, err
+	}
+
+	return OCRTextLayerOptions{
+		PageIndex:  pageIndex,
+		Text:       text,
+		Box:        box,
+		Confidence: confidence,
+	}, nil
+}
+
+func parseRequiredALTONumber(attrs map[string]string, name string) (float64, error) {
+	value, ok := attrs[name]
+	if !ok {
+		return 0, fmt.Errorf("%s is required", name)
+	}
+	return parseALTONumber(name, value)
+}
+
+func parseALTONumber(name, value string) (float64, error) {
+	number, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be numeric", name)
+	}
+	if math.IsNaN(number) || math.IsInf(number, 0) {
+		return 0, fmt.Errorf("%s must be finite", name)
+	}
+	return number, nil
 }
 
 func decodeOCRTextLayerJSON(input []byte, v any) error {
