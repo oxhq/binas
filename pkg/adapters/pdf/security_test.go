@@ -255,6 +255,30 @@ func TestSecurityMetadataIncludesSignatureDigestDiagnostics(t *testing.T) {
 	}
 }
 
+func TestSecurityMetadataSeparatesByteRangeDigestFromCertificateTrust(t *testing.T) {
+	input := signedPDFWithCMSMessageDigest(t, nil)
+
+	metadata := SecurityMetadataForInput(input)
+	signature := metadata.Signature
+	if !signature.ByteRangeDigestValidation || signature.ByteRangeDigestValidationStatus != signatureByteRangeDigestValidationValid {
+		t.Fatalf("byte-range digest validation = %t/%q, want true/%q", signature.ByteRangeDigestValidation, signature.ByteRangeDigestValidationStatus, signatureByteRangeDigestValidationValid)
+	}
+	if signature.CertificateTrustValidation || signature.CertificateTrustValidationStatus != signatureCertificateTrustValidationInsufficientCertificates {
+		t.Fatalf("certificate trust validation = %t/%q, want false/%q", signature.CertificateTrustValidation, signature.CertificateTrustValidationStatus, signatureCertificateTrustValidationInsufficientCertificates)
+	}
+	if !signature.CryptographicValidation || signature.CryptographicValidationStatus != signatureCryptographicValidationByteRangeDigestValid {
+		t.Fatalf("legacy cryptographic validation = %t/%q, want byte-range digest compatibility", signature.CryptographicValidation, signature.CryptographicValidationStatus)
+	}
+	data, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if !strings.Contains(got, `"byte_range_digest_validation":true`) || !strings.Contains(got, `"certificate_trust_validation":false`) || !strings.Contains(got, `"certificate_trust_validation_status":"insufficient_certificates"`) {
+		t.Fatalf("security JSON = %s, want separated digest and certificate trust fields", got)
+	}
+}
+
 func TestSecuritySignaturePreserveIncrementalRequiresByteRangeProof(t *testing.T) {
 	input := testPDF("<< /Type /Catalog /SigFlags 3 >>", "<<>>")
 

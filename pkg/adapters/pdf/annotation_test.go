@@ -769,6 +769,49 @@ func TestListAnnotationCandidatesIncludesStableMetadata(t *testing.T) {
 	}
 }
 
+func TestListAnnotationCandidatesReportsUnsafeAppearanceGenerationStatus(t *testing.T) {
+	input := testPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Page /Annots [3 0 R 4 0 R 5 0 R 6 0 R] >>",
+		"<< /Type /Annot /Subtype /Text /Rect [0 0 80 30] /Contents (plain note) >>",
+		"<< /Type /Annot /Subtype /FreeText /Rect [0 0 80 30] /Contents (rich note) /RC (<b>rich note</b>) >>",
+		"<< /Type /Annot /Subtype /Text /Rect [0 0 80 30] /Contents (script note) /A << /S /JavaScript /JS (app.alert('x')) >> >>",
+		"<< /Type /Annot /Subtype /Square /Rect [0 0 80 30] /Contents (actions) /AA << /E << /S /URI /URI (https://example.test) >> >> >>",
+	)
+
+	candidates, err := ListAnnotationCandidates(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 4 {
+		t.Fatalf("candidate count = %d, want 4: %+v", len(candidates), candidates)
+	}
+	if candidates[0].AppearanceGenerationStatus != "approximate_supported" || len(candidates[0].AppearanceGenerationBlockers) != 0 {
+		t.Fatalf("plain annotation appearance status = %q blockers %+v", candidates[0].AppearanceGenerationStatus, candidates[0].AppearanceGenerationBlockers)
+	}
+	for i, want := range [][]string{
+		{"rich_text_content"},
+		{"javascript_action"},
+		{"additional_actions"},
+	} {
+		candidate := candidates[i+1]
+		if candidate.AppearanceGenerationStatus != "unsafe" {
+			t.Fatalf("candidate %d appearance status = %q, want unsafe", i+1, candidate.AppearanceGenerationStatus)
+		}
+		assertStringSliceEqual(t, candidate.AppearanceGenerationBlockers, want)
+	}
+
+	encoded, err := json.Marshal(candidates[2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{`"appearance_generation_status":"unsafe"`, `"appearance_generation_blockers":["javascript_action"]`} {
+		if !bytes.Contains(encoded, []byte(key)) {
+			t.Fatalf("encoded metadata missing %s: %s", key, encoded)
+		}
+	}
+}
+
 func TestListAnnotationCandidatesReportsPageTreeIndex(t *testing.T) {
 	input := testPDF(
 		"<< /Type /Catalog /Pages 2 0 R >>",

@@ -7,14 +7,24 @@ import (
 	"crypto/sha512"
 	"crypto/x509"
 	"encoding/asn1"
+	"errors"
 	"hash"
 	"strings"
+	"time"
 )
 
 const signatureCryptographicValidationNotPerformed = "not_performed"
 const signatureCryptographicValidationUnsupported = "unsupported"
 const signatureCryptographicValidationByteRangeDigestValid = "byte_range_digest_valid"
 const signatureCryptographicValidationByteRangeDigestMismatch = "byte_range_digest_mismatch"
+const signatureByteRangeDigestValidationNotPerformed = "not_performed"
+const signatureByteRangeDigestValidationUnsupported = "unsupported"
+const signatureByteRangeDigestValidationValid = "valid"
+const signatureByteRangeDigestValidationMismatch = "mismatch"
+const signatureCertificateTrustValidationNotPerformed = "not_performed"
+const signatureCertificateTrustValidationInsufficientCertificates = "insufficient_certificates"
+const signatureCertificateTrustValidationValid = "valid"
+const signatureCertificateTrustValidationInvalid = "invalid"
 const signatureContainerUnknown = "unknown"
 const signatureDigestAlgorithmUnknown = "unknown"
 const signatureDigestAlgorithmNotParsed = "not_parsed"
@@ -26,35 +36,41 @@ const signatureByteRangeStatusValid = "valid"
 const signatureByteRangeStatusMalformed = "malformed"
 
 type signatureInfo struct {
-	HasSignatureMarker            bool
-	ByteRanges                    []signatureByteRange
-	ByteRangeCount                int
-	ByteRangeStatus               string
-	ContentsByteLength            *int
-	SubFilter                     string
-	Filter                        string
-	SigningTime                   string
-	ObjectNumber                  *int
-	ObjectGeneration              *int
-	SignatureContainer            string
-	DigestAlgorithm               string
-	DigestAlgorithmStatus         string
-	CertificateCount              int
-	SignerCertificateSubject      string
-	SignerCertificateIssuer       string
-	MalformedByteRangeError       error
-	CryptographicValidation       bool
-	CryptographicValidationStatus string
+	HasSignatureMarker               bool
+	ByteRanges                       []signatureByteRange
+	ByteRangeCount                   int
+	ByteRangeStatus                  string
+	ContentsByteLength               *int
+	SubFilter                        string
+	Filter                           string
+	SigningTime                      string
+	ObjectNumber                     *int
+	ObjectGeneration                 *int
+	SignatureContainer               string
+	DigestAlgorithm                  string
+	DigestAlgorithmStatus            string
+	CertificateCount                 int
+	SignerCertificateSubject         string
+	SignerCertificateIssuer          string
+	MalformedByteRangeError          error
+	ByteRangeDigestValidation        bool
+	ByteRangeDigestValidationStatus  string
+	CertificateTrustValidation       bool
+	CertificateTrustValidationStatus string
+	CryptographicValidation          bool
+	CryptographicValidationStatus    string
 }
 
 func inspectSignatureInfo(input []byte) signatureInfo {
 	info := signatureInfo{
-		HasSignatureMarker:            hasPDFSignatureBoundary(input),
-		ByteRangeStatus:               signatureByteRangeStatusAbsent,
-		SignatureContainer:            signatureContainerUnknown,
-		DigestAlgorithm:               signatureDigestAlgorithmUnknown,
-		DigestAlgorithmStatus:         signatureDigestAlgorithmNotParsed,
-		CryptographicValidationStatus: signatureCryptographicValidationNotPerformed,
+		HasSignatureMarker:               hasPDFSignatureBoundary(input),
+		ByteRangeStatus:                  signatureByteRangeStatusAbsent,
+		SignatureContainer:               signatureContainerUnknown,
+		DigestAlgorithm:                  signatureDigestAlgorithmUnknown,
+		DigestAlgorithmStatus:            signatureDigestAlgorithmNotParsed,
+		ByteRangeDigestValidationStatus:  signatureByteRangeDigestValidationNotPerformed,
+		CertificateTrustValidationStatus: signatureCertificateTrustValidationNotPerformed,
+		CryptographicValidationStatus:    signatureCryptographicValidationNotPerformed,
 	}
 	applySignatureDictionaryMetadata(&info, input)
 	if len(findAllPDFNamesOutsideStringOrComment(input, "ByteRange")) == 0 {
@@ -101,15 +117,20 @@ func applySignatureCryptographicValidation(info *signatureInfo, input []byte) {
 			continue
 		}
 		if bytes.Equal(digest, cms.MessageDigest) {
+			info.ByteRangeDigestValidation = true
+			info.ByteRangeDigestValidationStatus = signatureByteRangeDigestValidationValid
 			info.CryptographicValidation = true
 			info.CryptographicValidationStatus = signatureCryptographicValidationByteRangeDigestValid
 			return
 		}
+		info.ByteRangeDigestValidation = false
+		info.ByteRangeDigestValidationStatus = signatureByteRangeDigestValidationMismatch
 		info.CryptographicValidation = false
 		info.CryptographicValidationStatus = signatureCryptographicValidationByteRangeDigestMismatch
 		return
 	}
 	if attempted && info.CryptographicValidationStatus == signatureCryptographicValidationNotPerformed {
+		info.ByteRangeDigestValidationStatus = signatureByteRangeDigestValidationUnsupported
 		info.CryptographicValidationStatus = signatureCryptographicValidationUnsupported
 	}
 }
@@ -149,6 +170,9 @@ func applyCMSMetadata(info *signatureInfo, cms cmsDetachedSignature) {
 	}
 	if info.SignatureContainer == signatureContainerUnknown && cms.IsPKCS7SignedData {
 		info.SignatureContainer = "pkcs7"
+	}
+	if cms.IsPKCS7SignedData {
+		info.CertificateTrustValidation, info.CertificateTrustValidationStatus = validateSignerCertificateTrust(cms, signerCertificateTrustOptions{})
 	}
 }
 
@@ -312,6 +336,7 @@ type cmsDetachedSignature struct {
 	CertificateCount         int
 	SignerCertificateSubject string
 	SignerCertificateIssuer  string
+	Certificates             []*x509.Certificate
 }
 
 var (
@@ -356,7 +381,8 @@ func parseCMSDetachedSignature(contents []byte) (cmsDetachedSignature, error) {
 	}
 	for _, child := range signedDataChildren {
 		if child.Class == asn1.ClassContextSpecific && child.Tag == 0 && child.IsCompound {
-			out.CertificateCount, out.SignerCertificateSubject, out.SignerCertificateIssuer = parseCMSCertificateMetadata(child.Bytes)
+			out.Certificates = parseCMSCertificates(child.Bytes)
+			out.CertificateCount, out.SignerCertificateSubject, out.SignerCertificateIssuer = cmsCertificateMetadata(out.Certificates)
 		}
 	}
 	if len(signedDataChildren) == 0 {
@@ -435,13 +461,15 @@ func messageDigestFromSignedAttributes(input []byte) ([]byte, bool) {
 }
 
 func parseCMSCertificateMetadata(input []byte) (int, string, string) {
+	return cmsCertificateMetadata(parseCMSCertificates(input))
+}
+
+func parseCMSCertificates(input []byte) []*x509.Certificate {
 	certs, err := parseDERChildren(input)
 	if err != nil {
-		return 0, "", ""
+		return nil
 	}
-	count := 0
-	subject := ""
-	issuer := ""
+	out := make([]*x509.Certificate, 0, len(certs))
 	for _, candidate := range certs {
 		if candidate.Class != asn1.ClassUniversal || candidate.Tag != asn1.TagSequence {
 			continue
@@ -450,7 +478,18 @@ func parseCMSCertificateMetadata(input []byte) (int, string, string) {
 		if err != nil {
 			continue
 		}
-		count++
+		out = append(out, cert)
+	}
+	return out
+}
+
+func cmsCertificateMetadata(certs []*x509.Certificate) (int, string, string) {
+	subject := ""
+	issuer := ""
+	for _, cert := range certs {
+		if cert == nil {
+			continue
+		}
 		if subject == "" {
 			subject = cert.Subject.String()
 		}
@@ -458,7 +497,58 @@ func parseCMSCertificateMetadata(input []byte) (int, string, string) {
 			issuer = cert.Issuer.String()
 		}
 	}
-	return count, subject, issuer
+	return len(certs), subject, issuer
+}
+
+type signerCertificateTrustOptions struct {
+	Roots         []*x509.Certificate
+	Intermediates []*x509.Certificate
+	CurrentTime   time.Time
+}
+
+func validateSignerCertificateTrust(cms cmsDetachedSignature, opts signerCertificateTrustOptions) (bool, string) {
+	if len(cms.Certificates) == 0 || cms.Certificates[0] == nil {
+		return false, signatureCertificateTrustValidationInsufficientCertificates
+	}
+	if len(opts.Roots) == 0 {
+		return false, signatureCertificateTrustValidationNotPerformed
+	}
+	roots := x509.NewCertPool()
+	for _, root := range opts.Roots {
+		if root != nil {
+			roots.AddCert(root)
+		}
+	}
+	if len(roots.Subjects()) == 0 {
+		return false, signatureCertificateTrustValidationNotPerformed
+	}
+	intermediates := x509.NewCertPool()
+	for _, cert := range cms.Certificates[1:] {
+		if cert != nil {
+			intermediates.AddCert(cert)
+		}
+	}
+	for _, cert := range opts.Intermediates {
+		if cert != nil {
+			intermediates.AddCert(cert)
+		}
+	}
+	verifyOptions := x509.VerifyOptions{
+		Roots:         roots,
+		Intermediates: intermediates,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+	}
+	if !opts.CurrentTime.IsZero() {
+		verifyOptions.CurrentTime = opts.CurrentTime
+	}
+	if _, err := cms.Certificates[0].Verify(verifyOptions); err != nil {
+		var unknownAuthority x509.UnknownAuthorityError
+		if errors.As(err, &unknownAuthority) {
+			return false, signatureCertificateTrustValidationInsufficientCertificates
+		}
+		return false, signatureCertificateTrustValidationInvalid
+	}
+	return true, signatureCertificateTrustValidationValid
 }
 
 func digestAlgorithmNameFromAlgorithmIdentifier(input asn1.RawValue) string {

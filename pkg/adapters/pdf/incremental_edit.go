@@ -64,6 +64,7 @@ func applyIncrementalTextEdit(input []byte, selector core.Match, mutation core.M
 	if err != nil {
 		return nil, core.Report{}, core.Verification{}, SignaturePreservationVerification{}, err
 	}
+	candidates = filterCanonicalTextCandidatesByMeta(candidates, selector.Meta)
 	if len(candidates) == 0 {
 		return nil, core.Report{}, core.Verification{}, SignaturePreservationVerification{}, fmt.Errorf("no nodes match kind=%q text=%q", KindTextShow, selector.Text)
 	}
@@ -81,6 +82,9 @@ func applyIncrementalTextEdit(input []byte, selector core.Match, mutation core.M
 	}
 
 	candidate := candidates[index]
+	if err := rejectSharedFormXObjectCandidateEdit(selector, len(candidates), candidate); err != nil {
+		return nil, core.Report{}, core.Verification{}, SignaturePreservationVerification{}, err
+	}
 	replacement, replacementProof, err := encodeCanonicalTextReplacement(candidate.Show, mutation.Replace)
 	if err != nil {
 		return nil, core.Report{}, core.Verification{}, SignaturePreservationVerification{}, err

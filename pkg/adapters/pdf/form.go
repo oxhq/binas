@@ -11,26 +11,28 @@ import (
 )
 
 type FormFieldMetadata struct {
-	Index                       int      `json:"index"`
-	Name                        string   `json:"name"`
-	ObjectNumber                *int     `json:"object_number,omitempty"`
-	ObjectGeneration            *int     `json:"object_generation,omitempty"`
-	FieldType                   string   `json:"field_type,omitempty"`
-	AlternateName               *string  `json:"alternate_name,omitempty"`
-	MappingName                 *string  `json:"mapping_name,omitempty"`
-	Value                       *string  `json:"value,omitempty"`
-	DefaultValue                *string  `json:"default_value,omitempty"`
-	Flags                       *int     `json:"flags,omitempty"`
-	FlagNames                   []string `json:"flag_names,omitempty"`
-	TypeFlagNames               []string `json:"type_flag_names,omitempty"`
-	ReadOnly                    bool     `json:"read_only,omitempty"`
-	Required                    bool     `json:"required,omitempty"`
-	NoExport                    bool     `json:"no_export,omitempty"`
-	KidCount                    int      `json:"kid_count"`
-	ButtonWidgetAppearanceProof bool     `json:"button_widget_appearance_proof"`
-	ButtonStates                []string `json:"button_states,omitempty"`
-	Options                     []string `json:"options,omitempty"`
-	SelectedIndexes             []int    `json:"selected_indexes,omitempty"`
+	Index                        int      `json:"index"`
+	Name                         string   `json:"name"`
+	ObjectNumber                 *int     `json:"object_number,omitempty"`
+	ObjectGeneration             *int     `json:"object_generation,omitempty"`
+	FieldType                    string   `json:"field_type,omitempty"`
+	AlternateName                *string  `json:"alternate_name,omitempty"`
+	MappingName                  *string  `json:"mapping_name,omitempty"`
+	Value                        *string  `json:"value,omitempty"`
+	DefaultValue                 *string  `json:"default_value,omitempty"`
+	Flags                        *int     `json:"flags,omitempty"`
+	FlagNames                    []string `json:"flag_names,omitempty"`
+	TypeFlagNames                []string `json:"type_flag_names,omitempty"`
+	ReadOnly                     bool     `json:"read_only,omitempty"`
+	Required                     bool     `json:"required,omitempty"`
+	NoExport                     bool     `json:"no_export,omitempty"`
+	KidCount                     int      `json:"kid_count"`
+	ButtonWidgetAppearanceProof  bool     `json:"button_widget_appearance_proof"`
+	ButtonStates                 []string `json:"button_states,omitempty"`
+	Options                      []string `json:"options,omitempty"`
+	SelectedIndexes              []int    `json:"selected_indexes,omitempty"`
+	AppearanceGenerationStatus   string   `json:"appearance_generation_status,omitempty"`
+	AppearanceGenerationBlockers []string `json:"appearance_generation_blockers,omitempty"`
 }
 
 type FormFieldEditOptions struct {
@@ -1044,24 +1046,27 @@ func collectFormFieldMetadata(graph *pdfGraph, value pdfValue, context formField
 			if ft, ok := formFieldType(v, context); ok {
 				fieldType = string(ft)
 			}
+			appearanceGenerationStatus, appearanceGenerationBlockers := formFieldAppearanceGenerationMetadata(graph, v, context, fieldType)
 			fields = append(fields, FormFieldMetadata{
-				Name:                        fullName,
-				FieldType:                   fieldType,
-				AlternateName:               formFieldTextMetadata(v, "TU"),
-				MappingName:                 formFieldTextMetadata(v, "TM"),
-				Value:                       formFieldValue(v),
-				DefaultValue:                formFieldDefaultValue(v),
-				Flags:                       formFieldFlags(v, context),
-				FlagNames:                   formFieldFlagNames(v, context),
-				TypeFlagNames:               formFieldTypeFlagNames(v, context, fieldType),
-				ReadOnly:                    formFieldFlagSet(v, context, formFieldFlagReadOnly),
-				Required:                    formFieldFlagSet(v, context, formFieldFlagRequired),
-				NoExport:                    formFieldFlagSet(v, context, formFieldFlagNoExport),
-				KidCount:                    formFieldKidCount(v),
-				ButtonWidgetAppearanceProof: formFieldButtonAppearanceProof(graph, v, fieldType),
-				ButtonStates:                formFieldButtonStates(graph, v, fieldType),
-				Options:                     formFieldChoiceOptions(v, fieldType),
-				SelectedIndexes:             formFieldChoiceSelectedIndexes(v, fieldType),
+				Name:                         fullName,
+				FieldType:                    fieldType,
+				AlternateName:                formFieldTextMetadata(v, "TU"),
+				MappingName:                  formFieldTextMetadata(v, "TM"),
+				Value:                        formFieldValue(v),
+				DefaultValue:                 formFieldDefaultValue(v),
+				Flags:                        formFieldFlags(v, context),
+				FlagNames:                    formFieldFlagNames(v, context),
+				TypeFlagNames:                formFieldTypeFlagNames(v, context, fieldType),
+				ReadOnly:                     formFieldFlagSet(v, context, formFieldFlagReadOnly),
+				Required:                     formFieldFlagSet(v, context, formFieldFlagRequired),
+				NoExport:                     formFieldFlagSet(v, context, formFieldFlagNoExport),
+				KidCount:                     formFieldKidCount(v),
+				ButtonWidgetAppearanceProof:  formFieldButtonAppearanceProof(graph, v, fieldType),
+				ButtonStates:                 formFieldButtonStates(graph, v, fieldType),
+				Options:                      formFieldChoiceOptions(v, fieldType),
+				SelectedIndexes:              formFieldChoiceSelectedIndexes(v, fieldType),
+				AppearanceGenerationStatus:   appearanceGenerationStatus,
+				AppearanceGenerationBlockers: appearanceGenerationBlockers,
 			})
 			childContext.nameSegments = append(append([]string{}, context.nameSegments...), name)
 		}
@@ -1196,6 +1201,59 @@ func formFieldTypeFlagNames(dict pdfDict, context formFieldContext, fieldType st
 		return nil
 	}
 	return names
+}
+
+func formFieldAppearanceGenerationMetadata(graph *pdfGraph, dict pdfDict, context formFieldContext, fieldType string) (string, []string) {
+	switch fieldType {
+	case "Tx", "Ch":
+		blockers := formFieldAppearanceGenerationBlockers(dict, context)
+		if len(blockers) > 0 {
+			return "unsafe", blockers
+		}
+		if formFieldHasDirectAppearanceWidgetRect(graph, dict) {
+			return "approximate_supported", nil
+		}
+		return "unsupported", []string{"missing_widget_rect"}
+	case "Btn":
+		if formFieldButtonAppearanceProof(graph, dict, fieldType) {
+			return "existing_button_state_only", nil
+		}
+		return "unsupported", []string{"button_appearance_synthesis_not_supported"}
+	case "":
+		return "unsupported", []string{"unknown_field_type"}
+	default:
+		return "unsupported", []string{"unsupported_field_type"}
+	}
+}
+
+func formFieldAppearanceGenerationBlockers(dict pdfDict, context formFieldContext) []string {
+	if _, hasRichValue := dict["RV"]; hasRichValue {
+		return []string{"rich_text_value"}
+	}
+	if flags, ok := effectiveFormFieldFlags(dict, context); ok && flags&formFieldFlagTxRichText != 0 {
+		return []string{"rich_text_flag"}
+	}
+	return nil
+}
+
+func formFieldHasDirectAppearanceWidgetRect(graph *pdfGraph, dict pdfDict) bool {
+	if kids, ok := dict["Kids"].(pdfArray); ok {
+		if len(kids) == 0 {
+			return false
+		}
+		for _, kid := range kids {
+			widget, ok := resolvePDFDict(graph, kid)
+			if !ok {
+				return false
+			}
+			if _, ok := formWidgetRect(widget); !ok {
+				return false
+			}
+		}
+		return true
+	}
+	_, ok := formWidgetRect(dict)
+	return ok
 }
 
 type formFieldTypeFlagSpec struct {

@@ -3,6 +3,7 @@ package pdf
 import (
 	"bytes"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/oxhq/binas/pkg/core"
@@ -159,6 +160,118 @@ func TestSharedFormXObjectInheritsInvokingPageResourceContext(t *testing.T) {
 	}
 	assertOneTextShow(t, tree, "A", "form_xobject", 3, 7, true)
 	assertOneTextShow(t, tree, "B", "form_xobject", 4, 7, true)
+}
+
+func TestSharedFormXObjectTextMetadataReportsInvocationRisk(t *testing.T) {
+	pageContent := []byte("q\n/Fm1 Do\nQ\n")
+	formContent := []byte("BT\n/F1 12 Tf\n(SHARED) Tj\nET\n")
+	input := testPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+		"<< /Type /Page /Parent 2 0 R /Contents 6 0 R /Resources << /XObject << /Fm1 5 0 R >> >> >>",
+		"<< /Type /Page /Parent 2 0 R /Contents 7 0 R /Resources << /XObject << /Fm1 5 0 R >> >> >>",
+		fmt.Sprintf("<< /Type /XObject /Subtype /Form /Length %d >>\nstream\n%sendstream", len(formContent), formContent),
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(pageContent), pageContent),
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(pageContent), pageContent),
+	)
+
+	tree, err := NewAdapter().Parse(input, core.ParseOptions{Strict: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	matches := tree.Query(core.Match{Kind: KindTextShow, Text: "SHARED"})
+	if len(matches) != 2 {
+		t.Fatalf("shared form matches = %d, want 2", len(matches))
+	}
+	for _, match := range matches {
+		if match.Meta["shared_form_xobject"] != true {
+			t.Fatalf("shared_form_xobject = %v, want true; meta=%+v", match.Meta["shared_form_xobject"], match.Meta)
+		}
+		if match.Meta["form_invocation_count"] != 2 {
+			t.Fatalf("form_invocation_count = %v, want 2; meta=%+v", match.Meta["form_invocation_count"], match.Meta)
+		}
+		if got := fmt.Sprint(match.Meta["form_invoked_page_object_numbers"]); got != "[3 4]" {
+			t.Fatalf("form_invoked_page_object_numbers = %v, want [3 4]", got)
+		}
+	}
+}
+
+func TestSharedFormXObjectPageSpecificTextEditFailsClosed(t *testing.T) {
+	input := sharedFormXObjectPageSpecificTextPDF()
+
+	adapter := NewAdapter()
+	tree, err := adapter.Parse(input, core.ParseOptions{Strict: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = adapter.PlanEdit(tree, core.Match{Kind: KindTextShow, Text: "B"}, core.Mutation{Replace: "D"})
+	if err == nil {
+		t.Fatal("expected shared form XObject isolation refusal")
+	}
+	if !strings.Contains(err.Error(), "shared Form XObject edit isolation") {
+		t.Fatalf("error = %v, want shared Form XObject edit isolation", err)
+	}
+}
+
+func TestSharedFormXObjectCanonicalPageSpecificTextEditFailsClosed(t *testing.T) {
+	input := sharedFormXObjectPageSpecificTextPDF()
+
+	_, _, _, err := ApplyCanonicalEdit(input, core.Match{Kind: KindTextShow, Text: "B"}, core.Mutation{Replace: "D"}, nil)
+	if err == nil {
+		t.Fatal("expected shared form XObject isolation refusal")
+	}
+	if !strings.Contains(err.Error(), "shared Form XObject edit isolation") {
+		t.Fatalf("error = %v, want shared Form XObject edit isolation", err)
+	}
+}
+
+func TestSharedFormXObjectCanonicalPageMetadataSelectorFailsClosed(t *testing.T) {
+	input := sharedFormXObjectSharedTextPDF()
+
+	_, _, _, err := ApplyCanonicalEdit(
+		input,
+		core.Match{Kind: KindTextShow, Text: "SHARED", Meta: map[string]any{"page_object_number": 3}},
+		core.Mutation{Replace: "UPDATED"},
+		nil,
+	)
+	if err == nil {
+		t.Fatal("expected shared form XObject isolation refusal")
+	}
+	if !strings.Contains(err.Error(), "shared Form XObject edit isolation") {
+		t.Fatalf("error = %v, want shared Form XObject edit isolation", err)
+	}
+}
+
+func sharedFormXObjectSharedTextPDF() []byte {
+	pageContent := []byte("q\n/Fm1 Do\nQ\n")
+	formContent := []byte("BT\n/F1 12 Tf\n(SHARED) Tj\nET\n")
+	return testPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+		"<< /Type /Page /Parent 2 0 R /Contents 6 0 R /Resources << /XObject << /Fm1 5 0 R >> >> >>",
+		"<< /Type /Page /Parent 2 0 R /Contents 7 0 R /Resources << /XObject << /Fm1 5 0 R >> >> >>",
+		fmt.Sprintf("<< /Type /XObject /Subtype /Form /Length %d >>\nstream\n%sendstream", len(formContent), formContent),
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(pageContent), pageContent),
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(pageContent), pageContent),
+	)
+}
+
+func sharedFormXObjectPageSpecificTextPDF() []byte {
+	pageContent := []byte("q\n/Fm1 Do\nQ\n")
+	formContent := []byte("BT\n/F1 12 Tf\n<01> Tj\nET\n")
+	return testPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+		"<< /Type /Page /Parent 2 0 R /Contents 8 0 R /Resources << /Font << /F1 5 0 R >> /XObject << /Fm1 7 0 R >> >> >>",
+		"<< /Type /Page /Parent 2 0 R /Contents 9 0 R /Resources << /Font << /F1 6 0 R >> /XObject << /Fm1 7 0 R >> >> >>",
+		"<< /Type /Font /Subtype /Type0 /ToUnicode 10 0 R >>",
+		"<< /Type /Font /Subtype /Type0 /ToUnicode 11 0 R >>",
+		fmt.Sprintf("<< /Type /XObject /Subtype /Form /Length %d >>\nstream\n%sendstream", len(formContent), formContent),
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(pageContent), pageContent),
+		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(pageContent), pageContent),
+		testTwoCharToUnicodeCMapStream("0041", "0043"),
+		testTwoCharToUnicodeCMapStream("0042", "0044"),
+	)
 }
 
 func assertOneTextShow(t *testing.T, tree *core.Tree, text, fontContext string, pageObject, formObject int, inherited bool) {

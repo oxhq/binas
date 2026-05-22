@@ -813,7 +813,53 @@ func (g *pdfGraph) textShowStreamContexts(cmapContext pdfCMapContext) []pdfGraph
 			),
 		})
 	}
+	annotateSharedFormXObjectTextShowContexts(contexts)
 	return contexts
+}
+
+type sharedFormXObjectContextSummary struct {
+	count int
+	pages map[int]bool
+}
+
+func annotateSharedFormXObjectTextShowContexts(contexts []pdfGraphTextShowStreamContext) {
+	summaries := make(map[pdfObjectID]sharedFormXObjectContextSummary)
+	for _, context := range contexts {
+		if context.textContext.formObject == nil {
+			continue
+		}
+		id := *context.textContext.formObject
+		summary := summaries[id]
+		summary.count++
+		if context.textContext.pageObject != nil {
+			if summary.pages == nil {
+				summary.pages = make(map[int]bool)
+			}
+			summary.pages[context.textContext.pageObject.Number] = true
+		}
+		summaries[id] = summary
+	}
+	for i := range contexts {
+		if contexts[i].textContext.formObject == nil {
+			continue
+		}
+		summary := summaries[*contexts[i].textContext.formObject]
+		if summary.count <= 1 {
+			continue
+		}
+		contexts[i].textContext.sharedFormXObject = true
+		contexts[i].textContext.formInvocationCount = summary.count
+		contexts[i].textContext.formInvokedPageObjectNumbers = sortedIntSet(summary.pages)
+	}
+}
+
+func sortedIntSet(values map[int]bool) []int {
+	out := make([]int, 0, len(values))
+	for value := range values {
+		out = append(out, value)
+	}
+	sort.Ints(out)
+	return out
 }
 
 func pdfGraphStreamIsImagePassThrough(stream pdfStreamObject) bool {
@@ -952,6 +998,16 @@ type parsedTextShow struct {
 	End          int
 }
 
+func rejectSharedFormXObjectCandidateEdit(selector core.Match, matchCount int, candidate canonicalTextCandidate) error {
+	if !pdfBoolMetadata(candidate.Show.Meta, "shared_form_xobject") {
+		return nil
+	}
+	if selector.MatchIndex == nil && matchCount > 1 {
+		return nil
+	}
+	return sharedFormXObjectIsolationError(candidate.Show.Meta)
+}
+
 func EditCanonical(input []byte, selector core.Match, mutation core.Mutation, invariants []core.Invariant) ([]byte, core.Report, core.Verification, error) {
 	return editCanonicalWithOptions(input, selector, mutation, invariants, pdfGraphParseOptions{}, pdfCanonicalWriteOptions{})
 }
@@ -1004,6 +1060,7 @@ func editCanonicalWithOptions(input []byte, selector core.Match, mutation core.M
 	if err != nil {
 		return nil, core.Report{}, core.Verification{}, err
 	}
+	candidates = filterCanonicalTextCandidatesByMeta(candidates, selector.Meta)
 	if len(candidates) == 0 {
 		return nil, core.Report{}, core.Verification{}, fmt.Errorf("no nodes match kind=%q text=%q", selector.Kind, selector.Text)
 	}
@@ -1020,6 +1077,9 @@ func editCanonicalWithOptions(input []byte, selector core.Match, mutation core.M
 		return nil, core.Report{}, core.Verification{}, fmt.Errorf("selector matched %d nodes; pass --match-index N (zero-based, 0..%d) to choose one", len(candidates), len(candidates)-1)
 	}
 	candidate := candidates[index]
+	if err := rejectSharedFormXObjectCandidateEdit(selector, len(candidates), candidate); err != nil {
+		return nil, core.Report{}, core.Verification{}, err
+	}
 	replacement, replacementProof, err := encodeCanonicalTextReplacement(candidate.Show, mutation.Replace)
 	if err != nil {
 		return nil, core.Report{}, core.Verification{}, err
@@ -1135,6 +1195,32 @@ func (g *pdfGraph) textShowCandidatesWithCMapContext(text string, cmapContext pd
 	return candidates, nil
 }
 
+func filterCanonicalTextCandidatesByMeta(candidates []canonicalTextCandidate, want map[string]any) []canonicalTextCandidate {
+	if len(want) == 0 {
+		return candidates
+	}
+	out := make([]canonicalTextCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if pdfMetadataMatches(candidate.Show.Meta, want) {
+			out = append(out, candidate)
+		}
+	}
+	return out
+}
+
+func pdfMetadataMatches(meta, want map[string]any) bool {
+	for key, value := range want {
+		got, ok := meta[key]
+		if !ok {
+			return false
+		}
+		if fmt.Sprint(got) != fmt.Sprint(value) {
+			return false
+		}
+	}
+	return true
+}
+
 func parseCanonicalTextShows(input []byte, ctx textShowContext) []parsedTextShow {
 	shows := make([]parsedTextShow, 0)
 	activeFont := ""
@@ -1237,6 +1323,7 @@ func parseCanonicalTextShows(input []byte, ctx textShowContext) []parsedTextShow
 			"encoded":  encoded,
 			"encoding": encoding,
 		}
+		enrichTextShowContextMetadata(meta, ctx)
 		if activeFont != "" {
 			meta["font"] = activeFont
 		}

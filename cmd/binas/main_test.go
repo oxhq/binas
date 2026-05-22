@@ -5690,14 +5690,23 @@ func captureStdoutAndError(t *testing.T, fn func() error) (string, error) {
 		t.Fatal(err)
 	}
 	os.Stdout = w
+	type captureResult struct {
+		out string
+		err error
+	}
+	done := make(chan captureResult, 1)
+	go func() {
+		buf := new(bytes.Buffer)
+		_, err := buf.ReadFrom(r)
+		done <- captureResult{out: buf.String(), err: err}
+	}()
 	runErr := fn()
 	_ = w.Close()
 	os.Stdout = old
-	out, err := os.ReadFile(r.Name())
-	if err == nil && len(out) > 0 {
-		return string(out), runErr
+	result := <-done
+	_ = r.Close()
+	if result.err != nil {
+		t.Fatal(result.err)
 	}
-	buf := new(bytes.Buffer)
-	_, _ = buf.ReadFrom(r)
-	return buf.String(), runErr
+	return result.out, runErr
 }

@@ -174,6 +174,9 @@ func (Adapter) PlanEdit(tree *core.Tree, selector core.Match, mutation core.Muta
 		return nil, fmt.Errorf("match index %d out of range for %d matches", index, len(matches))
 	}
 	target := matches[index]
+	if err := rejectSharedFormXObjectTreeEdit(selector, mutation, len(matches), target); err != nil {
+		return nil, err
+	}
 	if filter, ok := target.Meta["stream_filter"].(string); ok {
 		decodeParms, _ := target.Meta["stream_decode_parms"].(string)
 		if !pdfStreamFilterCapabilityAllowsTextTargetsWithDecodeParms(filter, decodeParms) {
@@ -280,6 +283,26 @@ func (Adapter) PlanEdit(tree *core.Tree, selector core.Match, mutation core.Muta
 		},
 		Meta: layoutProofMeta,
 	}, nil
+}
+
+func rejectSharedFormXObjectTreeEdit(selector core.Match, mutation core.Mutation, matchCount int, target core.Node) error {
+	if !pdfBoolMetadata(target.Meta, "shared_form_xobject") {
+		return nil
+	}
+	if selector.MatchIndex == nil && mutation.Index == 0 && matchCount > 1 {
+		return nil
+	}
+	return sharedFormXObjectIsolationError(target.Meta)
+}
+
+func sharedFormXObjectIsolationError(meta map[string]any) error {
+	formObject, _ := metaInt(meta, "form_object_number")
+	invocations, _ := metaInt(meta, "form_invocation_count")
+	pages := fmt.Sprint(meta["form_invoked_page_object_numbers"])
+	if formObject > 0 && invocations > 0 {
+		return fmt.Errorf("shared Form XObject edit isolation: form object %d is invoked %d times across page objects %s; refusing context-specific text edit because isolated form stream cloning is not implemented", formObject, invocations, pages)
+	}
+	return errors.New("shared Form XObject edit isolation: refusing context-specific text edit because isolated form stream cloning is not implemented")
 }
 
 func (Adapter) Apply(input []byte, plan *core.EditPlan) ([]byte, core.Report, error) {
@@ -1405,22 +1428,48 @@ func findArrayEnd(input []byte, start int) (int, bool) {
 }
 
 type textShowContext struct {
-	sourceOffset       int
-	streamSpan         core.Span
-	streamFilter       string
-	streamDecodeParms  string
-	streamEncoded      []byte
-	decodedContent     []byte
-	fontContext        string
-	pageObject         *pdfObjectID
-	formObject         *pdfObjectID
-	inheritedResources bool
-	formDepth          int
-	toUnicode          *toUnicodeCMap
-	fontToUnicode      map[string]*toUnicodeCMap
-	fontEncodings      map[string]*pdfSimpleFontEncoding
-	fontMetrics        map[string]pdfSimpleFontMetrics
-	cidMetrics         map[string]pdfCIDFontMetrics
+	sourceOffset                 int
+	streamSpan                   core.Span
+	streamFilter                 string
+	streamDecodeParms            string
+	streamEncoded                []byte
+	decodedContent               []byte
+	fontContext                  string
+	pageObject                   *pdfObjectID
+	formObject                   *pdfObjectID
+	inheritedResources           bool
+	formDepth                    int
+	sharedFormXObject            bool
+	formInvocationCount          int
+	formInvokedPageObjectNumbers []int
+	toUnicode                    *toUnicodeCMap
+	fontToUnicode                map[string]*toUnicodeCMap
+	fontEncodings                map[string]*pdfSimpleFontEncoding
+	fontMetrics                  map[string]pdfSimpleFontMetrics
+	cidMetrics                   map[string]pdfCIDFontMetrics
+}
+
+func enrichTextShowContextMetadata(meta map[string]any, ctx textShowContext) {
+	if ctx.fontContext != "" {
+		meta["font_context"] = ctx.fontContext
+	}
+	if ctx.pageObject != nil {
+		meta["page_object_number"] = ctx.pageObject.Number
+		meta["page_object_generation"] = ctx.pageObject.Generation
+	}
+	if ctx.formObject != nil {
+		meta["form_object_number"] = ctx.formObject.Number
+		meta["form_object_generation"] = ctx.formObject.Generation
+		meta["form_depth"] = ctx.formDepth
+	}
+	if ctx.inheritedResources {
+		meta["inherited_resources"] = true
+	}
+	if ctx.sharedFormXObject {
+		meta["shared_form_xobject"] = true
+		meta["form_invocation_count"] = ctx.formInvocationCount
+		meta["form_invoked_page_object_numbers"] = append([]int(nil), ctx.formInvokedPageObjectNumbers...)
+	}
 }
 
 func parseTextShow(input []byte, start, end int, tree *core.Tree, streamID core.NodeID, ctx textShowContext) {
@@ -1529,21 +1578,7 @@ func parseTextShow(input []byte, start, end int, tree *core.Tree, streamID core.
 			"encoded":  encoded,
 			"encoding": encoding,
 		}
-		if ctx.fontContext != "" {
-			meta["font_context"] = ctx.fontContext
-		}
-		if ctx.pageObject != nil {
-			meta["page_object_number"] = ctx.pageObject.Number
-			meta["page_object_generation"] = ctx.pageObject.Generation
-		}
-		if ctx.formObject != nil {
-			meta["form_object_number"] = ctx.formObject.Number
-			meta["form_object_generation"] = ctx.formObject.Generation
-			meta["form_depth"] = ctx.formDepth
-		}
-		if ctx.inheritedResources {
-			meta["inherited_resources"] = true
-		}
+		enrichTextShowContextMetadata(meta, ctx)
 		enrichTextShowTextStateMetadata(meta, textState.Snapshot())
 		if encoding == "hex-cmap" || encoding == "tj-array-cmap" {
 			meta["cmap"] = ctx.cmapForFont(activeFont)

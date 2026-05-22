@@ -39,34 +39,36 @@ type AnnotationContentsEditOptions struct {
 }
 
 type AnnotationCandidateMetadata struct {
-	Index                int       `json:"index"`
-	ObjectNumber         *int      `json:"object_number,omitempty"`
-	ObjectGeneration     *int      `json:"object_generation,omitempty"`
-	PageIndex            *int      `json:"page_index,omitempty"`
-	PageObjectNumber     *int      `json:"page_object_number,omitempty"`
-	PageObjectGeneration *int      `json:"page_object_generation,omitempty"`
-	Subtype              string    `json:"subtype,omitempty"`
-	Contents             string    `json:"contents"`
-	Name                 string    `json:"name,omitempty"`
-	Modified             string    `json:"modified,omitempty"`
-	Title                string    `json:"title,omitempty"`
-	HasAppearance        bool      `json:"has_appearance"`
-	Rect                 []float64 `json:"rect,omitempty"`
-	Color                []float64 `json:"color,omitempty"`
-	Border               []float64 `json:"border,omitempty"`
-	QuadPointsCount      int       `json:"quad_points_count,omitempty"`
-	Flags                int       `json:"flags"`
-	FlagNames            []string  `json:"flag_names,omitempty"`
-	Invisible            bool      `json:"invisible"`
-	Hidden               bool      `json:"hidden"`
-	Print                bool      `json:"print"`
-	NoZoom               bool      `json:"no_zoom"`
-	NoRotate             bool      `json:"no_rotate"`
-	NoView               bool      `json:"no_view"`
-	ReadOnly             bool      `json:"read_only"`
-	Locked               bool      `json:"locked"`
-	ToggleNoView         bool      `json:"toggle_no_view"`
-	LockedContents       bool      `json:"locked_contents"`
+	Index                        int       `json:"index"`
+	ObjectNumber                 *int      `json:"object_number,omitempty"`
+	ObjectGeneration             *int      `json:"object_generation,omitempty"`
+	PageIndex                    *int      `json:"page_index,omitempty"`
+	PageObjectNumber             *int      `json:"page_object_number,omitempty"`
+	PageObjectGeneration         *int      `json:"page_object_generation,omitempty"`
+	Subtype                      string    `json:"subtype,omitempty"`
+	Contents                     string    `json:"contents"`
+	Name                         string    `json:"name,omitempty"`
+	Modified                     string    `json:"modified,omitempty"`
+	Title                        string    `json:"title,omitempty"`
+	HasAppearance                bool      `json:"has_appearance"`
+	Rect                         []float64 `json:"rect,omitempty"`
+	Color                        []float64 `json:"color,omitempty"`
+	Border                       []float64 `json:"border,omitempty"`
+	QuadPointsCount              int       `json:"quad_points_count,omitempty"`
+	Flags                        int       `json:"flags"`
+	FlagNames                    []string  `json:"flag_names,omitempty"`
+	Invisible                    bool      `json:"invisible"`
+	Hidden                       bool      `json:"hidden"`
+	Print                        bool      `json:"print"`
+	NoZoom                       bool      `json:"no_zoom"`
+	NoRotate                     bool      `json:"no_rotate"`
+	NoView                       bool      `json:"no_view"`
+	ReadOnly                     bool      `json:"read_only"`
+	Locked                       bool      `json:"locked"`
+	ToggleNoView                 bool      `json:"toggle_no_view"`
+	LockedContents               bool      `json:"locked_contents"`
+	AppearanceGenerationStatus   string    `json:"appearance_generation_status,omitempty"`
+	AppearanceGenerationBlockers []string  `json:"appearance_generation_blockers,omitempty"`
 }
 
 type annotationFlagDefinition struct {
@@ -290,6 +292,38 @@ func supportedBasicAnnotationAppearanceSubtype(subtype string) bool {
 	default:
 		return false
 	}
+}
+
+func annotationAppearanceGenerationMetadata(dict pdfDict) (string, []string) {
+	blockers := annotationAppearanceGenerationUnsafeBlockers(dict)
+	if len(blockers) > 0 {
+		return "unsafe", blockers
+	}
+	if !supportedBasicAnnotationAppearanceSubtype(annotationSubtype(dict)) {
+		return "unsupported", []string{"unsupported_subtype"}
+	}
+	rect := annotationRect(dict)
+	if len(rect) != 4 || rect[2] <= rect[0] || rect[3] <= rect[1] {
+		return "unsupported", []string{"missing_usable_rect"}
+	}
+	return "approximate_supported", nil
+}
+
+func annotationAppearanceGenerationUnsafeBlockers(dict pdfDict) []string {
+	blockers := make([]string, 0, 3)
+	if annotationHasRichTextContent(dict) {
+		blockers = append(blockers, "rich_text_content")
+	}
+	if annotationHasJavaScriptAction(dict) {
+		blockers = append(blockers, "javascript_action")
+	}
+	if _, ok := dict["AA"]; ok {
+		blockers = append(blockers, "additional_actions")
+	}
+	if len(blockers) == 0 {
+		return nil
+	}
+	return blockers
 }
 
 func basicAnnotationAppearanceStream(width, height float64, contents string) (pdfStreamObject, error) {
@@ -685,20 +719,23 @@ func (p annotationPageReference) dict() pdfDict {
 
 func (c annotationCandidate) metadata() AnnotationCandidateMetadata {
 	flags := annotationFlags(c.Dict)
+	appearanceGenerationStatus, appearanceGenerationBlockers := annotationAppearanceGenerationMetadata(c.Dict)
 	metadata := AnnotationCandidateMetadata{
-		Index:           c.Index,
-		Subtype:         annotationSubtype(c.Dict),
-		Contents:        c.OldContent,
-		Name:            annotationTextField(c.Dict, "NM"),
-		Modified:        annotationTextField(c.Dict, "M"),
-		Title:           annotationTextField(c.Dict, "T"),
-		HasAppearance:   annotationHasAppearance(c.Dict),
-		Rect:            annotationRect(c.Dict),
-		Color:           annotationNumericArray(c.Dict, "C"),
-		Border:          annotationNumericArray(c.Dict, "Border"),
-		QuadPointsCount: annotationQuadPointsCount(c.Dict),
-		Flags:           flags,
-		FlagNames:       annotationFlagNames(flags),
+		Index:                        c.Index,
+		Subtype:                      annotationSubtype(c.Dict),
+		Contents:                     c.OldContent,
+		Name:                         annotationTextField(c.Dict, "NM"),
+		Modified:                     annotationTextField(c.Dict, "M"),
+		Title:                        annotationTextField(c.Dict, "T"),
+		HasAppearance:                annotationHasAppearance(c.Dict),
+		Rect:                         annotationRect(c.Dict),
+		Color:                        annotationNumericArray(c.Dict, "C"),
+		Border:                       annotationNumericArray(c.Dict, "Border"),
+		QuadPointsCount:              annotationQuadPointsCount(c.Dict),
+		Flags:                        flags,
+		FlagNames:                    annotationFlagNames(flags),
+		AppearanceGenerationStatus:   appearanceGenerationStatus,
+		AppearanceGenerationBlockers: appearanceGenerationBlockers,
 	}
 	metadata.Invisible = annotationFlagSet(flags, "invisible")
 	metadata.Hidden = annotationFlagSet(flags, "hidden")

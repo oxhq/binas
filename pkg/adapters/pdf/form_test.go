@@ -451,6 +451,40 @@ func TestFormFieldEditVerificationRejectsAppearanceWithoutGeneratedContent(t *te
 	}
 }
 
+func TestListFormFieldsReportsAppearanceGenerationStatus(t *testing.T) {
+	input := formTestPDF(
+		"<< /Type /Catalog /AcroForm 2 0 R >>",
+		"<< /Fields [3 0 R 4 0 R] >>",
+		"<< /FT /Tx /T (payer.name) /V (Old Name) /Rect [0 0 120 20] >>",
+		fmt.Sprintf("<< /FT /Tx /T (payer.rich) /V (Old Name) /RV (<b>Old Name</b>) /Ff %d /Rect [0 0 120 20] >>", formFieldFlagTxRichText),
+	)
+
+	fields, err := ListFormFields(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fields) != 2 {
+		t.Fatalf("field count = %d, want 2: %+v", len(fields), fields)
+	}
+	if fields[0].AppearanceGenerationStatus != "approximate_supported" || len(fields[0].AppearanceGenerationBlockers) != 0 {
+		t.Fatalf("plain field appearance status = %q blockers %+v", fields[0].AppearanceGenerationStatus, fields[0].AppearanceGenerationBlockers)
+	}
+	if fields[1].AppearanceGenerationStatus != "unsafe" {
+		t.Fatalf("rich field appearance status = %q, want unsafe", fields[1].AppearanceGenerationStatus)
+	}
+	assertStringSliceEqual(t, fields[1].AppearanceGenerationBlockers, []string{"rich_text_value"})
+
+	encoded, err := json.Marshal(fields[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{`"appearance_generation_status":"unsafe"`, `"appearance_generation_blockers":["rich_text_value"]`} {
+		if !bytes.Contains(encoded, []byte(key)) {
+			t.Fatalf("encoded metadata missing %s: %s", key, encoded)
+		}
+	}
+}
+
 func TestFormFieldEditVerificationRequiresEveryWidgetAppearanceToMatch(t *testing.T) {
 	output := formTestPDF(
 		"<< /Type /Catalog /AcroForm 2 0 R >>",

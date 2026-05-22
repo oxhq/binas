@@ -2,12 +2,18 @@ package pdf
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/big"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSignatureInfoNoSignature(t *testing.T) {
@@ -146,6 +152,12 @@ func TestSignatureInfoValidatesCMSDetachedMessageDigestAgainstByteRange(t *testi
 	if info.CryptographicValidationStatus != signatureCryptographicValidationByteRangeDigestValid {
 		t.Fatalf("CryptographicValidationStatus = %q, want %q", info.CryptographicValidationStatus, signatureCryptographicValidationByteRangeDigestValid)
 	}
+	if !info.ByteRangeDigestValidation || info.ByteRangeDigestValidationStatus != signatureByteRangeDigestValidationValid {
+		t.Fatalf("byte-range digest validation = %t/%q, want true/%q", info.ByteRangeDigestValidation, info.ByteRangeDigestValidationStatus, signatureByteRangeDigestValidationValid)
+	}
+	if info.CertificateTrustValidation || info.CertificateTrustValidationStatus != signatureCertificateTrustValidationInsufficientCertificates {
+		t.Fatalf("certificate trust validation = %t/%q, want false/%q", info.CertificateTrustValidation, info.CertificateTrustValidationStatus, signatureCertificateTrustValidationInsufficientCertificates)
+	}
 	if info.SignatureContainer != "pkcs7" {
 		t.Fatalf("SignatureContainer = %q, want pkcs7", info.SignatureContainer)
 	}
@@ -172,8 +184,52 @@ func TestSignatureInfoFailsClosedWhenCMSDetachedMessageDigestMismatchesByteRange
 	if info.CryptographicValidationStatus != signatureCryptographicValidationByteRangeDigestMismatch {
 		t.Fatalf("CryptographicValidationStatus = %q, want %q", info.CryptographicValidationStatus, signatureCryptographicValidationByteRangeDigestMismatch)
 	}
+	if info.ByteRangeDigestValidation || info.ByteRangeDigestValidationStatus != signatureByteRangeDigestValidationMismatch {
+		t.Fatalf("byte-range digest validation = %t/%q, want false/%q", info.ByteRangeDigestValidation, info.ByteRangeDigestValidationStatus, signatureByteRangeDigestValidationMismatch)
+	}
+	if info.CertificateTrustValidation || info.CertificateTrustValidationStatus != signatureCertificateTrustValidationInsufficientCertificates {
+		t.Fatalf("certificate trust validation = %t/%q, want false/%q", info.CertificateTrustValidation, info.CertificateTrustValidationStatus, signatureCertificateTrustValidationInsufficientCertificates)
+	}
 	if info.DigestAlgorithm != "sha256" || info.DigestAlgorithmStatus != signatureDigestAlgorithmCMSAuthenticatedAttribute {
 		t.Fatalf("digest algorithm = %q/%q, want sha256/%q", info.DigestAlgorithm, info.DigestAlgorithmStatus, signatureDigestAlgorithmCMSAuthenticatedAttribute)
+	}
+}
+
+func TestSignatureInfoCertificateTrustStatusIsNotPerformedWithoutCallerRoots(t *testing.T) {
+	rootDER, _, leafDER := testCertificateChain(t)
+	input := signedPDFWithCMSMessageDigestAndCertificates(t, nil, [][]byte{leafDER, rootDER})
+
+	info := inspectSignatureInfo(input)
+
+	if !info.ByteRangeDigestValidation || info.ByteRangeDigestValidationStatus != signatureByteRangeDigestValidationValid {
+		t.Fatalf("byte-range digest validation = %t/%q, want true/%q", info.ByteRangeDigestValidation, info.ByteRangeDigestValidationStatus, signatureByteRangeDigestValidationValid)
+	}
+	if info.CertificateCount != 2 {
+		t.Fatalf("CertificateCount = %d, want 2", info.CertificateCount)
+	}
+	if info.CertificateTrustValidation || info.CertificateTrustValidationStatus != signatureCertificateTrustValidationNotPerformed {
+		t.Fatalf("certificate trust validation = %t/%q, want false/%q", info.CertificateTrustValidation, info.CertificateTrustValidationStatus, signatureCertificateTrustValidationNotPerformed)
+	}
+}
+
+func TestValidateSignerCertificateTrustUsesOnlyCallerProvidedChain(t *testing.T) {
+	rootDER, root, leafDER := testCertificateChain(t)
+	cms := cmsDetachedSignature{Certificates: parseCMSCertificates(bytes.Join([][]byte{leafDER, rootDER}, nil))}
+	now := time.Date(2026, 5, 22, 12, 0, 0, 0, time.UTC)
+
+	valid, status := validateSignerCertificateTrust(cms, signerCertificateTrustOptions{Roots: []*x509.Certificate{root}, CurrentTime: now})
+	if !valid || status != signatureCertificateTrustValidationValid {
+		t.Fatalf("trust validation = %t/%q, want true/%q", valid, status, signatureCertificateTrustValidationValid)
+	}
+
+	valid, status = validateSignerCertificateTrust(cmsDetachedSignature{}, signerCertificateTrustOptions{Roots: []*x509.Certificate{root}, CurrentTime: now})
+	if valid || status != signatureCertificateTrustValidationInsufficientCertificates {
+		t.Fatalf("trust validation without certs = %t/%q, want false/%q", valid, status, signatureCertificateTrustValidationInsufficientCertificates)
+	}
+
+	valid, status = validateSignerCertificateTrust(cms, signerCertificateTrustOptions{CurrentTime: now})
+	if valid || status != signatureCertificateTrustValidationNotPerformed {
+		t.Fatalf("trust validation without caller roots = %t/%q, want false/%q", valid, status, signatureCertificateTrustValidationNotPerformed)
 	}
 }
 
@@ -192,16 +248,20 @@ func TestSignatureInfoCAdESSubFilterContainerHint(t *testing.T) {
 }
 
 func signedPDFWithCMSMessageDigest(t *testing.T, mutateDigest func([]byte) []byte) []byte {
+	return signedPDFWithCMSMessageDigestAndCertificates(t, mutateDigest, nil)
+}
+
+func signedPDFWithCMSMessageDigestAndCertificates(t *testing.T, mutateDigest func([]byte) []byte, certificates [][]byte) []byte {
 	t.Helper()
 
 	zeroDigest := make([]byte, sha256.Size)
-	placeholderCMS := append(minimalDetachedCMSWithMessageDigest(zeroDigest), make([]byte, 8)...)
+	placeholderCMS := append(minimalDetachedCMSWithMessageDigestAndCertificates(zeroDigest, certificates), make([]byte, 8)...)
 	input, ranges := signedPDFWithContentsPlaceholder(t, len(placeholderCMS))
 	digest := sha256DigestForRanges(input, ranges)
 	if mutateDigest != nil {
 		digest = mutateDigest(digest)
 	}
-	cms := append(minimalDetachedCMSWithMessageDigest(digest), make([]byte, 8)...)
+	cms := append(minimalDetachedCMSWithMessageDigestAndCertificates(digest, certificates), make([]byte, 8)...)
 	if len(cms) != len(placeholderCMS) {
 		t.Fatalf("CMS length changed from %d to %d", len(placeholderCMS), len(cms))
 	}
@@ -255,6 +315,10 @@ func sha256DigestForRanges(input []byte, ranges []signatureByteRange) []byte {
 }
 
 func minimalDetachedCMSWithMessageDigest(digest []byte) []byte {
+	return minimalDetachedCMSWithMessageDigestAndCertificates(digest, nil)
+}
+
+func minimalDetachedCMSWithMessageDigestAndCertificates(digest []byte, certificates [][]byte) []byte {
 	messageDigestAttr := derSeq(
 		derOID(0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x04),
 		derSet(derOctetString(digest)),
@@ -267,16 +331,64 @@ func minimalDetachedCMSWithMessageDigest(digest []byte) []byte {
 		derAlgorithmIdentifier(derOID(0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01)),
 		derOctetString([]byte{0}),
 	)
-	signedData := derSeq(
+	signedDataParts := [][]byte{
 		derInteger(1),
 		derSet(derAlgorithmIdentifier(derOID(0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01))),
 		derSeq(derOID(0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01)),
-		derSet(signerInfo),
-	)
+	}
+	if len(certificates) > 0 {
+		signedDataParts = append(signedDataParts, derConstructed(0, bytes.Join(certificates, nil)))
+	}
+	signedDataParts = append(signedDataParts, derSet(signerInfo))
+	signedData := derSeq(signedDataParts...)
 	return derSeq(
 		derOID(0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02),
 		derConstructed(0, signedData),
 	)
+}
+
+func testCertificateChain(t *testing.T) ([]byte, *x509.Certificate, []byte) {
+	t.Helper()
+
+	rootKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notBefore := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	notAfter := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
+	rootTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "Binas Test Root"},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	rootDER, err := x509.CreateCertificate(rand.Reader, rootTemplate, rootTemplate, &rootKey.PublicKey, rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := x509.ParseCertificate(rootDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "Binas Test Signer"},
+		NotBefore:    notBefore,
+		NotAfter:     notAfter,
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, root, &leafKey.PublicKey, rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rootDER, root, leafDER
 }
 
 func derAlgorithmIdentifier(oid []byte) []byte {
