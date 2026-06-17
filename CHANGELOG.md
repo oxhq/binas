@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.2.0 - 2026-06-17
+
+- Add exported PDF graph traversal primitives for catalog, page tree, name tree,
+  object resolution, stream access, and object-stream provenance.
+- Add canonical page copy, extract, and merge helpers with reparse, page-count,
+  text, resource, and dangling-reference verification.
+- Add page insert and rotate/crop transform helpers on the canonical page writer
+  path.
+- Preserve and reconcile catalog structures across canonical page operations,
+  including name trees, page labels, outlines, and AcroForm fields from
+  merged/inserted sources when referenced objects can be cloned safely. Metadata
+  and viewer/open-action entries remain primary-document settings.
+- Add conservative page scale transforms for unfiltered page content streams and
+  expose richer graph provenance/filter metadata.
+- Add narrow form field create/remove APIs, raw stream mutation, simple
+  unfiltered image XObject replacement, and structured unsupported errors for
+  form flattening and inline-image replacement.
+- Add dynamic XFA boundary inspection and Standard Security R2 password
+  encryption/change-password/decrypt-to-plain helpers, with public-key
+  encryption still returning a structured unsupported error.
+- Add a root `github.com/oxhq/binas` fluent API over `core.Adapter` for the
+  shared PDF-now, future-format-later public layer.
+- Re-export the graph and page-operation surface through `pkg/pdfapi` for
+  Go consumers.
+- Re-export form field list/edit, annotation contents edit, XFA semantic update,
+  overlay/OCR fallback, security metadata, and signature preservation/re-signing
+  helpers through `pkg/pdfapi`, keeping `pkg/adapters/pdf` internal-facing for
+  higher-level Go consumers such as OxPDF.
+- Remove the fluent `pdfapi.Document` DSL; direct `pkg/pdfapi` functions remain
+  the PDF-specific helper surface.
+
 ## v0.1.1
 
 Release hygiene update.

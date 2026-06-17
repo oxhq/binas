@@ -136,10 +136,6 @@ func Profile(input []byte, opts ProfileOptions) (ProfileReport, error) {
 	return report, nil
 }
 
-func (d *Document) Profile() (ProfileReport, error) {
-	return Profile(d.input, ProfileOptions{Options: d.opts})
-}
-
 func scanProfileMarkers(input []byte) ProfileMarkers {
 	return ProfileMarkers{
 		Encrypted:   bytes.Contains(input, []byte("/Encrypt")),

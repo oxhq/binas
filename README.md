@@ -26,16 +26,39 @@ binas query C:\path\file.pdf --format pdf --kind pdf.content.text_show --text "I
 binas edit C:\path\file.pdf --format pdf --kind pdf.content.text_show --text "Invoice #1234" --replace "Invoice #5678" --verify reparse,old-gone,new-selectable,page-count-unchanged,no-fallback -o C:\path\out.pdf --json
 ```
 
-Go consumers can use the v0 API without shelling out:
+Go consumers can use the format-neutral v0 API without shelling out:
 
 ```go
-output, report, verification, err := pdfapi.New(input).
-	Rewrite(pdfapi.RewriteModeAuto).
-	FindText("Invoice #1234").
-	ReplaceWith("Invoice #5678").
-	Verify("reparse", "old-gone", "new-selectable", "page-count-unchanged", "no-fallback").
+import (
+	"github.com/oxhq/binas"
+	"github.com/oxhq/binas/pkg/core"
+)
+
+doc := binas.Open(input, binas.WithFormat(binas.PDF))
+output, report, verification, err := doc.
+	Kind("pdf.content.text_show").
+	Text("Invoice #1234").
+	Replace("Invoice #5678").
+	Verify(core.InvariantReparse, core.InvariantOldGone, core.InvariantNewSelectable).
 	Bytes()
 ```
+
+That same fluent layer is backed by `core.Adapter`, so future adapters such as
+ELF can use the same `Open` / `Inspect` / `Query` / `Edit` flow. PDF-specific
+helpers remain in `pkg/pdfapi`:
+
+```go
+graph, err := pdfapi.ParseGraph(input, pdfapi.GraphOptions{})
+pages, err := graph.PageTree()
+output, report, verification, err := pdfapi.Merge([][]byte{left, right})
+```
+
+Canonical page operations preserve and reconcile catalog structures such as name
+trees, page labels, outlines, and AcroForm fields across merged/inserted sources
+when their referenced objects can be cloned safely. Metadata and viewer/open
+action entries remain primary-document settings. Page transforms include
+rotate/crop plus a conservative scale operation that scales page boxes and wraps
+unfiltered content streams with a graphics-state matrix.
 
 ## CLI Surface
 
@@ -85,8 +108,9 @@ Overlay and OCR text-layer output are available only through explicit fallback c
 ## Packages
 
 - `pkg/core`: span-preserving tree, selector, adapter, edit plan, report, and verification types.
+- root package `github.com/oxhq/binas`: fluent, format-neutral API over `core.Adapter`.
 - `pkg/adapters/pdf`: PDF parser, object graph, stream/text/form/annotation/XFA/signature helpers, canonical writer, and verification logic.
-- `pkg/pdfapi`: v0 Go API and fluent DSL for inspect, validate, profile, query, and verified text rewrite over PDF bytes.
+- `pkg/pdfapi`: PDF-specific graph traversal, canonical page copy/insert/extract/merge/transform, narrow form/annotation/XFA/stream/image mutation, explicit overlay/OCR fallback helpers, security/signature inspection and signing helpers, Standard Security password encryption/decrypt-to-plain helpers, and direct PDF text rewrite helpers.
 - `cmd/binas`: CLI for PDF inspection, validation, query, edit, forms, annotations, XFA, overlay/OCR fallback, and signature flows.
 - `cmd/binas-wasm`: browser/WASM entrypoint for inspect, query, and verified text edit over `Uint8Array` PDF bytes.
 

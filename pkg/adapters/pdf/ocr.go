@@ -297,10 +297,11 @@ func ApplyExplicitOCRTextLayer(input []byte, opts OCRTextLayerOptions) ([]byte, 
 	if err != nil {
 		return nil, core.Report{}, core.Verification{}, err
 	}
-	verification, err := verifyExplicitOCRTextLayer(output, opts.Text, len(pages))
+	pageVerification, err := verifyExplicitOCRTextLayerPageOperation(output, opts.Text, len(pages))
 	if err != nil {
 		return nil, core.Report{}, core.Verification{}, err
 	}
+	verification := pageVerification.CoreVerification()
 
 	policy := OverlayPolicy{Fallback: FallbackOCRTextLayer, Mode: FallbackModeExplicit}
 	report := WithFallbackPolicy(core.Report{
@@ -315,13 +316,14 @@ func ApplyExplicitOCRTextLayer(input []byte, opts OCRTextLayerOptions) ([]byte, 
 		},
 		Verification: &verification,
 		Meta: map[string]any{
-			"operation":    "ocr_text_layer_embed",
-			"planned_only": false,
-			"page_index":   opts.PageIndex,
-			"text":         opts.Text,
-			"box":          opts.Box,
-			"confidence":   opts.Confidence,
-			"plan":         plan.Operation,
+			"operation":         "ocr_text_layer_embed",
+			"planned_only":      false,
+			"page_index":        opts.PageIndex,
+			"text":              opts.Text,
+			"box":               opts.Box,
+			"confidence":        opts.Confidence,
+			"plan":              plan.Operation,
+			"page_verification": pageVerification.Metadata(),
 		},
 	}, policy)
 	return output, report, verification, nil
@@ -348,19 +350,20 @@ func ocrTextLayerContentStream(fontName string, opts OCRTextLayerOptions) string
 }
 
 func verifyExplicitOCRTextLayer(output []byte, text string, pageCount int) (core.Verification, error) {
-	graph, err := parsePDFGraph(output)
+	verification, err := verifyExplicitOCRTextLayerPageOperation(output, text, pageCount)
 	if err != nil {
 		return core.Verification{}, err
 	}
-	candidates, err := graph.textShowCandidates(text)
-	if err != nil {
-		return core.Verification{}, err
-	}
-	return core.Verification{
-		ReparseOK:     true,
-		NewSelectable: len(candidates) > 0,
-		PageUnchanged: graph.pageCount() == pageCount,
-	}, nil
+	return verification.CoreVerification(), nil
+}
+
+func verifyExplicitOCRTextLayerPageOperation(output []byte, text string, pageCount int) (PageOperationVerification, error) {
+	return VerifyPageOperationOutput(output, PageOperationVerificationOptions{
+		ExpectedPageCount:  pageCount,
+		ExpectedText:       []string{text},
+		RequirePageContent: true,
+		RequireResources:   true,
+	})
 }
 
 func (b OCRTextLayerBox) validate() error {

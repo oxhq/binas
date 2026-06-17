@@ -120,10 +120,10 @@ func TestProfileReportsFormCapabilities(t *testing.T) {
 	}
 }
 
-func TestDocumentProfileUsesDocumentOptions(t *testing.T) {
+func TestProfileUsesOptions(t *testing.T) {
 	input := testPDFAPIFile("<< /Type /Page >>", flateStreamObject(t, "compressed text"))
 
-	profile, err := New(input).Rewrite(RewriteModePreserveStructure).Profile()
+	profile, err := Profile(input, ProfileOptions{Options: Options{Rewrite: RewriteModePreserveStructure}})
 	if err != nil {
 		t.Fatal(err)
 	}

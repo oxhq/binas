@@ -2,7 +2,7 @@
 //
 // This v0 surface defaults RewriteModeAuto to the canonical PDF rewrite path.
 // That keeps the package shell-free while preserving the adapter's existing
-// parse, edit, report, and verification behavior.
+// parse, graph traversal, page operation, edit, report, and verification behavior.
 package pdfapi
 
 import (
@@ -38,6 +38,10 @@ type TextSelector struct {
 
 type TextReplacement struct {
 	Replace string
+}
+
+func Parse(input []byte, opts core.ParseOptions) (*core.Tree, error) {
+	return pdf.NewAdapter().Parse(input, opts)
 }
 
 func Inspect(input []byte, opts Options) (*core.Tree, error) {

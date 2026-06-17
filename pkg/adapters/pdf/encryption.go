@@ -178,6 +178,19 @@ func encryptPDFObjectValue(security *pdfStandardSecurity, fileKey []byte, id pdf
 			return nil, err
 		}
 		return pdfHexString(hex.EncodeToString(ciphertext)), nil
+	case pdfLiteralString, pdfHexString:
+		plaintext, ok, err := pdfStringBytes(v)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, unsupportedPDFEncryption("encrypted object string has unsupported value type %T", value)
+		}
+		ciphertext, err := security.encryptObject(fileKey, id, plaintext)
+		if err != nil {
+			return nil, err
+		}
+		return pdfHexString(hex.EncodeToString(ciphertext)), nil
 	case pdfArray:
 		out := make(pdfArray, len(v))
 		for i, item := range v {

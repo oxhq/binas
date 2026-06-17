@@ -86,10 +86,11 @@ func ApplyExplicitOverlayStamp(input []byte, opts ExplicitOverlayStampOptions) (
 	if err != nil {
 		return nil, core.Report{}, core.Verification{}, err
 	}
-	verification, err := verifyExplicitOverlayStamp(output, opts.Text, len(pages))
+	pageVerification, err := verifyExplicitOverlayStampPageOperation(output, opts.Text, len(pages))
 	if err != nil {
 		return nil, core.Report{}, core.Verification{}, err
 	}
+	verification := pageVerification.CoreVerification()
 	report := WithFallbackPolicy(core.Report{
 		Format:        "pdf",
 		Edit:          explicitOverlayStampOperation,
@@ -102,8 +103,9 @@ func ApplyExplicitOverlayStamp(input []byte, opts ExplicitOverlayStampOptions) (
 		},
 		Verification: &verification,
 		Meta: map[string]any{
-			"page_index": opts.PageIndex,
-			"operation":  "overlay_stamp",
+			"page_index":        opts.PageIndex,
+			"operation":         "overlay_stamp",
+			"page_verification": pageVerification.Metadata(),
 		},
 	}, OverlayPolicy{Fallback: FallbackOverlay, Mode: FallbackModeExplicit})
 	return output, report, verification, nil
@@ -234,17 +236,18 @@ func overlayStampContentStream(fontName string, opts ExplicitOverlayStampOptions
 }
 
 func verifyExplicitOverlayStamp(output []byte, text string, pageCount int) (core.Verification, error) {
-	graph, err := parsePDFGraph(output)
+	verification, err := verifyExplicitOverlayStampPageOperation(output, text, pageCount)
 	if err != nil {
 		return core.Verification{}, err
 	}
-	candidates, err := graph.textShowCandidates(text)
-	if err != nil {
-		return core.Verification{}, err
-	}
-	return core.Verification{
-		ReparseOK:     true,
-		NewSelectable: len(candidates) > 0,
-		PageUnchanged: graph.pageCount() == pageCount,
-	}, nil
+	return verification.CoreVerification(), nil
+}
+
+func verifyExplicitOverlayStampPageOperation(output []byte, text string, pageCount int) (PageOperationVerification, error) {
+	return VerifyPageOperationOutput(output, PageOperationVerificationOptions{
+		ExpectedPageCount:  pageCount,
+		ExpectedText:       []string{text},
+		RequirePageContent: true,
+		RequireResources:   true,
+	})
 }
