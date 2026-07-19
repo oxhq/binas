@@ -1,6 +1,6 @@
 # Release Surface
 
-This document describes the Go CLI surface for the PDF proof slice. It is intentionally narrower than a general PDF editor. The in-tree Rust workspace and Rust OXPDF consumer use local development sources, which do not by themselves prove crates.io publication, an installed registry consumer, or a completed release.
+This document describes the frozen Go v0.2 CLI surface used as the PDF oracle and rollback slice. It is intentionally narrower than a general PDF editor. The Rust 0.1.1 engine crates are published on crates.io, and the Rust OXPDF cutover consumes `binas-pdf` from the registry. Registry publication, a clean CLI install, and hosted multi-OS CI prove the released artifacts and automated gates; they do not prove independent PDF interoperability, real HSM/TSA behavior, or production deployment.
 
 For the semantic edit contract behind these CLI fields, including the difference between fail-closed boundaries and detection-only warnings, see [pdf-semantic-boundaries.md](pdf-semantic-boundaries.md).
 

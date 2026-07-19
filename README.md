@@ -1,6 +1,6 @@
 # binas
 
-`binas` is a bounded PDF inspection and verified rewrite engine. The active rewrite is a four-crate Rust workspace; the Go v0.2 implementation remains the frozen oracle and rollback surface until the Rust consumer and release gates pass.
+`binas` is a bounded PDF inspection and verified rewrite engine. The active implementation is a four-crate Rust workspace; the Go v0.2 implementation remains the frozen oracle and rollback surface during the Rust consumer cutover.
 
 The engine parses PDF object/content structure, exposes queryable nodes, and applies fail-closed rewrites that are verified by reparsing the output. It is not a renderer or general visual PDF editor.
 
