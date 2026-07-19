@@ -1,5 +1,9 @@
 # Changelog
 
+## Rust 0.1.1
+
+- Report the Apache-2.0 SPDX license correctly on crates.io and include the canonical license in every published crate archive.
+
 ## Rust 0.1.0
 
 - Introduces the four-crate Rust workspace: `binas-core`, `binas-pdf`, `binas-cli`, and the non-crates.io `binas-pdf-wasm` binding.

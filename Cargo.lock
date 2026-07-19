@@ -145,7 +145,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "binas-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "binas-pdf",
  "clap",
@@ -156,7 +156,7 @@ dependencies = [
 
 [[package]]
 name = "binas-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -164,7 +164,7 @@ dependencies = [
 
 [[package]]
 name = "binas-pdf"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes",
  "binas-core",
@@ -193,7 +193,7 @@ dependencies = [
 
 [[package]]
 name = "binas-pdf-wasm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "binas-pdf",
  "js-sys",
