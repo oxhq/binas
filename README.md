@@ -1,10 +1,33 @@
 # binas
 
-`binas` is a Go-first binary AST and verified rewrite engine. The first production adapter is PDF: it parses PDF object/content structure, exposes queryable nodes, and applies fail-closed rewrites that are verified by reparsing the output.
+`binas` is a bounded PDF inspection and verified rewrite engine. The active rewrite is a four-crate Rust workspace; the Go v0.2 implementation remains the frozen oracle and rollback surface until the Rust consumer and release gates pass.
 
-The current release is intentionally narrow. It is useful for inspecting PDFs, querying selectable text, replacing supported text operands, filling supported AcroForm fields, updating supported annotations/XFA packets, adding explicit overlay/OCR text-layer fallbacks, and inspecting or explicitly handling signature boundaries. It is not a general visual PDF editor.
+The engine parses PDF object/content structure, exposes queryable nodes, and applies fail-closed rewrites that are verified by reparsing the output. It is not a renderer or general visual PDF editor.
 
-## Install
+## Rust workspace
+
+For a published Rust release, add the engine or install the CLI from crates.io:
+
+```powershell
+cargo add binas-pdf
+cargo install binas-cli
+```
+
+To build and verify the current checkout instead:
+
+```powershell
+cargo test --workspace
+cargo run -p binas-cli -- inspect C:\path\file.pdf --json
+```
+
+- `binas-pdf`: public PDF engine and consumer API.
+- `binas-core`: shared checked spans, diagnostics, and verification vocabulary.
+- `binas-cli`: installs the `binas` executable.
+- `binas-pdf-wasm`: browser binding built from this workspace; it is not a crates.io package.
+
+Rust releases and their proof boundaries are recorded in [CHANGELOG.md](CHANGELOG.md).
+
+## Install Go v0.2
 
 ```powershell
 go install github.com/oxhq/binas/cmd/binas@latest

@@ -1,0 +1,176 @@
+name: publish-rust
+
+on:
+  workflow_dispatch:
+    inputs:
+      authentication:
+        description: crates.io authentication method
+        required: true
+        type: choice
+        default: trusted-publishing
+        options:
+          - trusted-publishing
+          - bootstrap-token
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-rust-${{ github.ref }}
+  cancel-in-progress: false
+
+# Before the first release, create a protected GitHub environment named
+# `crates-io`, add an environment secret named CRATES_IO_BOOTSTRAP_TOKEN, and
+# select bootstrap-token. After all three crates exist, configure their trusted
+# publishers for oxhq/binas, this workflow file, and the crates-io environment;
+# then delete the bootstrap secret and use trusted-publishing.
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      # actions/checkout v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - id: version
+        name: Validate rust-v tag and crate versions
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" != "tag" || "$GITHUB_REF_NAME" != rust-v* ]]; then
+            echo "Run this workflow from a rust-v<version> tag." >&2
+            exit 1
+          fi
+
+          version="${GITHUB_REF_NAME#rust-v}"
+          metadata="$(cargo metadata --no-deps --format-version 1)"
+          for package in binas-core binas-pdf binas-cli; do
+            actual="$(jq -r --arg package "$package" '.packages[] | select(.name == $package) | .version' <<<"$metadata")"
+            if [[ "$actual" != "$version" ]]; then
+              echo "$package version $actual does not match tag version $version." >&2
+              exit 1
+            fi
+          done
+          if [[ "$(jq -c '.packages[] | select(.name == "binas-pdf-wasm") | .publish' <<<"$metadata")" != "[]" ]]; then
+            echo "binas-pdf-wasm must remain excluded from crates.io publication." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - run: rustup component add rustfmt clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --locked
+      - name: Verify binas-core package
+        run: cargo package -p binas-core --locked
+      - name: Verify binas-pdf package against local binas-core
+        run: cargo package -p binas-pdf --locked --config 'patch.crates-io.binas-core.path="crates/binas-core"'
+      - name: Verify binas-cli package against local libraries
+        run: cargo package -p binas-cli --locked --config 'patch.crates-io.binas-core.path="crates/binas-core"' --config 'patch.crates-io.binas-pdf.path="crates/binas-pdf"'
+
+  publish-core:
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      # actions/checkout v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - id: trusted-auth
+        if: inputs.authentication == 'trusted-publishing'
+        # rust-lang/crates-io-auth-action v1.0.5
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
+      - name: Require first-publication token
+        if: inputs.authentication == 'bootstrap-token'
+        env:
+          CRATES_IO_BOOTSTRAP_TOKEN: ${{ secrets.CRATES_IO_BOOTSTRAP_TOKEN }}
+        shell: bash
+        run: test -n "$CRATES_IO_BOOTSTRAP_TOKEN"
+      - name: Publish binas-core
+        run: cargo publish -p binas-core --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ inputs.authentication == 'bootstrap-token' && secrets.CRATES_IO_BOOTSTRAP_TOKEN || steps.trusted-auth.outputs.token }}
+
+  publish-pdf:
+    needs: [validate, publish-core]
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      # actions/checkout v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Wait for binas-core registry availability
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        shell: bash
+        run: |
+          for attempt in {1..30}; do
+            if cargo info "binas-core@$VERSION" >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "binas-core@$VERSION did not become available within five minutes." >&2
+          exit 1
+      - id: trusted-auth
+        if: inputs.authentication == 'trusted-publishing'
+        # rust-lang/crates-io-auth-action v1.0.5
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
+      - name: Require first-publication token
+        if: inputs.authentication == 'bootstrap-token'
+        env:
+          CRATES_IO_BOOTSTRAP_TOKEN: ${{ secrets.CRATES_IO_BOOTSTRAP_TOKEN }}
+        shell: bash
+        run: test -n "$CRATES_IO_BOOTSTRAP_TOKEN"
+      - name: Publish binas-pdf
+        run: cargo publish -p binas-pdf --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ inputs.authentication == 'bootstrap-token' && secrets.CRATES_IO_BOOTSTRAP_TOKEN || steps.trusted-auth.outputs.token }}
+
+  publish-cli:
+    needs: [validate, publish-pdf]
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      # actions/checkout v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Wait for binas-pdf registry availability
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        shell: bash
+        run: |
+          for attempt in {1..30}; do
+            if cargo info "binas-pdf@$VERSION" >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "binas-pdf@$VERSION did not become available within five minutes." >&2
+          exit 1
+      - id: trusted-auth
+        if: inputs.authentication == 'trusted-publishing'
+        # rust-lang/crates-io-auth-action v1.0.5
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
+      - name: Require first-publication token
+        if: inputs.authentication == 'bootstrap-token'
+        env:
+          CRATES_IO_BOOTSTRAP_TOKEN: ${{ secrets.CRATES_IO_BOOTSTRAP_TOKEN }}
+        shell: bash
+        run: test -n "$CRATES_IO_BOOTSTRAP_TOKEN"
+      - name: Publish binas-cli
+        run: cargo publish -p binas-cli --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ inputs.authentication == 'bootstrap-token' && secrets.CRATES_IO_BOOTSTRAP_TOKEN || steps.trusted-auth.outputs.token }}

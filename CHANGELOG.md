@@ -1,5 +1,13 @@
 # Changelog
 
+## Rust 0.1.0
+
+- Introduces the four-crate Rust workspace: `binas-core`, `binas-pdf`, `binas-cli`, and the non-crates.io `binas-pdf-wasm` binding.
+- Provides bounded PDF parsing, inspection, text extraction, verified rewrites, page/document operations, forms, annotations, XFA, images, encryption, signatures, CLI, and browser bindings within their documented fail-closed boundaries.
+- Configures dependency-ordered publication (`binas-core`, `binas-pdf`, then `binas-cli`) from a version-matched `rust-v0.1.0` tag.
+
+This source entry does not claim crates.io publication, installed-consumer proof, hosted multi-OS CI, sustained fuzzing, performance baselines, or independent interoperability results. Those remain release-time evidence gates.
+
 ## v0.2.0 - 2026-06-17
 
 - Add exported PDF graph traversal primitives for catalog, page tree, name tree,

@@ -1,4 +1,6 @@
 /tmp/
+target/
 *.exe
 *.test
 *.out
+/binas-wasm

@@ -1,0 +1,141 @@
+{
+  "version": 1,
+  "corpus_root": "tests/fixtures/pdf",
+  "fixture_count": 22,
+  "coverage_status": "unit_boundary_only_not_compatibility_or_adversarial",
+  "repository_license_path": "LICENSE",
+  "fixtures": [
+    {
+      "path": "tests/fixtures/pdf/ascii85-flate-content-stream.pdf",
+      "sha256": "407f5ab2e69f676eec61e562ec3cad85295027d4d9b5bbc0420bba40e411af92",
+      "source_status": "unverified",
+      "license_status": "unverified"
+    },
+    {
+      "path": "tests/fixtures/pdf/asciihex-content-stream.pdf",
+      "sha256": "9b4c9dd659e3a8da752c26c92aced7eb0bbcb1eea2a459d90685e87552f15505",
+      "source_status": "unverified",
+      "license_status": "unverified"
+    },
+    {
+      "path": "tests/fixtures/pdf/asciihex-flate-content-stream.pdf",
+      "sha256": "cbf798528928866273bdfabec8b8d3fa9db90c7045b5820f756169d8ba7de47f",
+      "source_status": "unverified",
+      "license_status": "unverified"
+    },
+    {
+      "path": "tests/fixtures/pdf/flate-decodeparms-predictor12-bpc16.pdf",
+      "sha256": "4dfad49855cfde9c55010014888dbd6df1e4dab641ac53e06b16410ed906a238",
+      "source_status": "unverified",
+      "license_status": "unverified"
+    },
+    {
+      "path": "tests/fixtures/pdf/flate-decodeparms-predictor12-columns1.pdf",
+      "sha256": "0c97c16fb429bc36ec6022ba39d1187f0a14b052155c05d289b939bc28cd288b",
+      "source_status": "unverified",
+      "license_status": "unverified"
+    },
+    {
+      "path": "tests/fixtures/pdf/flate-decodeparms-predictor12-columns4.pdf",
+      "sha256": "108ec879bb2f54084d2ed7c3d48c24122745770d4a958c813350d25da0c347a2",
+      "source_status": "unverified",
+      "license_status": "unverified"
+    },
+    {
+      "path": "tests/fixtures/pdf/flate-decodeparms-predictor12-rgb.pdf",
+      "sha256": "e33f7cb179bca45620a65e1d23a6b83c262a4df6d8ca8cac97dcc7f50eb0db4f",
+      "source_status": "unverified",
+      "license_status": "unverified"
+    },
+    {
+      "path": "tests/fixtures/pdf/graph-traversal-catalog.pdf",
+      "sha256": "445390fa6580613db501f8451944963be6eb308fdcff2a07a88ffcc68373fec3",
+      "source_status": "unverified",
+      "license_status": "unverified"
+    },
+    {
+      "path": "tests/fixtures/pdf/indirect-length-uncompressed.pdf",
+      "sha256": "54efd09bb555e3ef3093af202678779c99fbb2bda294fc01c815652e646f917c",
+      "source_status": "unverified",
+      "license_status": "unverified"
+    },
+    {
+      "path": "tests/fixtures/pdf/malformed-missing-eof.pdf",
+      "sha256": "aba818dfad2a58e6ce729fb94fd8c55deb091e8247c953e00846741b45dd61ea",
+      "source_status": "unverified",
+      "license_status": "unverified"
+    },
+    {
+      "path": "tests/fixtures/pdf/multiple-streams.pdf",
+      "sha256": "2a9f5342f06be4c8ff57d7cf2d6a1de441f7b4e42f7f2c6547573c2aae46d976",
+      "source_status": "unverified",
+      "license_status": "unverified"
+    },
+    {
+      "path": "tests/fixtures/pdf/object-stream.pdf",
+      "sha256": "40e83a2ecb72a658630fd767c45b1445e3a8f42450a4e8b520aca33c896b539e",
+      "source_status": "unverified",
+      "license_status": "unverified"
+    },
+    {
+      "path": "tests/fixtures/pdf/p2-image-decodeparms-unsupported-supported-content.pdf",
+      "sha256": "755efa4b3112f404c91db8b26b018f06c8020f5d76ed391bb873a31e3fbb1dcd",
+      "source_status": "unverified",
+      "license_status": "unverified"
+    },
+    {
+      "path": "tests/fixtures/pdf/p2-image-only-filters-supported-content.pdf",
+      "sha256": "0c562f506887d5434fd36699367dca495e96a476dfc5539f6f813f812c319a2a",
+      "source_status": "unverified",
+      "license_status": "unverified"
+    },
+    {
+      "path": "tests/fixtures/pdf/p2-unsupported-nonimage-filter-text.pdf",
+      "sha256": "a7311a3dfd53ccec973477d453301412f230da384369f3443f729e8d5d07be3f",
+      "source_status": "unverified",
+      "license_status": "unverified"
+    },
+    {
+      "path": "tests/fixtures/pdf/p3-decodeparms-direct-dictionary.pdf",
+      "sha256": "0c97c16fb429bc36ec6022ba39d1187f0a14b052155c05d289b939bc28cd288b",
+      "source_status": "unverified",
+      "license_status": "unverified"
+    },
+    {
+      "path": "tests/fixtures/pdf/p3-decodeparms-filter-array.pdf",
+      "sha256": "8d06244f2adb60af64a64211ca36b6d4557e90484f6dced65199be5417a3e5b8",
+      "source_status": "unverified",
+      "license_status": "unverified"
+    },
+    {
+      "path": "tests/fixtures/pdf/p3-decodeparms-malformed-unsupported.pdf",
+      "sha256": "ab1f9698d21fe008ff0d03a54644d488c4a88784b575f9dd7382639122efea44",
+      "source_status": "unverified",
+      "license_status": "unverified"
+    },
+    {
+      "path": "tests/fixtures/pdf/p4-object-stream-preserve-text.pdf",
+      "sha256": "067ca1bda3abc233ad1bd5dcbc3373d0f5e1c05de8f4f14b25ca0ef6c32f1fab",
+      "source_status": "unverified",
+      "license_status": "unverified"
+    },
+    {
+      "path": "tests/fixtures/pdf/p4-xref-stream-preserve-text.pdf",
+      "sha256": "aeb1cc5c5f51b1c34f418026c15af3ae9dc0ac65ced7b97a44163a74a47c2d65",
+      "source_status": "unverified",
+      "license_status": "unverified"
+    },
+    {
+      "path": "tests/fixtures/pdf/uncompressed-direct-length.pdf",
+      "sha256": "7f124dd08cbabd98aa54672f0fa57a326becdfbda7a99df61c5fd3a5bbd2387c",
+      "source_status": "unverified",
+      "license_status": "unverified"
+    },
+    {
+      "path": "tests/fixtures/pdf/xref-stream.pdf",
+      "sha256": "0960e91a0b982a1f550f0aa7a3be2f4caf9fe30b20fe5b59b97411b25b0f6c96",
+      "source_status": "unverified",
+      "license_status": "unverified"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+[package]
+name = "binas-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Shared checked spans, selectors, diagnostics, and verification types for Binas engines"
+readme = "README.md"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

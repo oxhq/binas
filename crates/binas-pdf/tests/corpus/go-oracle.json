@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "vectors": [
+    { "file": "ascii85-flate-content-stream.pdf", "queries": ["08-15-2024"], "known_difference": "Go edit output omits the required ASCII85 ~> end marker; Rust intentionally refuses that malformed output" },
+    { "file": "asciihex-content-stream.pdf", "queries": ["08-15-2024"], "edit": { "old": "08-15-2024", "replacement": "05-05-2026" } },
+    { "file": "asciihex-flate-content-stream.pdf", "queries": ["08-15-2024"], "edit": { "old": "08-15-2024", "replacement": "05-05-2026" } },
+    { "file": "flate-decodeparms-predictor12-bpc16.pdf", "queries": ["ABCD"] },
+    { "file": "flate-decodeparms-predictor12-columns1.pdf", "queries": ["08-15-2024"] },
+    { "file": "flate-decodeparms-predictor12-columns4.pdf", "queries": ["08-15-2024"] },
+    { "file": "flate-decodeparms-predictor12-rgb.pdf", "queries": ["ABCDEF"] },
+    { "file": "graph-traversal-catalog.pdf", "queries": ["Page 1", "Page 3"], "repair": true },
+    { "file": "indirect-length-uncompressed.pdf", "queries": ["indirect"] },
+    { "file": "multiple-streams.pdf", "queries": ["first", "second"], "edit": { "old": "first", "replacement": "FIRST" } },
+    { "file": "object-stream.pdf", "queries": [], "expected_error": "invalid_syntax", "known_difference": "Legacy malformed object-stream fixture is accepted by Go's permissive scanner; the valid p4 object-stream fixture passes Rust" },
+    { "file": "p2-image-decodeparms-unsupported-supported-content.pdf", "queries": ["P2-DECODEPARMS-TEXT"] },
+    { "file": "p2-image-only-filters-supported-content.pdf", "queries": ["P2-TEXT"] },
+    { "file": "p2-unsupported-nonimage-filter-text.pdf", "queries": ["SUPPORTED-P2"] },
+    { "file": "p3-decodeparms-direct-dictionary.pdf", "queries": ["08-15-2024"] },
+    { "file": "p3-decodeparms-filter-array.pdf", "queries": ["08-15-2024"] },
+    { "file": "p3-decodeparms-malformed-unsupported.pdf", "queries": [], "known_difference": "Go query reports zero matches for an undecodable target stream; Rust returns unsupported_feature instead of a false negative" },
+    { "file": "p4-object-stream-preserve-text.pdf", "queries": ["08-15-2024"], "edit": { "old": "08-15-2024", "replacement": "May 5, 2026" } },
+    { "file": "p4-xref-stream-preserve-text.pdf", "queries": ["08-15-2024"] },
+    { "file": "uncompressed-direct-length.pdf", "queries": ["08-15-2024"], "edit": { "old": "08-15-2024", "replacement": "05-05-2026" } },
+    { "file": "xref-stream.pdf", "queries": [], "expected_error": "invalid_syntax", "go_parse_error": true, "known_difference": "Both engines refuse this malformed xref stream with different stable error classes; valid p4 xref-stream fixtures pass Rust" },
+    { "file": "malformed-missing-eof.pdf", "queries": [], "expected_error": "invalid_syntax", "go_parse_error": true }
+  ]
+}

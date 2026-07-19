@@ -1,0 +1,60 @@
+%PDF-1.3
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /XObject << /ImDCT 5 0 R /ImJPX 6 0 R /ImCCITT 7 0 R /ImJBIG2 8 0 R /ImMixed 9 0 R >> >> >>
+endobj
+4 0 obj
+<< /Length 19 >>
+stream
+BT
+(P2-TEXT) Tj
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 14 /Filter /DCTDecode >>
+stream
+p2 image bytesendstream
+endobj
+6 0 obj
+<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 14 /Filter /JPXDecode >>
+stream
+p2 image bytesendstream
+endobj
+7 0 obj
+<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 14 /Filter /CCITTFaxDecode >>
+stream
+p2 image bytesendstream
+endobj
+8 0 obj
+<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 14 /Filter /JBIG2Decode >>
+stream
+p2 image bytesendstream
+endobj
+9 0 obj
+<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 14 /Filter [/DCTDecode /JPXDecode] >>
+stream
+p2 image bytesendstream
+endobj
+xref
+0 10
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000281 00000 n 
+0000000349 00000 n 
+0000000525 00000 n 
+0000000701 00000 n 
+0000000882 00000 n 
+0000001060 00000 n 
+trailer
+<< /Size 10 /Root 1 0 R >>
+startxref
+1249
+%%EOF

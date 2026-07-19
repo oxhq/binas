@@ -1,14 +1,2 @@
-* text=auto
-
-.gitattributes text eol=lf
-*.go text eol=lf
-*.md text eol=lf
-*.mod text eol=lf
-*.sum text eol=lf
-*.txt text eol=lf
-*.json text eol=lf
-*.yml text eol=lf
-*.yaml text eol=lf
-
-*.pdf binary
-*.exe binary
+fuzz/corpus/** -text -diff
+crates/binas-pdf/tests/fixtures/pdf/** -text -diff

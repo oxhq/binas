@@ -1,6 +1,6 @@
 # Release Surface
 
-This document describes the current public CLI surface for the PDF proof slice. It is intentionally narrower than a general PDF editor.
+This document describes the Go CLI surface for the PDF proof slice. It is intentionally narrower than a general PDF editor. The in-tree Rust workspace and Rust OXPDF consumer use local development sources, which do not by themselves prove crates.io publication, an installed registry consumer, or a completed release.
 
 For the semantic edit contract behind these CLI fields, including the difference between fail-closed boundaries and detection-only warnings, see [pdf-semantic-boundaries.md](pdf-semantic-boundaries.md).
 
@@ -190,6 +190,8 @@ Everything else under `/DecodeParms` remains unsupported unless a later pass add
 ## Residual Boundary Fixtures
 
 Synthetic corpus fixtures live under `testdata/pdf`. They are small PDFs for parser and edit-boundary checks, not examples of broad PDF compatibility.
+
+`crates/binas-pdf/tests/corpus/fixture-provenance.json` freezes each checked-in fixture path and SHA-256. Every fixture currently records `source_status` and `license_status` as `unverified`: the repository documents the files as synthetic, but contains no per-file origin or license record. This 22-file unit corpus is not a compatibility or adversarial corpus claim.
 
 - `uncompressed-direct-length.pdf`: supported direct `/Length` baseline for variable-length literal-string rewrites.
 - `multiple-streams.pdf`: supported multiple-stream baseline for query selection and selected-match edits.

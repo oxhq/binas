@@ -1,0 +1,57 @@
+name: fuzz-smoke
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover-targets:
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.targets.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --locked
+      - id: targets
+        name: Discover fuzz targets
+        working-directory: fuzz
+        shell: bash
+        run: cargo +nightly fuzz list | python3 -c 'import json, sys; print("targets=" + json.dumps([line.strip() for line in sys.stdin if line.strip()]))' >> "$GITHUB_OUTPUT"
+
+  smoke:
+    needs: discover-targets
+    name: ${{ matrix.target }} (ASan, 60s)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.discover-targets.outputs.targets) }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --locked
+      - name: Build fuzz target with AddressSanitizer
+        working-directory: fuzz
+        run: cargo +nightly fuzz build ${{ matrix.target }} --sanitizer address
+      # This is a crash-regression smoke only, not a release-duration fuzz campaign.
+      - name: Fuzz ${{ matrix.target }} for 60 seconds
+        working-directory: fuzz
+        run: cargo +nightly fuzz run ${{ matrix.target }} --sanitizer address -- -max_total_time=60 -timeout=5
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: |
+            fuzz/artifacts/${{ matrix.target }}/**
+            fuzz/corpus/${{ matrix.target }}/**
+          if-no-files-found: ignore
+          retention-days: 14

@@ -1,0 +1,76 @@
+%PDF-1.7
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /Metadata 4 0 R /AcroForm 5 0 R /Names << /EmbeddedFiles 6 0 R >> >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>
+endobj
+4 0 obj
+<< /Type /Metadata /Subtype /XML /Filter /ASCIIHexDecode /Length 115 >>
+stream
+3C3F787061636B657420626567696E3D27273F3E3C783A786D706D65746120786D6C6E733A783D2761646F62653A6E733A6D6574612F272F3E>
+endstream
+endobj
+5 0 obj
+<< /XFA [(template) 7 0 R (datasets) 8 0 R] >>
+endobj
+6 0 obj
+<< /Names [(payload.bin) 9 0 R] >>
+endobj
+7 0 obj
+<< /Length 52 >>
+stream
+<template><field name="form.payer.name"/></template>
+endstream
+endobj
+8 0 obj
+<< /Length 80 >>
+stream
+<datasets><data><form><payer><name>David</name></payer></form></data></datasets>
+endstream
+endobj
+9 0 obj
+<< /Type /Filespec /F (payload.bin) /EF << /F 10 0 R >> >>
+endobj
+10 0 obj
+<< /Type /EmbeddedFile /Length 4 >>
+stream
+DATA
+endstream
+endobj
+11 0 obj
+<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /DCTDecode /Length 5 >>
+stream
+NOJPG
+endstream
+endobj
+12 0 obj
+<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode /Length 5 >>
+stream
+BAD!!
+endstream
+endobj
+xref
+0 13
+0000000000 65535 f 
+0000000009 00000 n 
+0000000124 00000 n 
+0000000181 00000 n 
+0000000252 00000 n 
+0000000472 00000 n 
+0000000534 00000 n 
+0000000584 00000 n 
+0000000686 00000 n 
+0000000816 00000 n 
+0000000890 00000 n 
+0000000964 00000 n 
+0000001132 00000 n 
+trailer
+<< /Size 13 /Root 1 0 R >>
+startxref
+1302
+%%EOF
+

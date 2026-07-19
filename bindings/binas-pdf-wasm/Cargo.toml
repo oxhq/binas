@@ -1,0 +1,23 @@
+[package]
+name = "binas-pdf-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "WebAssembly bindings for the Binas PDF engine"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+binas-pdf.workspace = true
+js-sys = "0.3"
+serde.workspace = true
+serde_json.workspace = true
+wasm-bindgen = "0.2"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"

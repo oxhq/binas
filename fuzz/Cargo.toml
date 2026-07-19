@@ -1,0 +1,50 @@
+[package]
+name = "binas-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+binas-pdf = { path = "../crates/binas-pdf" }
+
+[[bin]]
+name = "parser"
+path = "fuzz_targets/parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "content"
+path = "fuzz_targets/content.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cmap"
+path = "fuzz_targets/cmap.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cms"
+path = "fuzz_targets/cms.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "graph_readers"
+path = "fuzz_targets/graph_readers.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
