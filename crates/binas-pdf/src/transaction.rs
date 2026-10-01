@@ -20,6 +20,11 @@ mod catalog_keys;
 mod object_roles;
 mod page_keys;
 mod stream_keys;
+mod text_contract;
+pub use text_contract::{
+    PdfPreparedTextEdit, PdfTextEditCapability, PdfTextEditError, PdfTextEditReceipt,
+    PdfTextEditRefusal,
+};
 
 use crate::{
     Annotation, AnnotationContentsMutationRequest, DecodeMetrics, InspectResult, PdfDocument,

@@ -181,8 +181,9 @@ pub use streams::{
     read_decoded_stream, read_decoded_stream_shared,
 };
 pub use transaction::{
-    PdfFontTextEffect, PdfPageTextEditRequest, PdfRevision, PdfRevisionPlan, PdfRevisionReceipt,
-    PdfRevisionRequest, PdfSharedEditMode, PdfStreamEditEffect,
+    PdfFontTextEffect, PdfPageTextEditRequest, PdfPreparedTextEdit, PdfRevision, PdfRevisionPlan,
+    PdfRevisionReceipt, PdfRevisionRequest, PdfSharedEditMode, PdfStreamEditEffect,
+    PdfTextEditCapability, PdfTextEditError, PdfTextEditReceipt, PdfTextEditRefusal,
 };
 pub use writer::{PdfRevisionExport, PdfWriterMode};
 pub use xfa::{
