@@ -745,7 +745,7 @@ impl PdfDocument {
             .get_mut(&reference)
             .ok_or_else(|| PdfError::selection("image object was not found"))?;
         replacement.value = Value::Dict(dictionary);
-        replacement.stream = Some(request.encoded_bytes.clone());
+        replacement.stream = Some(request.encoded_bytes.clone().into());
         replacement.stream_offset = 0;
         replacement.offset = 0;
         if let (Some(smask_reference), Some(smask)) = (smask_reference, generated_smask.as_ref()) {
@@ -757,7 +757,7 @@ impl PdfDocument {
                         request.height,
                         smask.encoded_bytes.len(),
                     )?),
-                    stream: Some(smask.encoded_bytes.clone()),
+                    stream: Some(smask.encoded_bytes.clone().into()),
                     stream_offset: 0,
                     offset: 0,
                 },
@@ -902,7 +902,7 @@ fn validate_encoded_bytes(
             }
         }
         ImageFilter::Flate => {
-            let mut budget = ParseBudget::default();
+            let mut budget = ParseBudget::for_document(parsed);
             let decoded = parser::decode_stream(
                 &Value::Dict(dictionary.clone()),
                 &request.encoded_bytes,
@@ -1060,14 +1060,14 @@ fn validate_generated_smask(
     }
     let dictionary =
         soft_mask_dictionary(request.width, request.height, smask.encoded_bytes.len())?;
-    let mut budget = ParseBudget::default();
+    let mut budget = ParseBudget::for_document(parsed);
     let decoded = parser::decode_stream(
         &Value::Dict(dictionary),
         &smask.encoded_bytes,
         &parsed.limits,
         &mut budget,
     )?;
-    if decoded != smask.samples {
+    if &*decoded != smask.samples.as_slice() {
         return Err(PdfError::unsafe_rewrite(
             "generated soft mask stream does not match its samples",
         ));
@@ -1171,14 +1171,14 @@ fn generated_smask_matches(
     let Some(stream) = object.stream.as_deref() else {
         return Ok(false);
     };
-    let mut budget = ParseBudget::default();
+    let mut budget = ParseBudget::for_document(parsed);
     let decoded = parser::decode_stream(
         &Value::Dict(dictionary.clone()),
         stream,
         &parsed.limits,
         &mut budget,
     )?;
-    Ok(decoded == expected.samples)
+    Ok(&*decoded == expected.samples.as_slice())
 }
 
 fn image_dictionary<'a>(

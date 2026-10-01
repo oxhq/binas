@@ -706,7 +706,7 @@ fn annotation_appearance(
                 (b"BBox".to_vec(), number_array(&[0.0, 0.0, width, height])),
                 (b"Resources".to_vec(), Value::Dict(resources)),
             ])),
-            stream: Some(stream),
+            stream: Some(stream.into()),
             stream_offset: 0,
             offset: 0,
         },
@@ -1106,7 +1106,7 @@ fn decode_text(value: &[u8]) -> String {
     String::from_utf8_lossy(value).into_owned()
 }
 
-fn encode_text(value: &str) -> Vec<u8> {
+pub(crate) fn encode_text(value: &str) -> Vec<u8> {
     if value.is_ascii() {
         return value.as_bytes().to_vec();
     }

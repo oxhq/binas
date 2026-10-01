@@ -85,7 +85,7 @@ impl PdfDocument {
             ));
         }
 
-        let mut budget = ParseBudget::default();
+        let mut budget = ParseBudget::for_document(self.parsed());
         let cmap_object = self.parsed().object(cmap_reference)?;
         let cmap_stream = cmap_object
             .stream
@@ -155,7 +155,7 @@ impl PdfDocument {
         let output = append_object_revision(self, reference, &object.value, Some(&encoded_stream))?;
         let rewritten = reopen_for_verification(self, &output)?;
         let rewritten_object = rewritten.parsed().object(reference)?;
-        let mut verify_budget = ParseBudget::default();
+        let mut verify_budget = ParseBudget::for_document(rewritten.parsed());
         let verified_stream = parser::decode_stream(
             &rewritten_object.value,
             rewritten_object.stream.as_deref().ok_or_else(|| {
@@ -166,7 +166,7 @@ impl PdfDocument {
         )?;
         let prefix_preserved = output.starts_with(self.source());
         let page_count_unchanged = rewritten.page_count()? == old_pages;
-        let decoded_stream_verified = verified_stream == replacement_stream;
+        let decoded_stream_verified = &*verified_stream == replacement_stream.as_slice();
         let replacement_selectable =
             rewritten
                 .query_text_all(&request.replacement)?

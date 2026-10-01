@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     OpenOptions, PdfDocument, PdfEngine, PdfError, content,
-    parser::{ObjectRef, ParsedDocument, Value},
+    parser::{ObjectRef, ParseBudget, ParsedDocument, Value},
     writer::refuse_security_boundaries,
 };
 
@@ -87,6 +87,7 @@ pub fn list_inline_images(
     document: &PdfDocument,
 ) -> Result<Vec<InlineImageInventoryEntry>, PdfError> {
     let mut entries = Vec::new();
+    let mut budget = ParseBudget::for_document(document.parsed());
     for (page_index, page_ref) in document.page_refs()?.into_iter().enumerate() {
         let page = document.parsed().object(page_ref)?;
         let page = dictionary(&page.value, "page")?;
@@ -111,9 +112,10 @@ pub fn list_inline_images(
             .stream
             .as_deref()
             .ok_or_else(|| PdfError::unsupported("page content reference is not a stream"))?;
-        for (image_index, image) in content::inline_images(stream, &document.parsed().limits)?
-            .into_iter()
-            .enumerate()
+        for (image_index, image) in
+            content::inline_images(stream, &document.parsed().limits, &mut budget)?
+                .into_iter()
+                .enumerate()
         {
             if entries.len() >= document.parsed().limits.max_container_items {
                 return Err(PdfError::limit(
@@ -153,7 +155,9 @@ impl PdfDocument {
             ));
         }
         let normalized = normalized_inline_image(&request);
-        let parsed_replacement = content::inline_images(&normalized, &self.parsed().limits)?;
+        let mut budget = ParseBudget::for_document(self.parsed());
+        let parsed_replacement =
+            content::inline_images(&normalized, &self.parsed().limits, &mut budget)?;
         let replacement = parsed_replacement
             .first()
             .filter(|_| parsed_replacement.len() == 1)
@@ -187,7 +191,7 @@ impl PdfDocument {
                 .stream
                 .as_deref()
                 .ok_or_else(|| PdfError::unsupported("page content reference is not a stream"))?;
-            let images = content::inline_images(stream, &self.parsed().limits)?;
+            let images = content::inline_images(stream, &self.parsed().limits, &mut budget)?;
             for image in images {
                 found.push((reference, image));
             }
@@ -253,7 +257,7 @@ impl PdfDocument {
                     .map_err(|_| PdfError::limit("inline image stream length exceeds i64"))?,
             ),
         );
-        object.stream = Some(stream.clone());
+        object.stream = Some(stream.clone().into());
         object.stream_offset = 0;
         object.offset = 0;
         let canonical = self.with_parsed(parsed).canonicalize()?;
@@ -266,7 +270,11 @@ impl PdfDocument {
         let verified_stream = verified_object.stream.as_deref().ok_or_else(|| {
             PdfError::verification("verified inline image content is not a stream")
         })?;
-        let verified_images = content::inline_images(verified_stream, &reopened.parsed().limits)?;
+        let verified_images = content::inline_images(
+            verified_stream,
+            &reopened.parsed().limits,
+            &mut ParseBudget::for_document(reopened.parsed()),
+        )?;
         let verified_image = verified_images
             .first()
             .filter(|_| verified_images.len() == 1)

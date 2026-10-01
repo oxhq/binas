@@ -882,10 +882,19 @@ pub(crate) fn decrypt_objects(
     security: &StandardSecurity,
     file_key: &[u8],
 ) -> Result<(), PdfError> {
-    for (reference, object) in &mut parsed.objects {
+    let references: Vec<_> = parsed.objects.keys().copied().collect();
+    for reference in &references {
+        let object = parsed
+            .objects
+            .get(reference)
+            .expect("collected object key remains present");
         if Some(*reference) == security.encrypt_object || is_type(&object.value, b"XRef") {
             continue;
         }
+        let object = parsed
+            .objects
+            .get_mut(reference)
+            .expect("collected object key remains present");
         if object.stream.is_some() {
             reject_stream_crypt_filter(&object.value)?;
         }
@@ -906,7 +915,7 @@ pub(crate) fn decrypt_objects(
             if decrypted.len() > parsed.limits.max_stream_bytes {
                 return Err(PdfError::limit("decrypted stream exceeds max_stream_bytes"));
             }
-            object.stream = Some(decrypted);
+            object.stream = Some(decrypted.into());
         }
     }
     Ok(())
@@ -917,10 +926,19 @@ pub(crate) fn encrypt_objects(
     security: &StandardSecurity,
     file_key: &[u8],
 ) -> Result<(), PdfError> {
-    for (reference, object) in &mut parsed.objects {
+    let references: Vec<_> = parsed.objects.keys().copied().collect();
+    for reference in &references {
+        let object = parsed
+            .objects
+            .get(reference)
+            .expect("collected object key remains present");
         if is_type(&object.value, b"XRef") {
             continue;
         }
+        let object = parsed
+            .objects
+            .get_mut(reference)
+            .expect("collected object key remains present");
         if object.stream.is_some() {
             reject_stream_crypt_filter(&object.value)?;
         }
@@ -941,7 +959,7 @@ pub(crate) fn encrypt_objects(
             if encrypted.len() > parsed.limits.max_stream_bytes {
                 return Err(PdfError::limit("encrypted stream exceeds max_stream_bytes"));
             }
-            object.stream = Some(encrypted);
+            object.stream = Some(encrypted.into());
         }
     }
     Ok(())

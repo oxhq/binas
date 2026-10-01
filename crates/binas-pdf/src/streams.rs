@@ -59,6 +59,16 @@ pub fn read_decoded_stream(
     document: &PdfDocument,
     object: StreamObjectRef,
 ) -> Result<Vec<u8>, PdfError> {
+    // Compatibility API promises owned bytes. Shared readers can avoid this copy.
+    Ok(read_decoded_stream_shared(document, object)?.to_vec())
+}
+
+/// Reads an immutable shared decoded payload under the document's decode budget.
+/// Holding this handle retains its accounted allocation after cache eviction.
+pub fn read_decoded_stream_shared(
+    document: &PdfDocument,
+    object: StreamObjectRef,
+) -> Result<crate::decode_cache::DecodedPayload, PdfError> {
     let reference = ObjectRef {
         number: object.object_number,
         generation: object.object_generation,
@@ -76,7 +86,7 @@ pub fn read_decoded_stream(
             reference,
         )
     })?;
-    let mut budget = ParseBudget::default();
+    let mut budget = ParseBudget::for_document(parsed);
     decode_stream(&stream.value, encoded, &parsed.limits, &mut budget)
         .map_err(|error| stream_error_at(error, reference))
 }
@@ -338,12 +348,12 @@ impl PdfDocument {
                     .map_err(|_| PdfError::limit("encoded stream length exceeds i64"))?,
             ),
         );
-        object.stream = Some(encoded);
+        object.stream = Some(encoded.into());
         let canonical = self.with_parsed(parsed).canonicalize()?;
         let reopened = PdfEngine::new(self.engine_config().clone())
             .open(&canonical.bytes, OpenOptions::default())?;
         let object = reopened.parsed().object(reference)?;
-        let mut budget = ParseBudget::default();
+        let mut budget = ParseBudget::for_document(reopened.parsed());
         let decoded = decode_stream(
             &object.value,
             object
@@ -354,7 +364,7 @@ impl PdfDocument {
             &mut budget,
         )?;
         let page_count_unchanged = reopened.page_count()? == old_pages;
-        let decoded_stream_matches = decoded == request.decoded_bytes;
+        let decoded_stream_matches = &*decoded == request.decoded_bytes.as_slice();
         let no_dangling_references = verify_references(reopened.parsed())?;
         let verification = StreamMutationVerification {
             passed: page_count_unchanged && decoded_stream_matches && no_dangling_references,

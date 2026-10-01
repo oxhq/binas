@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     OpenOptions, PdfDocument, PdfEngine, PdfError, content,
-    parser::{IndirectObject, ObjectRef, ParsedDocument, Value},
+    parser::{IndirectObject, ObjectRef, ParseBudget, ParsedDocument, Value},
     writer::refuse_security_boundaries,
 };
 
@@ -122,7 +122,7 @@ impl PdfDocument {
             form_ref,
             IndirectObject {
                 value: Value::Dict(form.dictionary),
-                stream: Some(form.stream.clone()),
+                stream: Some(form.stream.clone().into()),
                 stream_offset: 0,
                 offset: 0,
             },
@@ -178,7 +178,7 @@ impl PdfDocument {
             form_ref,
             IndirectObject {
                 value: Value::Dict(form.dictionary),
-                stream: Some(form.stream.clone()),
+                stream: Some(form.stream.clone().into()),
                 stream_offset: 0,
                 offset: 0,
             },
@@ -352,7 +352,13 @@ fn validate_request(document: &PdfDocument, request: &OverlayStampRequest) -> Re
             "overlay Form content must be resource-free; name operands are not supported",
         ));
     }
-    if !content::extract_text_show(&request.form_content, 0, &document.parsed().limits)?.is_empty()
+    if !content::extract_text_show(
+        &request.form_content,
+        0,
+        &document.parsed().limits,
+        &mut ParseBudget::for_document(document.parsed()),
+    )?
+    .is_empty()
     {
         return Err(PdfError::unsupported(
             "overlay Form text requires font resources and is not supported",
@@ -527,11 +533,16 @@ fn text_is_selectable(
         .stream
         .as_deref()
         .ok_or_else(|| PdfError::verification("text overlay Form stream is missing"))?;
-    Ok(content::extract_text_show(stream, 0, &parsed.limits)?
-        .iter()
-        .any(|item| {
-            item.text == expected_text && item.font.as_deref() == Some(b"BinasTextFont".as_slice())
-        }))
+    Ok(content::extract_text_show(
+        stream,
+        0,
+        &parsed.limits,
+        &mut ParseBudget::for_document(parsed),
+    )?
+    .iter()
+    .any(|item| {
+        item.text == expected_text && item.font.as_deref() == Some(b"BinasTextFont".as_slice())
+    }))
 }
 
 fn selected_pages(pages: &[ObjectRef], indices: &[usize]) -> Result<Vec<ObjectRef>, PdfError> {
@@ -761,7 +772,7 @@ fn number(value: f64) -> String {
 fn stream_object(stream: Vec<u8>) -> IndirectObject {
     IndirectObject {
         value: Value::Dict(BTreeMap::new()),
-        stream: Some(stream),
+        stream: Some(stream.into()),
         stream_offset: 0,
         offset: 0,
     }

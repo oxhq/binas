@@ -59,9 +59,9 @@ fn reads_direct_inherited_and_fallback_page_geometry() {
         binas_pdf::PageGeometry {
             media_box: [0.0, 0.0, 400.0, 500.0],
             crop_box: [10.0, 20.0, 390.0, 480.0],
-            bleed_box: Some([11.0, 21.0, 389.0, 479.0]),
-            trim_box: Some([12.0, 22.0, 388.0, 478.0]),
-            art_box: Some([13.0, 23.0, 387.0, 477.0]),
+            bleed_box: None,
+            trim_box: None,
+            art_box: None,
             rotation_degrees: 270,
         }
     );

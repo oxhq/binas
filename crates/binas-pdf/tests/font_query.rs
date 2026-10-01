@@ -163,3 +163,109 @@ fn missing_mappings_and_cumulative_decode_budget_fail_closed() {
     assert_eq!(error.code, PdfErrorCode::ResourceLimit);
     assert!(error.message.contains("decoded"));
 }
+
+#[test]
+fn unicode_expansion_is_bounded_before_retained_planning_can_publish() {
+    use binas_core::{BudgetLimits, CancellationToken, OperationContext, ResourceBudget};
+    use binas_pdf::{
+        PdfPageTextEditRequest, PdfRevision, PdfRevisionRequest, PdfSharedEditMode,
+        SurgicalTextEditRequest,
+    };
+    // Both encoded tokens fit the limit; the repeated one-byte code expands to
+    // 128 UTF-8 bytes through a 16-character destination.
+    let cmap = format!(
+        "1 begincodespacerange <00> <ff> endcodespacerange 1 beginbfchar <41> <{}> endbfchar",
+        "0041".repeat(16)
+    );
+    let input = pdf(
+        b"BT /F1 12 Tf (AAAAAAAA) Tj ET",
+        Some(cmap.as_bytes()),
+        false,
+    );
+    let document = PdfEngine::new(EngineConfig {
+        limits: Limits {
+            max_token_bytes: 96,
+            ..Limits::default()
+        },
+    })
+    .open_owned(input, OpenOptions::default())
+    .unwrap();
+    let first = document.extract_page_text_spans(0).unwrap_err();
+    assert_eq!(first.code, PdfErrorCode::ResourceLimit);
+    assert!(first.message.contains("max_token_bytes"));
+    let spent = document.decode_metrics().work_bytes;
+    let revision = PdfRevision::new(document);
+    let snapshot = revision.snapshot();
+    let context = OperationContext::new(
+        ResourceBudget::new(BudgetLimits {
+            max_live_bytes: 1_000_000,
+            max_work_units: 1_000_000,
+        }),
+        CancellationToken::new(),
+    );
+    let error = revision
+        .plan(
+            PdfRevisionRequest {
+                page_text: vec![PdfPageTextEditRequest {
+                    page_index: 0,
+                    edit: SurgicalTextEditRequest {
+                        old_text: "A".into(),
+                        replacement: "B".into(),
+                        match_index: 0,
+                    },
+                    shared: PdfSharedEditMode::Reject,
+                }],
+                ..Default::default()
+            },
+            &context,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, PdfErrorCode::ResourceLimit);
+    assert_eq!(revision.snapshot(), snapshot);
+    assert!(revision.decode_metrics().work_bytes > spent);
+}
+
+#[test]
+fn repeated_cmap_extraction_spends_work_after_cache_hits() {
+    let input = pdf(b"BT /F1 12 Tf <01> Tj ET", Some(cmap()), true);
+    let document = PdfEngine::new(EngineConfig {
+        limits: Limits {
+            max_decode_work_bytes: 20_000,
+            ..Limits::default()
+        },
+    })
+    .open_owned(input, OpenOptions::default())
+    .unwrap();
+    assert_eq!(
+        document.extract_page_text_spans(0).unwrap().spans[0].text,
+        "A"
+    );
+    let first = document.decode_metrics();
+    assert_eq!(
+        document.extract_page_text_spans(0).unwrap().spans[0].text,
+        "A"
+    );
+    let second = document.decode_metrics();
+    assert!(second.hits > first.hits);
+    assert!(second.work_bytes > first.work_bytes);
+    let mut exhausted = false;
+    for _ in 0..100 {
+        match document.clone().extract_page_text_spans(0) {
+            Ok(_) => {}
+            Err(error) => {
+                assert_eq!(error.code, PdfErrorCode::ResourceLimit);
+                exhausted = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        exhausted,
+        "cached CMap/text interpretation cannot reset cumulative work"
+    );
+    document.clear_decode_cache();
+    assert_eq!(
+        document.extract_page_text_spans(0).unwrap_err().code,
+        PdfErrorCode::ResourceLimit
+    );
+}

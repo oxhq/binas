@@ -329,7 +329,7 @@ impl PdfEngine {
             recipient_private_key_pkcs8_der,
             OpenOptions::default(),
         )?;
-        self.open(&plaintext.bytes, options)
+        self.open_owned(plaintext.bytes, options)
     }
 }
 

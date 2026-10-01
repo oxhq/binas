@@ -458,7 +458,10 @@ pub fn read_page_labels(document: &PdfDocument) -> Result<Vec<PageLabel>, PdfErr
         })
         .collect::<Vec<_>>();
     let (_, catalog) = catalog(document.parsed())?;
-    let Some(value) = catalog.get(b"PageLabels".as_slice()) else {
+    let Some(value) = catalog
+        .get(b"PageLabels".as_slice())
+        .filter(|value| !matches!(value, Value::Null))
+    else {
         return Ok(labels);
     };
     let (root, root_reference) = resolve_dict(document.parsed(), value, "catalog /PageLabels")?;
@@ -495,27 +498,27 @@ pub fn read_page_labels(document: &PdfDocument) -> Result<Vec<PageLabel>, PdfErr
                 .page_index
                 .checked_sub(start_index)
                 .ok_or_else(|| PdfError::syntax("page label index ordering is invalid", 0))?;
-            label.label = spec.label(offset)?;
+            label.label = spec.label(offset, document.parsed().limits.max_token_bytes)?;
         }
     }
     Ok(labels)
 }
 
 impl PageLabelSpec {
-    fn parse(parsed: &ParsedDocument, value: &Value) -> Result<Self, PdfError> {
+    pub(crate) fn parse(parsed: &ParsedDocument, value: &Value) -> Result<Self, PdfError> {
         let (dictionary, _) = resolve_dict(parsed, value, "page label spec")?;
         let style = match dictionary.get(b"S".as_slice()) {
-            None => None,
+            None | Some(Value::Null) => None,
             Some(Value::Name(value)) => Some(PageLabelStyle::from_pdf_name(value)?),
             Some(_) => return Err(PdfError::syntax("page label /S is not a name", 0)),
         };
         let prefix = match dictionary.get(b"P".as_slice()) {
-            None => String::new(),
+            None | Some(Value::Null) => String::new(),
             Some(Value::String(value)) => decode_text(value),
             Some(_) => return Err(PdfError::syntax("page label /P is not a string", 0)),
         };
         let start = match dictionary.get(b"St".as_slice()) {
-            None => 1,
+            None | Some(Value::Null) => 1,
             Some(Value::Integer(value)) if *value > 0 => usize::try_from(*value)
                 .map_err(|_| PdfError::limit("page label /St exceeds usize"))?,
             Some(Value::Integer(_)) => {
@@ -530,20 +533,43 @@ impl PageLabelSpec {
         })
     }
 
-    fn label(&self, offset: usize) -> Result<String, PdfError> {
-        let number = self
-            .start
-            .checked_add(offset)
-            .ok_or_else(|| PdfError::limit("page label number overflows"))?;
-        let suffix = match self.style {
-            Some(PageLabelStyle::LowerRoman) => roman_page_label(number).to_ascii_lowercase(),
-            Some(PageLabelStyle::UpperRoman) => roman_page_label(number),
-            Some(PageLabelStyle::LowerAlpha) => alpha_page_label(number).to_ascii_lowercase(),
-            Some(PageLabelStyle::UpperAlpha) => alpha_page_label(number),
+    pub(crate) fn label(&self, offset: usize, max_bytes: usize) -> Result<String, PdfError> {
+        let remaining = max_bytes
+            .checked_sub(self.prefix.len())
+            .ok_or_else(|| PdfError::limit("page label prefix exceeds max_token_bytes"))?;
+        let number = if self.style.is_some() {
+            self.start
+                .checked_add(offset)
+                .ok_or_else(|| PdfError::limit("page label number overflows"))?
+        } else {
+            1
+        };
+        let mut suffix = match self.style {
+            Some(PageLabelStyle::LowerRoman | PageLabelStyle::UpperRoman) => {
+                roman_page_label(number, remaining)?
+            }
+            Some(PageLabelStyle::LowerAlpha | PageLabelStyle::UpperAlpha) => {
+                alpha_page_label(number, remaining)?
+            }
             Some(PageLabelStyle::Decimal) => number.to_string(),
             None => String::new(),
         };
-        Ok(format!("{}{}", self.prefix, suffix))
+        if suffix.len() > remaining {
+            return Err(PdfError::limit("page label exceeds max_token_bytes"));
+        }
+        if matches!(
+            self.style,
+            Some(PageLabelStyle::LowerRoman | PageLabelStyle::LowerAlpha)
+        ) {
+            suffix.make_ascii_lowercase();
+        }
+        let mut label = String::new();
+        label
+            .try_reserve_exact(self.prefix.len() + suffix.len())
+            .map_err(|_| PdfError::limit("page label allocation failed"))?;
+        label.push_str(&self.prefix);
+        label.push_str(&suffix);
+        Ok(label)
     }
 }
 
@@ -592,7 +618,12 @@ fn collect_page_label_entries(
         ));
     }
     let limits = page_label_limits(node)?;
-    let actual = match (node.get(b"Nums".as_slice()), node.get(b"Kids".as_slice())) {
+    let actual = match (
+        node.get(b"Nums".as_slice())
+            .filter(|value| !matches!(value, Value::Null)),
+        node.get(b"Kids".as_slice())
+            .filter(|value| !matches!(value, Value::Null)),
+    ) {
         (Some(_), Some(_)) => {
             return Err(PdfError::syntax(
                 "page label node cannot contain both /Nums and /Kids",
@@ -703,7 +734,10 @@ fn collect_page_label_entries(
 }
 
 fn page_label_limits(node: &BTreeMap<Vec<u8>, Value>) -> Result<Option<(usize, usize)>, PdfError> {
-    let Some(value) = node.get(b"Limits".as_slice()) else {
+    let Some(value) = node
+        .get(b"Limits".as_slice())
+        .filter(|value| !matches!(value, Value::Null))
+    else {
         return Ok(None);
     };
     let Value::Array(values) = value else {
@@ -1394,46 +1428,66 @@ fn refresh_page_label_tree_limits(
     Ok(())
 }
 
-fn roman_page_label(mut number: usize) -> String {
-    if number == 0 {
-        return "0".into();
+const ROMAN_SYMBOLS: [(usize, &str); 13] = [
+    (1000, "M"),
+    (900, "CM"),
+    (500, "D"),
+    (400, "CD"),
+    (100, "C"),
+    (90, "XC"),
+    (50, "L"),
+    (40, "XL"),
+    (10, "X"),
+    (9, "IX"),
+    (5, "V"),
+    (4, "IV"),
+    (1, "I"),
+];
+
+fn roman_page_label(mut number: usize, max_bytes: usize) -> Result<String, PdfError> {
+    let mut remaining = number;
+    let mut length = 0_usize;
+    for (value, symbol) in ROMAN_SYMBOLS {
+        length = remaining
+            .checked_div(value)
+            .and_then(|count| count.checked_mul(symbol.len()))
+            .and_then(|count| length.checked_add(count))
+            .filter(|length| *length <= max_bytes)
+            .ok_or_else(|| PdfError::limit("Roman page label exceeds max_token_bytes"))?;
+        remaining %= value;
     }
     let mut label = String::new();
-    for (value, symbol) in [
-        (1000, "M"),
-        (900, "CM"),
-        (500, "D"),
-        (400, "CD"),
-        (100, "C"),
-        (90, "XC"),
-        (50, "L"),
-        (40, "XL"),
-        (10, "X"),
-        (9, "IX"),
-        (5, "V"),
-        (4, "IV"),
-        (1, "I"),
-    ] {
+    label
+        .try_reserve_exact(length)
+        .map_err(|_| PdfError::limit("page label allocation failed"))?;
+    for (value, symbol) in ROMAN_SYMBOLS {
         while number >= value {
             label.push_str(symbol);
             number -= value;
         }
     }
-    label
+    Ok(label)
 }
 
-fn alpha_page_label(mut number: usize) -> String {
-    if number == 0 {
-        return "0".into();
+fn alpha_page_label(number: usize, max_bytes: usize) -> Result<String, PdfError> {
+    // ISO 32000-1 Table 159: A..Z, AA..ZZ, AAA..ZZZ, etc.
+    // These are repetitions of one letter, not spreadsheet column numbers.
+    let index = number
+        .checked_sub(1)
+        .ok_or_else(|| PdfError::syntax("page label /St must be positive", 0))?;
+    let length = index / 26 + 1;
+    if length > max_bytes {
+        return Err(PdfError::limit(
+            "alphabetic page label exceeds max_token_bytes",
+        ));
     }
-    let mut label = Vec::new();
-    while number > 0 {
-        number -= 1;
-        label.push(b'A' + u8::try_from(number % 26).expect("alphabetic page label digit"));
-        number /= 26;
-    }
-    label.reverse();
-    String::from_utf8(label).expect("alphabetic page labels are ASCII")
+    let letter = char::from(b'A' + u8::try_from(index % 26).expect("alphabetic page label digit"));
+    let mut label = String::new();
+    label
+        .try_reserve_exact(length)
+        .map_err(|_| PdfError::limit("page label allocation failed"))?;
+    label.extend(std::iter::repeat_n(letter, length));
+    Ok(label)
 }
 
 impl PdfDocument {
@@ -1676,7 +1730,7 @@ impl PdfDocument {
                     metadata_ref,
                     IndirectObject {
                         value: Value::Dict(dict),
-                        stream: Some(xml),
+                        stream: Some(xml.into()),
                         stream_offset: 0,
                         offset: 0,
                     },
@@ -2177,7 +2231,7 @@ impl PdfDocument {
                         b"Type".to_vec(),
                         Value::Name(b"EmbeddedFile".to_vec()),
                     )])),
-                    stream: Some(data),
+                    stream: Some(data.into()),
                     stream_offset: 0,
                     offset: 0,
                 },

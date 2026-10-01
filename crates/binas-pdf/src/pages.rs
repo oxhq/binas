@@ -41,10 +41,40 @@ pub struct PageOperationReport {
     pub copied_objects: usize,
     pub input_bytes: usize,
     pub output_bytes: usize,
+    /// Catalog/trailer entries intentionally omitted during page assembly.
+    #[serde(default)]
+    pub omitted_document_entries: Vec<OmittedDocumentEntry>,
+}
+
+/// Explicit permission to omit named document entries when assembling pages.
+/// This is not secure erasure and does not authorize security-policy bypasses.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct PageAssemblyPolicy {
+    pub remove_catalog_entries: Vec<Vec<u8>>,
+    pub remove_trailer_entries: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct OmittedDocumentEntry {
+    /// Zero is the receiver; subsequent indices identify supplied source arguments.
+    pub input_index: usize,
+    pub location: DocumentEntryLocation,
+    /// Raw PDF name bytes, without the leading slash.
+    pub key: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentEntryLocation {
+    Catalog,
+    Trailer,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct PageOperationVerification {
+    /// Checks the staged output against its reparse, not all source semantics.
+    /// For assembly, consult the omission report as well; this is not a
+    /// conformance, accessibility, or complete preservation receipt.
     pub passed: bool,
     pub reparsed: bool,
     pub page_count_matches: bool,
@@ -67,13 +97,29 @@ struct PageSpec<'a> {
 
 impl PdfDocument {
     pub fn copy_pages(&self, page_indices: &[usize]) -> Result<PageOperationOutcome, PdfError> {
+        self.copy_pages_with_policy(page_indices, &PageAssemblyPolicy::default())
+    }
+
+    pub fn copy_pages_with_policy(
+        &self,
+        page_indices: &[usize],
+        policy: &PageAssemblyPolicy,
+    ) -> Result<PageOperationOutcome, PdfError> {
         let specs = selected_specs(self, page_indices)?;
-        assemble_pages("copy_pages", &specs, self)
+        assemble_pages("copy_pages", &specs, self, &[], policy)
     }
 
     pub fn extract_pages(&self, page_indices: &[usize]) -> Result<PageOperationOutcome, PdfError> {
+        self.extract_pages_with_policy(page_indices, &PageAssemblyPolicy::default())
+    }
+
+    pub fn extract_pages_with_policy(
+        &self,
+        page_indices: &[usize],
+        policy: &PageAssemblyPolicy,
+    ) -> Result<PageOperationOutcome, PdfError> {
         let specs = selected_specs(self, page_indices)?;
-        assemble_pages("extract_pages", &specs, self)
+        assemble_pages("extract_pages", &specs, self, &[], policy)
     }
 
     pub fn insert_pages(
@@ -81,6 +127,21 @@ impl PdfDocument {
         at: usize,
         source: &PdfDocument,
         source_page_indices: &[usize],
+    ) -> Result<PageOperationOutcome, PdfError> {
+        self.insert_pages_with_policy(
+            at,
+            source,
+            source_page_indices,
+            &PageAssemblyPolicy::default(),
+        )
+    }
+
+    pub fn insert_pages_with_policy(
+        &self,
+        at: usize,
+        source: &PdfDocument,
+        source_page_indices: &[usize],
+        policy: &PageAssemblyPolicy,
     ) -> Result<PageOperationOutcome, PdfError> {
         let current = all_specs(self)?;
         if at > current.len() {
@@ -101,10 +162,18 @@ impl PdfDocument {
         specs.extend_from_slice(&current[..at]);
         specs.extend(inserted);
         specs.extend_from_slice(&current[at..]);
-        assemble_pages("insert_pages", &specs, self)
+        assemble_pages("insert_pages", &specs, self, &[source], policy)
     }
 
     pub fn merge_pages(&self, sources: &[&PdfDocument]) -> Result<PageOperationOutcome, PdfError> {
+        self.merge_pages_with_policy(sources, &PageAssemblyPolicy::default())
+    }
+
+    pub fn merge_pages_with_policy(
+        &self,
+        sources: &[&PdfDocument],
+        policy: &PageAssemblyPolicy,
+    ) -> Result<PageOperationOutcome, PdfError> {
         let mut specs = all_specs(self)?;
         let mut input_pages = specs.len();
         for source in sources {
@@ -117,7 +186,7 @@ impl PdfDocument {
             }
             specs.extend(pages);
         }
-        assemble_pages("merge_pages", &specs, self)
+        assemble_pages("merge_pages", &specs, self, sources, policy)
     }
 
     /// Paints one page from `source` onto a page in this document.
@@ -214,7 +283,7 @@ impl PdfDocument {
             form_ref,
             IndirectObject {
                 value: Value::Dict(form_dictionary),
-                stream: Some(form_stream),
+                stream: Some(form_stream.into()),
                 stream_offset: 0,
                 offset: 0,
             },
@@ -478,13 +547,16 @@ fn assemble_pages(
     operation: &str,
     specs: &[PageSpec<'_>],
     base: &PdfDocument,
+    sources: &[&PdfDocument],
+    policy: &PageAssemblyPolicy,
 ) -> Result<PageOperationOutcome, PdfError> {
     if specs.len() > base.parsed().limits.max_pages {
         return Err(PdfError::limit("output page count exceeds max_pages"));
     }
-    refuse_security_boundaries(base.parsed())?;
-    for spec in specs {
-        refuse_security_boundaries(spec.document.parsed())?;
+    let mut omitted = Vec::new();
+    for (input_index, document) in std::iter::once(&base).chain(sources.iter()).enumerate() {
+        refuse_security_boundaries(document.parsed())?;
+        preflight_document_entries(document, input_index, policy, &mut omitted)?;
     }
     let catalog_ref = ObjectRef {
         number: 1,
@@ -497,8 +569,17 @@ fn assemble_pages(
     let mut objects = BTreeMap::new();
     let mut kids = Vec::with_capacity(specs.len());
     let mut next = 3_u32;
+    let mut imports = crate::import::PageImportMap::default();
     for spec in specs {
-        let page = copy_page_closure(*spec, pages_ref, &mut objects, &mut next, base)?;
+        let page = imports.import_page(
+            spec.document,
+            spec.reference,
+            materialize_page(spec.document, spec.reference)?,
+            pages_ref,
+            &mut objects,
+            &mut next,
+            &base.parsed().limits,
+        )?;
         kids.push(Value::Ref(page));
     }
     let mut catalog = BTreeMap::new();
@@ -520,56 +601,91 @@ fn assemble_pages(
     trailer.insert(b"Size".to_vec(), Value::Integer(i64::from(next)));
     let mut parsed = base.parsed().clone();
     parsed.version = "1.7".into();
-    parsed.objects = objects;
+    parsed.objects = objects.into();
     parsed.trailer = Value::Dict(trailer);
     let mut documents = BTreeSet::new();
     documents.insert(std::ptr::from_ref(base) as usize);
     let mut input_bytes = base.source_len();
     let mut input_pages = base.page_refs()?.len();
-    for spec in specs {
-        if !documents.insert(std::ptr::from_ref(spec.document) as usize) {
+    for document in sources {
+        if !documents.insert(std::ptr::from_ref(*document) as usize) {
             continue;
         }
         input_bytes = input_bytes
-            .checked_add(spec.document.source_len())
+            .checked_add(document.source_len())
             .ok_or_else(|| PdfError::limit("input byte count overflows"))?;
         input_pages = input_pages
-            .checked_add(spec.document.page_refs()?.len())
+            .checked_add(document.page_refs()?.len())
             .ok_or_else(|| PdfError::limit("input page count overflows"))?;
     }
-    finish_operation(
+    let mut outcome = finish_operation(
         operation,
         base,
         parsed,
         specs.len(),
         input_pages,
         input_bytes,
-    )
+    )?;
+    outcome.report.omitted_document_entries = omitted;
+    Ok(outcome)
 }
 
-fn copy_page_closure(
-    spec: PageSpec<'_>,
-    parent: ObjectRef,
-    output: &mut BTreeMap<ObjectRef, IndirectObject>,
-    next: &mut u32,
-    base: &PdfDocument,
-) -> Result<ObjectRef, PdfError> {
-    let page_ref = allocate_reference_from_limits(base, next)?;
-    let mut mapping = BTreeMap::new();
-    mapping.insert(spec.reference, page_ref);
-    let page = materialize_page(spec.document, spec.reference)?;
-    let mut value = remap_value(
-        &Value::Dict(page),
-        spec,
-        &mut mapping,
-        output,
-        next,
-        base,
-        0,
-    )?;
-    as_dict_mut(&mut value, "copied page")?.insert(b"Parent".to_vec(), Value::Ref(parent));
-    output.insert(page_ref, plain_object(value));
-    Ok(page_ref)
+fn preflight_document_entries(
+    document: &PdfDocument,
+    input_index: usize,
+    policy: &PageAssemblyPolicy,
+    omitted: &mut Vec<OmittedDocumentEntry>,
+) -> Result<(), PdfError> {
+    let parsed = document.parsed();
+    let trailer = resolve_dictionary(parsed, &parsed.trailer, "trailer")?;
+    let root = trailer
+        .get(b"Root".as_slice())
+        .ok_or_else(|| PdfError::syntax("trailer has no Root", 0))?;
+    let catalog = resolve_dictionary(parsed, root, "catalog")?;
+    let xref_stream =
+        matches!(trailer.get(b"Type".as_slice()), Some(Value::Name(name)) if name == b"XRef");
+    for (location, dictionary, allowed) in [
+        (
+            DocumentEntryLocation::Catalog,
+            &catalog,
+            &policy.remove_catalog_entries,
+        ),
+        (
+            DocumentEntryLocation::Trailer,
+            &trailer,
+            &policy.remove_trailer_entries,
+        ),
+    ] {
+        for key in dictionary.keys() {
+            let structural = match location {
+                DocumentEntryLocation::Catalog => matches!(key.as_slice(), b"Type" | b"Pages"),
+                // These describe the old cross-reference representation, not document semantics.
+                DocumentEntryLocation::Trailer => {
+                    matches!(key.as_slice(), b"Root" | b"Size" | b"Prev" | b"XRefStm")
+                        || (xref_stream
+                            && matches!(
+                                key.as_slice(),
+                                b"Type" | b"W" | b"Index" | b"Length" | b"Filter" | b"DecodeParms"
+                            ))
+                }
+            };
+            if structural {
+                continue;
+            }
+            if !allowed.contains(key) {
+                return Err(PdfError::unsupported(format!(
+                    "page assembly cannot preserve input {input_index} {location:?} /{}; explicit entry removal is required",
+                    String::from_utf8_lossy(key)
+                )));
+            }
+            omitted.push(OmittedDocumentEntry {
+                input_index,
+                location,
+                key: key.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -674,15 +790,22 @@ fn materialize_page(
         ));
     }
     result.remove(b"Parent".as_slice());
-    let keys: [&[u8]; 7] = [
-        b"Resources",
-        b"MediaBox",
-        b"CropBox",
-        b"Rotate",
-        b"BleedBox",
-        b"TrimBox",
-        b"ArtBox",
-    ];
+    let keys: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
+    // Null dictionary entries behave as absent. Non-inheritable page boxes
+    // default to the effective CropBox; they must never come from /Pages.
+    result.retain(|key, value| {
+        !matches!(value, Value::Null)
+            || !matches!(
+                key.as_slice(),
+                b"Resources"
+                    | b"MediaBox"
+                    | b"CropBox"
+                    | b"Rotate"
+                    | b"BleedBox"
+                    | b"TrimBox"
+                    | b"ArtBox"
+            )
+    });
     let mut current = page_ref;
     let mut visited = BTreeSet::new();
     for _ in 0..=document.parsed().limits.max_parser_depth {
@@ -693,14 +816,16 @@ fn materialize_page(
         let dictionary = as_dict(&object.value, "page inheritance node")?;
         for key in keys {
             if !result.contains_key(key)
-                && let Some(value) = dictionary.get(key)
+                && let Some(value) = dictionary
+                    .get(key)
+                    .filter(|value| !matches!(value, Value::Null))
             {
                 result.insert(key.to_vec(), value.clone());
             }
         }
         match dictionary.get(b"Parent".as_slice()) {
             Some(Value::Ref(parent)) => current = *parent,
-            None => return Ok(result),
+            None | Some(Value::Null) => return Ok(result),
             Some(_) => {
                 return Err(PdfError::syntax(
                     "page /Parent is not a reference",
@@ -755,6 +880,7 @@ fn finish_operation(
             copied_objects,
             input_bytes,
             output_bytes: canonical.bytes.len(),
+            omitted_document_entries: Vec::new(),
         },
         bytes: canonical.bytes,
         verification,
@@ -1353,7 +1479,7 @@ fn transformed_content(
         pdf_number(matrix[3])
     )
     .into_bytes();
-    let mut budget = ParseBudget::default();
+    let mut budget = ParseBudget::for_document(parsed);
     for reference in contents {
         let object = parsed.object(*reference)?;
         let stream = object
@@ -1458,7 +1584,7 @@ fn selection_error(message: impl Into<String>) -> PdfError {
 fn stream_object(stream: Vec<u8>) -> IndirectObject {
     IndirectObject {
         value: Value::Dict(BTreeMap::new()),
-        stream: Some(stream),
+        stream: Some(stream.into()),
         stream_offset: 0,
         offset: 0,
     }

@@ -1,7 +1,12 @@
+use binas_core::OperationContext;
 use std::{
     collections::BTreeMap,
     fmt::{self, Write},
 };
+
+mod revision;
+pub use revision::{PdfRevisionExport, PdfWriterMode};
+pub(crate) use revision::{export_staged_document, write_compact_document};
 
 use crate::{
     document::PdfDocument,
@@ -22,6 +27,17 @@ pub(crate) fn append_object_revisions(
     document: &PdfDocument,
     replacements: &[(ObjectRef, &Value, Option<&[u8]>)],
 ) -> Result<Vec<u8>, PdfError> {
+    append_object_revisions_with_context(document, replacements, None)
+}
+
+pub(crate) fn append_object_revisions_with_context(
+    document: &PdfDocument,
+    replacements: &[(ObjectRef, &Value, Option<&[u8]>)],
+    context: Option<&OperationContext>,
+) -> Result<Vec<u8>, PdfError> {
+    if let Some(context) = context {
+        context.checkpoint().map_err(PdfError::from_context)?;
+    }
     if replacements.is_empty() {
         return Err(PdfError::unsafe_rewrite(
             "incremental revision requires at least one replacement object",
@@ -34,18 +50,23 @@ pub(crate) fn append_object_revisions(
             "incremental replacement count exceeds limit",
         ));
     }
-    refuse_security_boundaries(document.parsed())?;
-    let size = dict_integer(&document.parsed().trailer, b"Size")
-        .and_then(|value| usize::try_from(value).ok())
+    refuse_security_boundaries_with_context(document.parsed(), context)?;
+    refuse_stale_linearization_with_context(document.parsed(), context)?;
+    let size = document
+        .parsed()
+        .source_size
         .ok_or_else(|| PdfError::unsafe_rewrite("trailer has no direct non-negative /Size"))?;
     let mut sorted = BTreeMap::new();
     let mut generations = BTreeMap::new();
     let mut new_objects = 0usize;
     let mut output_size = size;
     for &(reference, value, stream) in replacements {
+        if let Some(context) = context {
+            context.charge_work(1).map_err(PdfError::from_context)?;
+        }
         let number = usize::try_from(reference.number)
             .map_err(|_| PdfError::limit("replacement object number exceeds usize"))?;
-        let existing = document.parsed().objects.contains_key(&reference);
+        let existing = document.parsed().objects.contains_base_key(&reference);
         if existing && number >= size {
             return Err(PdfError::unsafe_rewrite(
                 "existing replacement object is outside trailer /Size",
@@ -57,17 +78,24 @@ pub(crate) fn append_object_revisions(
                     "new objects require generation zero at or above trailer /Size",
                 ));
             }
-            if document
+            for existing in document
                 .parsed()
                 .objects
                 .keys()
-                .any(|existing| existing.number == reference.number)
+                .chain(document.parsed().objects.base_keys())
             {
-                return Err(PdfError::unsafe_rewrite(
-                    "new object number collides with an existing generation",
-                ));
+                if let Some(context) = context {
+                    context.charge_work(1).map_err(PdfError::from_context)?;
+                }
+                if existing.number == reference.number && *existing != reference {
+                    return Err(PdfError::unsafe_rewrite(
+                        "new object number collides with an existing generation",
+                    ));
+                }
             }
-            if !sorted.contains_key(&reference) {
+            if !document.parsed().objects.contains_key(&reference)
+                && !sorted.contains_key(&reference)
+            {
                 new_objects = new_objects
                     .checked_add(1)
                     .ok_or_else(|| PdfError::limit("new object count overflows"))?;
@@ -86,7 +114,11 @@ pub(crate) fn append_object_revisions(
                 "one revision cannot replace multiple generations of an object number",
             ));
         }
-        sorted.insert(reference, (value, stream));
+        if sorted.insert(reference, (value, stream)).is_some() {
+            return Err(PdfError::unsafe_rewrite(
+                "one revision cannot replace the same object twice",
+            ));
+        }
     }
     if document
         .parsed()
@@ -94,16 +126,17 @@ pub(crate) fn append_object_revisions(
         .len()
         .checked_add(new_objects)
         .is_none_or(|count| count > document.parsed().limits.max_objects)
-        || (new_objects != 0 && output_size > document.parsed().limits.max_xref_entries)
+        || output_size > document.parsed().limits.max_xref_entries
     {
         return Err(PdfError::limit(
             "incremental object allocation exceeds object or xref limits",
         ));
     }
     let previous_xref = previous_xref_offset(document.source())?;
-    let mut output = Output::from_bytes(
+    let mut output = Output::from_bytes_with_context(
         document.source(),
         document.engine_config().limits.max_output_bytes,
+        context,
     )?;
     output.push(b"\n")?;
     let mut offsets = BTreeMap::new();
@@ -114,14 +147,10 @@ pub(crate) fn append_object_revisions(
             "{} {} obj\n",
             reference.number, reference.generation
         ))?;
-        write_object(
+        write_object_parts(
             &mut output,
-            &IndirectObject {
-                value: value.clone(),
-                stream: stream.map(<[u8]>::to_vec),
-                stream_offset: 0,
-                offset: object_offset,
-            },
+            value,
+            stream,
             document.parsed().limits.max_parser_depth,
         )?;
         output.push(b"\nendobj\n")?;
@@ -152,24 +181,99 @@ pub(crate) fn append_object_revisions(
         }
         start = end;
     }
-    output.formatted(format_args!("trailer\n<< /Size {output_size}"))?;
-    for key in [b"Root".as_slice(), b"Info".as_slice(), b"ID".as_slice()] {
-        if let Some(value) = dict_get(&document.parsed().trailer, key) {
-            output.push(b" ")?;
-            write_name(&mut output, key)?;
-            output.push(b" ")?;
-            write_value(
-                &mut output,
-                value,
-                0,
-                document.parsed().limits.max_parser_depth,
-            )?;
+    write_classic_trailer(
+        &mut output,
+        &document.parsed().trailer,
+        output_size,
+        Some(previous_xref),
+        document.parsed().limits.max_parser_depth,
+    )?;
+    output.formatted(format_args!("\nstartxref\n{xref_offset}\n%%EOF\n"))?;
+    Ok(output.into_bytes())
+}
+
+/// Excludes only fields describing the old xref representation. Remaining
+/// trailer values (including opaque extensions) survive without interpretation.
+pub(crate) fn is_xref_layout_key(trailer: &Value, key: &[u8]) -> bool {
+    matches!(key, b"Size" | b"Prev" | b"XRefStm")
+        || (matches!(dict_get(trailer, b"Type"), Some(Value::Name(kind)) if kind == b"XRef")
+            && matches!(
+                key,
+                b"Type"
+                    | b"W"
+                    | b"Index"
+                    | b"Length"
+                    | b"Filter"
+                    | b"DecodeParms"
+                    | b"F"
+                    | b"FFilter"
+                    | b"FDecodeParms"
+                    | b"DL"
+            ))
+}
+
+pub(crate) fn refuse_stale_linearization(parsed: &ParsedDocument) -> Result<(), PdfError> {
+    scan_linearization(parsed, None)
+}
+
+pub(crate) fn refuse_stale_linearization_with_context(
+    parsed: &ParsedDocument,
+    context: Option<&OperationContext>,
+) -> Result<(), PdfError> {
+    match context {
+        Some(_) => scan_linearization(parsed, context),
+        None => refuse_stale_linearization(parsed),
+    }
+}
+
+fn charge_scan(context: Option<&OperationContext>) -> Result<(), PdfError> {
+    if let Some(context) = context {
+        context.charge_work(1).map_err(PdfError::from_context)?;
+    }
+    Ok(())
+}
+
+fn scan_linearization(
+    parsed: &ParsedDocument,
+    context: Option<&OperationContext>,
+) -> Result<(), PdfError> {
+    charge_scan(context)?;
+    for object in parsed.objects.values() {
+        charge_scan(context)?;
+        if matches!(dict_get(&object.value, b"Linearized"), Some(value) if !matches!(value, Value::Null))
+        {
+            return Err(PdfError::unsupported(
+                "writer cannot rebuild existing /Linearized byte offsets and hint tables",
+            ));
         }
     }
-    output.formatted(format_args!(
-        " /Prev {previous_xref} >>\nstartxref\n{xref_offset}\n%%EOF\n"
-    ))?;
-    Ok(output.into_bytes())
+    Ok(())
+}
+
+pub(crate) fn write_classic_trailer(
+    output: &mut Output,
+    trailer: &Value,
+    size: usize,
+    previous: Option<usize>,
+    max_depth: usize,
+) -> Result<(), PdfError> {
+    let Value::Dict(values) = trailer else {
+        return Err(PdfError::unsafe_rewrite("trailer is not a dictionary"));
+    };
+    output.formatted(format_args!("trailer\n<< /Size {size}"))?;
+    for (key, value) in values {
+        if is_xref_layout_key(trailer, key) {
+            continue;
+        }
+        output.push(b" ")?;
+        write_name(output, key)?;
+        output.push(b" ")?;
+        write_value(output, value, 0, max_depth)?;
+    }
+    if let Some(previous) = previous {
+        output.formatted(format_args!(" /Prev {previous}"))?;
+    }
+    output.push(b" >>")
 }
 
 pub(crate) fn next_object_reference(document: &PdfDocument) -> Result<ObjectRef, PdfError> {
@@ -205,24 +309,34 @@ pub(crate) fn next_object_reference(document: &PdfDocument) -> Result<ObjectRef,
 pub(crate) struct Output {
     bytes: Vec<u8>,
     limit: usize,
+    context: Option<OperationContext>,
+    pending_error: Option<PdfError>,
 }
 
 impl Output {
     pub(crate) fn new(limit: usize) -> Self {
+        Self::new_with_context(limit, None)
+    }
+
+    /// Context work is charged before each byte append/allocation. This bounds
+    /// logical output length, not allocator/process memory or encoder scratch.
+    pub(crate) fn new_with_context(limit: usize, context: Option<&OperationContext>) -> Self {
         Self {
             bytes: Vec::new(),
             limit,
+            context: context.cloned(),
+            pending_error: None,
         }
     }
 
-    fn from_bytes(bytes: &[u8], limit: usize) -> Result<Self, PdfError> {
-        if bytes.len() > limit {
-            return Err(PdfError::limit("output exceeds max_output_bytes"));
-        }
-        Ok(Self {
-            bytes: bytes.to_vec(),
-            limit,
-        })
+    pub(crate) fn from_bytes_with_context(
+        bytes: &[u8],
+        limit: usize,
+        context: Option<&OperationContext>,
+    ) -> Result<Self, PdfError> {
+        let mut output = Self::new_with_context(limit, context);
+        output.push(bytes)?;
+        Ok(output)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -230,6 +344,9 @@ impl Output {
     }
 
     pub(crate) fn push(&mut self, bytes: &[u8]) -> Result<(), PdfError> {
+        if let Some(context) = &self.context {
+            context.checkpoint().map_err(PdfError::from_context)?;
+        }
         let length = self
             .bytes
             .len()
@@ -238,6 +355,14 @@ impl Output {
         if length > self.limit {
             return Err(PdfError::limit("output exceeds max_output_bytes"));
         }
+        if let Some(context) = &self.context {
+            context
+                .charge_work(bytes.len() as u64)
+                .map_err(PdfError::from_context)?;
+        }
+        self.bytes
+            .try_reserve(bytes.len())
+            .map_err(|_| PdfError::limit("output allocation failed"))?;
         self.bytes.extend_from_slice(bytes);
         Ok(())
     }
@@ -247,7 +372,19 @@ impl Output {
     }
 
     pub(crate) fn formatted(&mut self, args: fmt::Arguments<'_>) -> Result<(), PdfError> {
-        fmt::write(self, args).map_err(|_| PdfError::limit("output exceeds max_output_bytes"))
+        if let Some(error) = self.pending_error.take() {
+            return Err(error);
+        }
+        if let Some(context) = &self.context {
+            context.checkpoint().map_err(PdfError::from_context)?;
+        }
+        match fmt::write(self, args) {
+            Ok(()) => Ok(()),
+            Err(_) => Err(self
+                .pending_error
+                .take()
+                .unwrap_or_else(|| PdfError::unsafe_rewrite("output formatting failed"))),
+        }
     }
 
     pub(crate) fn into_bytes(self) -> Vec<u8> {
@@ -257,7 +394,13 @@ impl Output {
 
 impl Write for Output {
     fn write_str(&mut self, value: &str) -> fmt::Result {
-        self.push(value.as_bytes()).map_err(|_| fmt::Error)
+        if self.pending_error.is_some() {
+            return Err(fmt::Error);
+        }
+        self.push(value.as_bytes()).map_err(|error| {
+            self.pending_error = Some(error);
+            fmt::Error
+        })
     }
 }
 
@@ -266,9 +409,18 @@ pub(crate) fn write_object(
     object: &IndirectObject,
     max_depth: usize,
 ) -> Result<(), PdfError> {
-    match object.stream.as_deref() {
+    write_object_parts(output, &object.value, object.stream.as_deref(), max_depth)
+}
+
+fn write_object_parts(
+    output: &mut Output,
+    value: &Value,
+    stream: Option<&[u8]>,
+    max_depth: usize,
+) -> Result<(), PdfError> {
+    match stream {
         Some(stream) => {
-            let Value::Dict(dictionary) = &object.value else {
+            let Value::Dict(dictionary) = value else {
                 return Err(PdfError::unsafe_rewrite(
                     "stream object does not have a dictionary",
                 ));
@@ -278,7 +430,7 @@ pub(crate) fn write_object(
             output.push(stream)?;
             output.push(b"\nendstream")
         }
-        None => write_value(output, &object.value, 0, max_depth),
+        None => write_value(output, value, 0, max_depth),
     }
 }
 
@@ -421,35 +573,73 @@ pub(crate) fn dict_integer(value: &Value, key: &[u8]) -> Option<i64> {
 }
 
 pub(crate) fn refuse_security_boundaries(parsed: &ParsedDocument) -> Result<(), PdfError> {
+    scan_security(parsed, None)
+}
+
+/// Bounds the security census with the caller's cumulative work and cancellation.
+/// Each visited object/value costs one unit; encoded stream bytes are not scanned.
+pub(crate) fn refuse_security_boundaries_with_context(
+    parsed: &ParsedDocument,
+    context: Option<&OperationContext>,
+) -> Result<(), PdfError> {
+    match context {
+        Some(_) => scan_security(parsed, context),
+        None => refuse_security_boundaries(parsed),
+    }
+}
+
+fn scan_security(
+    parsed: &ParsedDocument,
+    context: Option<&OperationContext>,
+) -> Result<(), PdfError> {
+    charge_scan(context)?;
     if dict_get(&parsed.trailer, b"Encrypt").is_some() {
         return Err(PdfError::unsafe_rewrite(
             "rewriting encrypted PDFs is not implemented",
         ));
     }
-    if contains_signature(&parsed.trailer)
-        || parsed
-            .objects
-            .values()
-            .any(|object| contains_signature(&object.value))
-    {
+    if contains_signature(&parsed.trailer, context)? {
         return Err(PdfError::unsafe_rewrite(
             "rewriting signed PDFs requires an explicit signature policy",
         ));
     }
+    for object in parsed.objects.values() {
+        charge_scan(context)?;
+        if contains_signature(&object.value, context)? {
+            return Err(PdfError::unsafe_rewrite(
+                "rewriting signed PDFs requires an explicit signature policy",
+            ));
+        }
+    }
     Ok(())
 }
 
-fn contains_signature(value: &Value) -> bool {
+fn contains_signature(value: &Value, context: Option<&OperationContext>) -> Result<bool, PdfError> {
+    charge_scan(context)?;
     match value {
-        Value::Array(values) => values.iter().any(contains_signature),
+        Value::Array(values) => {
+            for value in values {
+                if contains_signature(value, context)? {
+                    return Ok(true);
+                }
+            }
+        }
         Value::Dict(dictionary) => {
-            dictionary.contains_key(b"ByteRange".as_slice())
+            if dictionary.contains_key(b"ByteRange".as_slice())
                 || matches!(dictionary.get(b"Type".as_slice()), Some(Value::Name(name)) if name == b"Sig")
                 || matches!(dictionary.get(b"FT".as_slice()), Some(Value::Name(name)) if name == b"Sig")
-                || dictionary.values().any(contains_signature)
+            {
+                return Ok(true);
+            }
+            for value in dictionary.values() {
+                if contains_signature(value, context)? {
+                    return Ok(true);
+                }
+            }
         }
-        _ => false,
+        _ => {}
     }
+    Ok(false)
 }
 
 fn previous_xref_offset(input: &[u8]) -> Result<usize, PdfError> {
@@ -478,6 +668,136 @@ fn previous_xref_offset(input: &[u8]) -> Result<usize, PdfError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preflight_scans_preserve_typed_limits_cancellation_and_source() {
+        let document = crate::PdfEngine::default()
+            .open(
+                include_bytes!("../tests/fixtures/preservation/metadata.pdf"),
+                crate::OpenOptions::default(),
+            )
+            .unwrap();
+        let original = document.input_source().clone();
+        for scan in [
+            super::refuse_security_boundaries_with_context,
+            super::refuse_stale_linearization_with_context,
+        ] {
+            let limited = output_context(2);
+            assert_eq!(
+                scan(document.parsed(), Some(&limited)).unwrap_err().code,
+                crate::PdfErrorCode::ResourceLimit
+            );
+            assert_eq!(limited.budget().snapshot().work_units, 2);
+            let cancelled = output_context(1000);
+            cancelled.cancellation().cancel();
+            assert_eq!(
+                scan(document.parsed(), Some(&cancelled)).unwrap_err().code,
+                crate::PdfErrorCode::Cancelled
+            );
+            assert_eq!(cancelled.budget().snapshot().work_units, 0);
+            scan(document.parsed(), Some(&output_context(1000))).unwrap();
+        }
+        assert_eq!(document.input_source().as_bytes(), original.as_bytes());
+        assert_eq!(document.source_id(), original.id());
+    }
+
+    #[test]
+    fn security_scan_charges_nested_values_before_visiting_them() {
+        let nested = super::Value::Array(vec![super::Value::Array(vec![super::Value::Null; 20])]);
+        let limited = output_context(5);
+        assert_eq!(
+            super::contains_signature(&nested, Some(&limited))
+                .unwrap_err()
+                .code,
+            crate::PdfErrorCode::ResourceLimit
+        );
+        assert_eq!(limited.budget().snapshot().work_units, 5);
+        let complete = output_context(22);
+        assert!(!super::contains_signature(&nested, Some(&complete)).unwrap());
+        assert_eq!(complete.budget().snapshot().work_units, 22);
+    }
+
+    fn output_context(work: u64) -> binas_core::OperationContext {
+        binas_core::OperationContext::new(
+            binas_core::ResourceBudget::new(binas_core::BudgetLimits {
+                max_live_bytes: 0,
+                max_work_units: work,
+            }),
+            binas_core::CancellationToken::new(),
+        )
+    }
+
+    #[test]
+    fn output_work_rejection_precedes_growth_and_drop_does_not_refund() {
+        let context = output_context(3);
+        let mut output = super::Output::new_with_context(100, Some(&context));
+        assert_eq!(
+            output.push(b"four").unwrap_err().code,
+            crate::PdfErrorCode::ResourceLimit
+        );
+        assert_eq!((output.len(), output.bytes.capacity()), (0, 0));
+        output.push(b"abc").unwrap();
+        let capacity = output.bytes.capacity();
+        assert_eq!(
+            output.push(b"d").unwrap_err().code,
+            crate::PdfErrorCode::ResourceLimit
+        );
+        assert_eq!((output.len(), output.bytes.capacity()), (3, capacity));
+        drop(output);
+        assert_eq!(context.budget().snapshot().work_units, 3);
+        assert_eq!(context.budget().snapshot().live_bytes, 0);
+    }
+
+    #[test]
+    fn formatted_output_preserves_cancelled_and_budget_error_codes() {
+        let context = output_context(100);
+        let mut output = super::Output::new_with_context(100, Some(&context));
+        context.cancellation().cancel();
+        assert_eq!(
+            output.formatted(format_args!("{}", 42)).unwrap_err().code,
+            crate::PdfErrorCode::Cancelled
+        );
+        assert_eq!(output.len(), 0);
+        // Exercise cancellation raised inside Display, after formatted's initial
+        // checkpoint, to verify fmt::Error does not erase the typed cause.
+        struct CancelDuringDisplay(binas_core::CancellationToken);
+        impl std::fmt::Display for CancelDuringDisplay {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.cancel();
+                formatter.write_str("cancelled")
+            }
+        }
+        let active = output_context(100);
+        let mut output = super::Output::new_with_context(100, Some(&active));
+        assert_eq!(
+            output
+                .formatted(format_args!(
+                    "{}",
+                    CancelDuringDisplay(active.cancellation().clone())
+                ))
+                .unwrap_err()
+                .code,
+            crate::PdfErrorCode::Cancelled
+        );
+        assert_eq!(active.budget().snapshot().work_units, 0);
+        let limited = output_context(0);
+        let mut output = super::Output::new_with_context(100, Some(&limited));
+        assert_eq!(
+            output.formatted(format_args!("{}", 42)).unwrap_err().code,
+            crate::PdfErrorCode::ResourceLimit
+        );
+        assert_eq!(output.len(), 0);
+    }
+
+    #[test]
+    fn output_length_cap_is_checked_before_copy_and_work_charge() {
+        let context = output_context(100);
+        let error = super::Output::from_bytes_with_context(b"four", 3, Some(&context))
+            .err()
+            .unwrap();
+        assert_eq!(error.code, crate::PdfErrorCode::ResourceLimit);
+        assert_eq!(context.budget().snapshot().work_units, 0);
+    }
+
     use crate::{OpenOptions, PdfEngine, parser::Value};
 
     use super::{ObjectRef, append_object_revisions};
@@ -509,7 +829,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_revision_sorts_deduplicates_and_groups_xref_subsections() {
+    fn batch_revision_rejects_conflicts_and_groups_sorted_xref_subsections() {
         let source = pdf();
         let document = PdfEngine::default()
             .open(&source, OpenOptions::default())
@@ -517,6 +837,30 @@ mod tests {
         let first = Value::String(b"ignored".to_vec());
         let fourth = Value::String(b"FOUR".to_vec());
         let fifth = Value::String(b"FIVE".to_vec());
+        assert!(
+            append_object_revisions(
+                &document,
+                &[
+                    (
+                        ObjectRef {
+                            number: 4,
+                            generation: 0
+                        },
+                        &first,
+                        None
+                    ),
+                    (
+                        ObjectRef {
+                            number: 4,
+                            generation: 0
+                        },
+                        &fourth,
+                        None
+                    ),
+                ]
+            )
+            .is_err()
+        );
         let output = append_object_revisions(
             &document,
             &[
@@ -526,14 +870,6 @@ mod tests {
                         generation: 0,
                     },
                     &fifth,
-                    None,
-                ),
-                (
-                    ObjectRef {
-                        number: 4,
-                        generation: 0,
-                    },
-                    &first,
                     None,
                 ),
                 (

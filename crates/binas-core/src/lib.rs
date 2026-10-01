@@ -3,111 +3,27 @@ use std::{collections::BTreeMap, error::Error, fmt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Span {
-    start: u64,
-    end: u64,
-}
+pub mod adapter;
+pub mod budget;
+pub mod capability;
+pub mod context;
+pub mod graph;
+pub mod identity;
+pub mod source;
+pub mod transaction;
+pub mod verification;
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-struct RawSpan {
-    start: u64,
-    end: u64,
-}
+pub use adapter::Adapter;
 
-impl Span {
-    pub fn new(start: u64, end: u64) -> Result<Self, SpanError> {
-        if end < start {
-            return Err(SpanError::Reversed { start, end });
-        }
-        Ok(Self { start, end })
-    }
+pub use budget::{
+    BudgetError, BudgetLimits, BudgetResource, BudgetSnapshot, Reservation, ResourceBudget,
+};
+pub use context::{CancellationToken, ContextError, OperationContext};
+pub use identity::{RevisionId, SnapshotId, SourceId};
+pub use source::{PayloadProvenance, Source, SourceError, SourceSpan};
 
-    pub fn from_start_len(start: u64, len: u64) -> Result<Self, SpanError> {
-        let end = start
-            .checked_add(len)
-            .ok_or(SpanError::Overflow { start, len })?;
-        Self::new(start, end)
-    }
-
-    pub const fn start(self) -> u64 {
-        self.start
-    }
-
-    pub const fn end(self) -> u64 {
-        self.end
-    }
-
-    pub const fn len(self) -> u64 {
-        self.end - self.start
-    }
-
-    pub const fn is_empty(self) -> bool {
-        self.start == self.end
-    }
-
-    pub fn slice(self, input: &[u8]) -> Option<&[u8]> {
-        let start = usize::try_from(self.start).ok()?;
-        let end = usize::try_from(self.end).ok()?;
-        input.get(start..end)
-    }
-}
-
-impl TryFrom<RawSpan> for Span {
-    type Error = SpanError;
-
-    fn try_from(value: RawSpan) -> Result<Self, Self::Error> {
-        Self::new(value.start, value.end)
-    }
-}
-
-impl From<Span> for RawSpan {
-    fn from(value: Span) -> Self {
-        Self {
-            start: value.start,
-            end: value.end,
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for Span {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        RawSpan::deserialize(deserializer)?
-            .try_into()
-            .map_err(serde::de::Error::custom)
-    }
-}
-
-impl Serialize for Span {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        RawSpan::from(*self).serialize(serializer)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SpanError {
-    Reversed { start: u64, end: u64 },
-    Overflow { start: u64, len: u64 },
-}
-
-impl fmt::Display for SpanError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Reversed { start, end } => write!(f, "invalid span {start}..{end}"),
-            Self::Overflow { start, len } => {
-                write!(f, "span start {start} plus length {len} overflows u64")
-            }
-        }
-    }
-}
-
-impl Error for SpanError {}
+pub mod span;
+pub use span::{Span, SpanError};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -253,113 +169,12 @@ impl fmt::Display for SelectionError {
 
 impl Error for SelectionError {}
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Severity {
-    Info,
-    Warning,
-    Error,
-}
+pub mod diagnostic;
+pub use diagnostic::{BinasError, Diagnostic, ErrorCode, Severity};
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct Diagnostic {
-    pub code: String,
-    pub severity: Severity,
-    pub message: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub span: Option<Span>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node: Option<NodeId>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub context: BTreeMap<String, Value>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ErrorCode {
-    InvalidSyntax,
-    UnsupportedFeature,
-    EncryptedDocument,
-    InvalidPassword,
-    PermissionDenied,
-    ResourceLimit,
-    SelectionNotFound,
-    SelectionAmbiguous,
-    UnsafeRewrite,
-    SignaturePolicy,
-    VerificationFailed,
-    ExternalSigner,
-    Io,
-    Internal,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct BinasError {
-    pub code: ErrorCode,
-    pub message: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub diagnostics: Vec<Diagnostic>,
-}
-
-impl fmt::Display for BinasError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}: {}", self.code, self.message)
-    }
-}
-
-impl Error for BinasError {}
-
-#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(transparent)]
-pub struct PlanId(pub String);
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Invariant {
-    Reparse,
-    OldGone,
-    NewSelectable,
-    PageCountUnchanged,
-    NoFallback,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct EditPlan {
-    pub id: PlanId,
-    pub operation: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub invariants: Vec<Invariant>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub warnings: Vec<Diagnostic>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub metadata: BTreeMap<String, Value>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct InvariantCheck {
-    pub invariant: Invariant,
-    pub passed: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub diagnostic: Option<Diagnostic>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
-pub struct Verification {
-    pub passed: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub checks: Vec<InvariantCheck>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct Report {
-    pub operation: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub diagnostics: Vec<Diagnostic>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub metadata: BTreeMap<String, Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verification: Option<Verification>,
-}
+pub mod legacy;
+// Source-compatible transport aliases; new contracts live in transaction/verification.
+pub use legacy::{EditPlan, Invariant, InvariantCheck, PlanId, Report, Verification};
 
 #[cfg(test)]
 mod tests {

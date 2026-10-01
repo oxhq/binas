@@ -1,3 +1,7 @@
+pub(crate) mod checkbox;
+pub(crate) mod flatten;
+pub(crate) mod text;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
@@ -977,7 +981,7 @@ fn create_appearances(
             (b"BBox".to_vec(), number_array(&bbox)),
             (b"Resources".to_vec(), resources),
         ])),
-        stream: Some(stream),
+        stream: Some(stream.into()),
         stream_offset: 0,
         offset: 0,
     };
@@ -1602,7 +1606,7 @@ fn add_flattened_content(
         content,
         IndirectObject {
             value: Value::Dict(BTreeMap::new()),
-            stream: Some(commands),
+            stream: Some(commands.into()),
             stream_offset: 0,
             offset: 0,
         },

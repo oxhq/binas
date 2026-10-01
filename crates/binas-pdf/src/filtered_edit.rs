@@ -102,7 +102,7 @@ impl PdfDocument {
             .stream
             .as_deref()
             .ok_or_else(|| PdfError::unsafe_rewrite("selected object is not a stream"))?;
-        let mut budget = ParseBudget::default();
+        let mut budget = ParseBudget::for_document(self.parsed());
         let decoded = parser::decode_stream(
             &object.value,
             encoded_stream,
@@ -151,7 +151,7 @@ impl PdfDocument {
         let output = append_object_revision(self, reference, &object.value, Some(&compressed))?;
         let rewritten = reopen_for_verification(self, &output)?;
         let rewritten_object = rewritten.parsed().object(reference)?;
-        let mut verify_budget = ParseBudget::default();
+        let mut verify_budget = ParseBudget::for_document(rewritten.parsed());
         let verified_stream = parser::decode_stream(
             &rewritten_object.value,
             rewritten_object.stream.as_deref().ok_or_else(|| {
@@ -162,7 +162,7 @@ impl PdfDocument {
         )?;
         let prefix_preserved = output.starts_with(self.source());
         let page_count_unchanged = rewritten.page_count()? == old_pages;
-        let decoded_stream_verified = verified_stream == replacement_stream;
+        let decoded_stream_verified = &*verified_stream == replacement_stream.as_slice();
         let filter_metadata_preserved = [b"Filter".as_slice(), b"DecodeParms".as_slice()]
             .iter()
             .all(|key| dict_get(&object.value, key) == dict_get(&rewritten_object.value, key));

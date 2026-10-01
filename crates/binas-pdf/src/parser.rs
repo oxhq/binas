@@ -1,73 +1,34 @@
+use binas_core::{CancellationToken, ContextError, Source, Span};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
+    decode_cache::{DecodeKey, DecodeState, DecodedPayload},
     error::PdfError,
-    filters::{DecodeParams, PdfFilter, decode_filter_chain},
+    filters::{DecodeParams, PdfFilter, decode_filter_chain_with_context},
     limits::Limits,
+    payload::StreamPayload,
 };
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct ObjectRef {
-    pub number: u32,
-    pub generation: u16,
-}
+// Compatibility paths for existing crate-internal users while storage and
+// parsing responsibilities migrate independently.
+pub(crate) use crate::{
+    object::{IndirectObject, ObjectRef, Value},
+    store::{ObjectStore, ParsedDocument},
+};
 
 #[derive(Clone, Copy, Debug)]
-enum XrefEntry {
+pub(crate) enum XrefEntry {
     Free,
     InUse { offset: usize, generation: u16 },
     Compressed { stream: u32, index: usize },
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum Value {
-    Null,
-    Bool(bool),
-    Integer(i64),
-    Real(f64),
-    Name(Vec<u8>),
-    String(Vec<u8>),
-    Array(Vec<Value>),
-    Dict(BTreeMap<Vec<u8>, Value>),
-    Ref(ObjectRef),
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct IndirectObject {
-    pub value: Value,
-    pub stream: Option<Vec<u8>>,
-    pub stream_offset: usize,
-    pub offset: usize,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ParsedDocument {
-    pub version: String,
-    pub objects: BTreeMap<ObjectRef, IndirectObject>,
-    pub trailer: Value,
-    pub xref_revisions: usize,
-    pub limits: Limits,
-    xref_entries: BTreeMap<u32, XrefEntry>,
-    decoded_stream_bytes: usize,
-    compressed_finished: bool,
-}
-
-impl ParsedDocument {
-    pub fn object(&self, reference: ObjectRef) -> Result<&IndirectObject, PdfError> {
-        self.objects.get(&reference).ok_or_else(|| {
-            PdfError::syntax(
-                format!(
-                    "missing object {} {} R",
-                    reference.number, reference.generation
-                ),
-                0,
-            )
-        })
-    }
-}
-
-pub(crate) fn parse_document(input: &[u8], limits: &Limits) -> Result<ParsedDocument, PdfError> {
-    let mut parsed = parse_document_skeleton(input, limits)?;
+pub(crate) fn parse_document(
+    source: &Source,
+    limits: &Limits,
+    cancellation: CancellationToken,
+) -> Result<ParsedDocument, PdfError> {
+    let mut parsed = parse_document_skeleton(source, limits, cancellation)?;
     if dict_get(&parsed.trailer, b"Encrypt").is_some()
         && parsed
             .xref_entries
@@ -83,9 +44,12 @@ pub(crate) fn parse_document(input: &[u8], limits: &Limits) -> Result<ParsedDocu
 }
 
 pub(crate) fn parse_document_repair(
-    input: &[u8],
+    source: &Source,
     limits: &Limits,
+    cancellation: CancellationToken,
 ) -> Result<ParsedDocument, PdfError> {
+    let input = source.as_bytes();
+    checkpoint(&cancellation)?;
     if input.len() > limits.max_input_bytes {
         return Err(PdfError::limit("input exceeds max_input_bytes"));
     }
@@ -110,7 +74,12 @@ pub(crate) fn parse_document_repair(
     let mut entries = BTreeMap::new();
     let mut offset = 0usize;
     let mut candidates = 0usize;
+    let mut next_checkpoint = 0usize;
     while offset < trailer_offset {
+        if offset >= next_checkpoint {
+            checkpoint(&cancellation)?;
+            next_checkpoint = offset.saturating_add(4096);
+        }
         let boundary = offset == 0 || is_delimiter(input[offset - 1]);
         if boundary && input[offset].is_ascii_digit() {
             candidates = candidates
@@ -119,9 +88,20 @@ pub(crate) fn parse_document_repair(
             if candidates > limits.max_xref_entries || candidates > limits.max_container_items {
                 return Err(PdfError::limit("repair candidate count exceeds limit"));
             }
-            if let Ok((reference, object, end)) =
-                parse_indirect_with_end(input, offset, limits, true, None)
+            let candidate = parse_indirect_with_end(source, offset, limits, true, None);
+            if let Err(error) = &candidate
+                && matches!(
+                    error.code,
+                    crate::PdfErrorCode::ResourceLimit
+                        | crate::PdfErrorCode::Cancelled
+                        | crate::PdfErrorCode::Internal
+                )
             {
+                // Recovery may skip malformed syntax, but must not reinterpret
+                // exhausted resources or interrupted work as an absent object.
+                return Err(error.clone());
+            }
+            if let Ok((reference, object, end)) = candidate {
                 entries.insert(
                     reference.number,
                     XrefEntry::InUse {
@@ -145,22 +125,29 @@ pub(crate) fn parse_document_repair(
             0,
         ));
     }
+    checkpoint(&cancellation)?;
     Ok(ParsedDocument {
         version,
-        objects,
+        objects: objects.into(),
+        source_size: dict_integer(&trailer, b"Size").and_then(|size| usize::try_from(size).ok()),
         trailer,
         xref_revisions: 1,
         limits: limits.clone(),
-        xref_entries: entries,
+        xref_entries: entries.into(),
         decoded_stream_bytes: 0,
+        decode_state: DecodeState::new(limits),
+        decode_cancellation: cancellation,
         compressed_finished: true,
     })
 }
 
 pub(crate) fn parse_document_skeleton(
-    input: &[u8],
+    source: &Source,
     limits: &Limits,
+    cancellation: CancellationToken,
 ) -> Result<ParsedDocument, PdfError> {
+    let input = source.as_bytes();
+    checkpoint(&cancellation)?;
     if input.len() > limits.max_input_bytes {
         return Err(PdfError::limit("input exceeds max_input_bytes"));
     }
@@ -187,9 +174,10 @@ pub(crate) fn parse_document_skeleton(
     let mut revisions = 0usize;
     let mut total_entries = 0usize;
     let mut xref_offsets = BTreeSet::new();
-    let mut budget = ParseBudget::default();
+    let mut budget = ParseBudget::new(limits, cancellation);
 
     loop {
+        checkpoint(&budget.cancellation)?;
         if !xref_offsets.insert(xref_offset) {
             return Err(PdfError::syntax("cycle in xref /Prev chain", xref_offset));
         }
@@ -198,7 +186,7 @@ pub(crate) fn parse_document_skeleton(
             return Err(PdfError::limit("xref revision count exceeds limit"));
         }
         let (revision_entries, revision_trailer) =
-            parse_xref(input, xref_offset, limits, &mut budget)?;
+            parse_xref(source, xref_offset, limits, &mut budget)?;
         if dict_integer(&revision_trailer, b"XRefStm").is_some() {
             return Err(PdfError::unsupported(
                 "hybrid-reference /XRefStm files are not implemented",
@@ -232,6 +220,7 @@ pub(crate) fn parse_document_skeleton(
     }
     let mut objects = BTreeMap::new();
     for (number, entry) in &entries {
+        checkpoint(&budget.cancellation)?;
         let XrefEntry::InUse { offset, generation } = *entry else {
             continue;
         };
@@ -240,7 +229,7 @@ pub(crate) fn parse_document_skeleton(
             generation,
         };
         let (actual, object, _) =
-            parse_indirect_with_end(input, offset, limits, false, Some(&entries))?;
+            parse_indirect_with_end(source, offset, limits, false, Some(&entries))?;
         if actual != reference {
             return Err(PdfError::syntax(
                 "xref entry points to a different object",
@@ -250,14 +239,18 @@ pub(crate) fn parse_document_skeleton(
         objects.insert(reference, object);
     }
     let trailer = trailer.ok_or_else(|| PdfError::syntax("missing trailer", xref_offset))?;
+    checkpoint(&budget.cancellation)?;
     Ok(ParsedDocument {
         version,
-        objects,
+        objects: objects.into(),
+        source_size: dict_integer(&trailer, b"Size").and_then(|size| usize::try_from(size).ok()),
         trailer,
         xref_revisions: revisions,
         limits: limits.clone(),
-        xref_entries: entries,
+        xref_entries: entries.into(),
         decoded_stream_bytes: budget.decoded_bytes,
+        decode_state: budget.state,
+        decode_cancellation: budget.cancellation,
         compressed_finished: false,
     })
 }
@@ -268,6 +261,7 @@ pub(crate) fn finish_compressed_objects(parsed: &mut ParsedDocument) -> Result<(
     }
     let mut budget = ParseBudget {
         decoded_bytes: parsed.decoded_stream_bytes,
+        ..ParseBudget::for_document(parsed)
     };
     parse_compressed_objects(
         &parsed.xref_entries,
@@ -276,20 +270,24 @@ pub(crate) fn finish_compressed_objects(parsed: &mut ParsedDocument) -> Result<(
         &mut budget,
     )?;
     parsed.decoded_stream_bytes = budget.decoded_bytes;
+    // Initial compressed members are part of the parsed baseline, not edits.
+    // Decryption callers complete this stage before full canonical serialization.
+    parsed.objects.seal_base();
     parsed.compressed_finished = true;
     Ok(())
 }
 
 fn parse_xref(
-    input: &[u8],
+    source: &Source,
     offset: usize,
     limits: &Limits,
     budget: &mut ParseBudget,
 ) -> Result<(BTreeMap<u32, XrefEntry>, Value), PdfError> {
+    let input = source.as_bytes();
     let mut cursor = Cursor::at(input, offset, limits);
     cursor.skip_ws();
     if !cursor.consume_word(b"xref") {
-        return parse_xref_stream(input, offset, limits, budget);
+        return parse_xref_stream(source, offset, limits, budget);
     }
     let mut entries = BTreeMap::new();
     let mut walked_entries = 0usize;
@@ -353,12 +351,12 @@ fn parse_xref(
 }
 
 fn parse_xref_stream(
-    input: &[u8],
+    source: &Source,
     offset: usize,
     limits: &Limits,
     budget: &mut ParseBudget,
 ) -> Result<(BTreeMap<u32, XrefEntry>, Value), PdfError> {
-    let (_, object) = parse_indirect(input, offset, limits)?;
+    let (_, object) = parse_indirect(source, offset, limits)?;
     if dict_name(&object.value, b"Type") != Some(b"XRef".as_slice()) {
         return Err(PdfError::syntax(
             "startxref does not point to an xref table or stream",
@@ -469,7 +467,7 @@ fn parse_xref_stream(
                 1 => {
                     let object_offset = usize::try_from(second)
                         .map_err(|_| PdfError::limit("xref object offset exceeds usize"))?;
-                    if object_offset >= input.len() {
+                    if object_offset >= source.len() {
                         return Err(PdfError::syntax(
                             "xref object offset is out of bounds",
                             offset,
@@ -530,7 +528,7 @@ fn validate_xref_size(
 
 fn parse_compressed_objects(
     entries: &BTreeMap<u32, XrefEntry>,
-    objects: &mut BTreeMap<ObjectRef, IndirectObject>,
+    objects: &mut ObjectStore,
     limits: &Limits,
     budget: &mut ParseBudget,
 ) -> Result<(), PdfError> {
@@ -582,7 +580,10 @@ fn parse_compressed_objects(
         }
         let mut header = Cursor::at(&stream, 0, limits);
         let mut offsets = Vec::with_capacity(count);
-        for _ in 0..count {
+        for index in 0..count {
+            if index.is_multiple_of(1024) {
+                checkpoint(&budget.cancellation)?;
+            }
             let number = u32::try_from(header.unsigned()?)
                 .map_err(|_| PdfError::limit("compressed object number exceeds u32"))?;
             let relative = header.unsigned()?;
@@ -617,6 +618,7 @@ fn parse_compressed_objects(
             .checked_mul(2)
             .ok_or_else(|| PdfError::limit("object stream item count overflows"))?;
         for (number, index) in wanted {
+            checkpoint(&budget.cancellation)?;
             let (header_number, relative) = *offsets.get(index).ok_or_else(|| {
                 PdfError::syntax("compressed object index exceeds /N", object_stream_offset)
             })?;
@@ -670,21 +672,22 @@ fn read_be(bytes: &[u8]) -> Result<u64, PdfError> {
 }
 
 fn parse_indirect(
-    input: &[u8],
+    source: &Source,
     offset: usize,
     limits: &Limits,
 ) -> Result<(ObjectRef, IndirectObject), PdfError> {
-    let (reference, object, _) = parse_indirect_with_end(input, offset, limits, false, None)?;
+    let (reference, object, _) = parse_indirect_with_end(source, offset, limits, false, None)?;
     Ok((reference, object))
 }
 
 fn parse_indirect_with_end(
-    input: &[u8],
+    source: &Source,
     offset: usize,
     limits: &Limits,
     repair: bool,
     xref_entries: Option<&BTreeMap<u32, XrefEntry>>,
 ) -> Result<(ObjectRef, IndirectObject, usize), PdfError> {
+    let input = source.as_bytes();
     let mut cursor = Cursor::at(input, offset, limits);
     let number = u32::try_from(cursor.unsigned()?)
         .map_err(|_| PdfError::syntax("object number exceeds u32", offset))?;
@@ -711,7 +714,7 @@ fn parse_indirect_with_end(
                 .map_err(|_| PdfError::syntax("invalid stream length", cursor.pos))?,
             None => match (dict_get(&value, b"Length"), xref_entries) {
                 (Some(Value::Ref(reference)), Some(entries)) => {
-                    resolve_indirect_stream_length(input, *reference, offset, limits, entries)?
+                    resolve_indirect_stream_length(source, *reference, offset, limits, entries)?
                 }
                 _ if repair => repair_stream_length(input, cursor.pos, limits)?,
                 _ => {
@@ -728,11 +731,16 @@ fn parse_indirect_with_end(
             .pos
             .checked_add(length)
             .ok_or_else(|| PdfError::limit("stream range overflows"))?;
-        let bytes = input
+        input
             .get(cursor.pos..end)
             .ok_or_else(|| PdfError::syntax("stream range exceeds input", cursor.pos))?;
         stream_offset = cursor.pos;
-        stream = Some(bytes.to_vec());
+        let span = Span::new(cursor.pos as u64, end as u64)
+            .map_err(|_| PdfError::limit("stream range overflows"))?;
+        stream = Some(
+            StreamPayload::from_source(source, span)
+                .map_err(|_| PdfError::syntax("stream range exceeds input", cursor.pos))?,
+        );
         cursor.pos = end;
         cursor.skip_ws();
         cursor.keyword(b"endstream")?;
@@ -753,7 +761,7 @@ fn parse_indirect_with_end(
 }
 
 fn resolve_indirect_stream_length(
-    input: &[u8],
+    source: &Source,
     reference: ObjectRef,
     stream_offset: usize,
     limits: &Limits,
@@ -771,7 +779,7 @@ fn resolve_indirect_stream_length(
             stream_offset,
         ));
     }
-    let (actual, object) = parse_indirect(input, *offset, limits)?;
+    let (actual, object) = parse_indirect(source, *offset, limits)?;
     if actual != reference {
         return Err(PdfError::syntax(
             "stream /Length xref entry points to a different object",
@@ -1163,12 +1171,32 @@ fn dict_integer(value: &Value, key: &[u8]) -> Option<i64> {
     }
 }
 
-#[derive(Default)]
 pub(crate) struct ParseBudget {
     decoded_bytes: usize,
+    state: DecodeState,
+    cancellation: CancellationToken,
 }
 
 impl ParseBudget {
+    pub(crate) fn new(limits: &Limits, cancellation: CancellationToken) -> Self {
+        Self {
+            decoded_bytes: 0,
+            state: DecodeState::new(limits),
+            cancellation,
+        }
+    }
+
+    pub(crate) fn for_document(parsed: &ParsedDocument) -> Self {
+        Self {
+            decoded_bytes: 0,
+            state: parsed.decode_state.clone(),
+            cancellation: parsed.decode_cancellation.clone(),
+        }
+    }
+
+    pub(crate) fn charge_work(&self, bytes: usize) -> Result<(), PdfError> {
+        self.state.charge_work(bytes, &self.cancellation)
+    }
     fn remaining_decoded(&self, limits: &Limits) -> Result<usize, PdfError> {
         limits
             .max_total_decoded_bytes
@@ -1195,10 +1223,25 @@ pub(crate) fn decode_stream(
     input: &[u8],
     limits: &Limits,
     budget: &mut ParseBudget,
-) -> Result<Vec<u8>, PdfError> {
+) -> Result<DecodedPayload, PdfError> {
+    decode_stream_bounded(value, input, limits, budget, limits.max_stream_bytes)
+}
+
+pub(crate) fn decode_stream_bounded(
+    value: &Value,
+    input: &[u8],
+    limits: &Limits,
+    budget: &mut ParseBudget,
+    max_output: usize,
+) -> Result<DecodedPayload, PdfError> {
     if input.len() > limits.max_stream_bytes {
         return Err(PdfError::limit("encoded stream exceeds max_stream_bytes"));
     }
+    // Charge the encoded-byte fingerprint scan and one request unit even when
+    // malformed metadata prevents decoding. Cache hits still perform this scan.
+    budget
+        .state
+        .charge_work(input.len().saturating_add(1), &budget.cancellation)?;
     let filters = match dict_get(value, b"Filter") {
         None => Vec::new(),
         Some(Value::Name(name)) => vec![pdf_filter(name)],
@@ -1242,10 +1285,25 @@ pub(crate) fn decode_stream(
     };
     let output_limit = limits
         .max_stream_bytes
+        .min(max_output)
         .min(budget.remaining_decoded(limits)?);
-    let output = decode_filter_chain(input, &filters, &decode_params, output_limit)?;
+    let key = DecodeKey::new(input, &filters, &decode_params);
+    let output =
+        budget
+            .state
+            .decode(key, output_limit, &budget.cancellation, |context, limit| {
+                decode_filter_chain_with_context(input, &filters, &decode_params, limit, context)
+            })?;
     budget.charge_decoded(output.len(), limits)?;
     Ok(output)
+}
+
+fn checkpoint(cancellation: &CancellationToken) -> Result<(), PdfError> {
+    if cancellation.is_cancelled() {
+        Err(PdfError::from_context(ContextError::Cancelled))
+    } else {
+        Ok(())
+    }
 }
 
 fn pdf_filter(name: &[u8]) -> PdfFilter {
@@ -1261,27 +1319,42 @@ fn pdf_filter(name: &[u8]) -> PdfFilter {
 
 fn parse_decode_params(value: &Value) -> Result<DecodeParams, PdfError> {
     let mut params = DecodeParams::default();
-    if let Some(value) = dict_integer(value, b"Predictor") {
+    if let Some(value) = decode_param_integer(value, b"Predictor")? {
         params.predictor =
             u8::try_from(value).map_err(|_| PdfError::syntax("/Predictor exceeds u8", 0))?;
     }
-    if let Some(value) = dict_integer(value, b"Colors") {
+    if let Some(value) = decode_param_integer(value, b"Colors")? {
         params.colors = usize::try_from(value)
             .map_err(|_| PdfError::syntax("/Colors must be non-negative", 0))?;
     }
-    if let Some(value) = dict_integer(value, b"BitsPerComponent") {
+    if let Some(value) = decode_param_integer(value, b"BitsPerComponent")? {
         params.bits_per_component =
             u8::try_from(value).map_err(|_| PdfError::syntax("/BitsPerComponent exceeds u8", 0))?;
     }
-    if let Some(value) = dict_integer(value, b"Columns") {
+    if let Some(value) = decode_param_integer(value, b"Columns")? {
         params.columns = usize::try_from(value)
             .map_err(|_| PdfError::syntax("/Columns must be non-negative", 0))?;
     }
-    if let Some(value) = dict_integer(value, b"EarlyChange") {
+    if let Some(value) = decode_param_integer(value, b"EarlyChange")? {
         params.early_change =
             u8::try_from(value).map_err(|_| PdfError::syntax("/EarlyChange exceeds u8", 0))?;
     }
     Ok(params)
+}
+
+// Omitted/null dictionary entries take defaults. Other known parameter values
+// must be integers. Unknown keys remain outside implemented coverage.
+// PDF Reference 1.4 section 3.2.6: null dictionary values equal absent entries.
+// https://opensource.adobe.com/dc-acrobat-sdk-docs/pdfstandards/pdfreference1.4.pdf
+fn decode_param_integer(value: &Value, key: &[u8]) -> Result<Option<i64>, PdfError> {
+    match dict_get(value, key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Integer(value)) => Ok(Some(*value)),
+        Some(_) => Err(PdfError::syntax(
+            format!("/{} must be an integer", String::from_utf8_lossy(key)),
+            0,
+        )),
+    }
 }
 
 fn dict_get<'a>(value: &'a Value, key: &[u8]) -> Option<&'a Value> {
@@ -1359,5 +1432,80 @@ fn hex(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod retained_decode_tests {
+    use super::*;
+    use crate::{OpenOptions, PdfEngine, StreamObjectRef, read_decoded_stream_shared};
+
+    #[test]
+    fn staged_filter_and_payload_changes_cannot_reuse_stale_decoded_bytes() {
+        let objects: [&[u8]; 2] = [
+            b"<< /Type /Catalog >>",
+            b"<< /Length 3 >>\nstream\n41>\nendstream",
+        ];
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, body) in objects.iter().enumerate() {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+        for offset in offsets {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        let document = PdfEngine::default()
+            .open_owned(bytes, OpenOptions::default())
+            .unwrap();
+        let stream = StreamObjectRef {
+            object_number: 2,
+            object_generation: 0,
+        };
+        let original = read_decoded_stream_shared(&document, stream).unwrap();
+        assert_eq!(original.as_ref(), b"41>");
+        let reference = ObjectRef {
+            number: 2,
+            generation: 0,
+        };
+        let mut candidate = document.parsed().clone();
+        let Value::Dict(dictionary) = &mut candidate.objects.get_mut(&reference).unwrap().value
+        else {
+            unreachable!()
+        };
+        dictionary.insert(b"Filter".to_vec(), Value::Name(b"ASCIIHexDecode".to_vec()));
+        let filtered = document.with_parsed(candidate.clone());
+        assert_eq!(
+            read_decoded_stream_shared(&filtered, stream)
+                .unwrap()
+                .as_ref(),
+            b"A"
+        );
+        candidate.objects.get_mut(&reference).unwrap().stream = Some(b"42>".to_vec().into());
+        let replaced = document.with_parsed(candidate);
+        assert_eq!(
+            read_decoded_stream_shared(&replaced, stream)
+                .unwrap()
+                .as_ref(),
+            b"B"
+        );
+        assert_eq!(
+            read_decoded_stream_shared(&document, stream)
+                .unwrap()
+                .as_ptr(),
+            original.as_ptr()
+        );
+        assert_eq!(document.decode_metrics().misses, 3);
+        assert_eq!(document.decode_metrics().hits, 1);
+        // All branches spent one shared budget despite identical object numbers
+        // and source provenance; only exact decoder inputs may hit the cache.
+        assert_eq!(document.decode_metrics(), replaced.decode_metrics());
     }
 }

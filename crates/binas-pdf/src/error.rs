@@ -9,6 +9,7 @@ pub enum PdfErrorCode {
     InvalidSyntax,
     UnsupportedFeature,
     ResourceLimit,
+    Cancelled,
     SelectionNotFound,
     UnsafeRewrite,
     VerificationFailed,
@@ -26,6 +27,17 @@ pub struct PdfError {
 }
 
 impl PdfError {
+    pub(crate) fn from_context(error: binas_core::ContextError) -> Self {
+        Self {
+            code: match &error {
+                binas_core::ContextError::Cancelled => PdfErrorCode::Cancelled,
+                binas_core::ContextError::Budget(_) => PdfErrorCode::ResourceLimit,
+            },
+            message: error.to_string(),
+            span: None,
+            object: None,
+        }
+    }
     pub(crate) fn syntax(message: impl Into<String>, offset: usize) -> Self {
         Self {
             code: PdfErrorCode::InvalidSyntax,
@@ -93,6 +105,7 @@ impl PdfErrorCode {
             Self::InvalidSyntax => "invalid_syntax",
             Self::UnsupportedFeature => "unsupported_feature",
             Self::ResourceLimit => "resource_limit",
+            Self::Cancelled => "cancelled",
             Self::SelectionNotFound => "selection_not_found",
             Self::UnsafeRewrite => "unsafe_rewrite",
             Self::VerificationFailed => "verification_failed",

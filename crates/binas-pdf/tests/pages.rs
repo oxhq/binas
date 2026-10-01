@@ -1,4 +1,258 @@
-use binas_pdf::{OpenOptions, PageTransform, PdfEngine, PdfErrorCode, list_annotations};
+use binas_pdf::{
+    DocumentEntryLocation, OmittedDocumentEntry, OpenOptions, PageAssemblyPolicy, PageTransform,
+    PdfEngine, PdfErrorCode, list_annotations,
+};
+
+// Generated Binas fixtures: each structure is reachable only through the catalog.
+// These isolate assembly loss; they are not third-party compatibility evidence.
+fn catalog_structure_pdf(key: &str) -> Vec<u8> {
+    let structure = match key {
+        "Metadata" => {
+            stream(b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">catalog-only-marker</x:xmpmeta>")
+        }
+        "Outlines" => b"<< /Type /Outlines /First 6 0 R /Last 6 0 R /Count 1 >>".to_vec(),
+        "Names" => b"<< /Dests << /Names [(catalog-only-marker) [3 0 R /Fit]] >> >>".to_vec(),
+        "PageLabels" => b"<< /Nums [0 << /P (catalog-only-marker) /S /D >>] >>".to_vec(),
+        "StructTreeRoot" => b"<< /Type /StructTreeRoot /K [] /ID (catalog-only-marker) >>".to_vec(),
+        "AcroForm" => b"<< /Fields [6 0 R] >>".to_vec(),
+        _ => b"<< /PrivateData (catalog-only-marker) >>".to_vec(),
+    };
+    let child = if key == "AcroForm" {
+        b"<< /FT /Tx /T (catalog-only-marker) /V (retained-value) >>".to_vec()
+    } else {
+        b"<< /Title (catalog-only-marker) /Parent 5 0 R /Dest [3 0 R /Fit] >>".to_vec()
+    };
+    classic(
+        &[
+            format!("<< /Type /Catalog /Pages 2 0 R /{key} 5 0 R >>").into_bytes(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R >>".to_vec(),
+            stream(b"q Q"),
+            structure,
+            child,
+        ],
+        "",
+    )
+}
+
+#[test]
+fn assembly_refuses_each_unpreserved_catalog_family_on_every_entrypoint() {
+    let plain = open(&pdf("A", "B"));
+    for key in [
+        "Metadata",
+        "Outlines",
+        "Names",
+        "PageLabels",
+        "StructTreeRoot",
+        "AcroForm",
+        "VendorExtension",
+    ] {
+        let document = open(&catalog_structure_pdf(key));
+        for result in [
+            document.copy_pages(&[0]),
+            document.extract_pages(&[0]),
+            document.merge_pages(&[&plain]),
+            document.insert_pages(0, &plain, &[0]),
+            plain.merge_pages(&[&document]),
+            plain.insert_pages(0, &document, &[0]),
+        ] {
+            let error = result.unwrap_err();
+            assert_eq!(error.code, PdfErrorCode::UnsupportedFeature, "{key}");
+            assert!(error.message.contains(key), "{error:?}");
+        }
+    }
+}
+
+#[test]
+fn explicit_catalog_omissions_report_exact_input_location_and_key() {
+    let plain = open(&pdf("A", "B"));
+    for key in [
+        "Metadata",
+        "Outlines",
+        "Names",
+        "PageLabels",
+        "StructTreeRoot",
+        "AcroForm",
+        "VendorExtension",
+    ] {
+        let input = catalog_structure_pdf(key);
+        let original = input.clone();
+        let document = open(&input);
+        document.inspect().unwrap();
+        let policy = PageAssemblyPolicy {
+            remove_catalog_entries: vec![key.as_bytes().to_vec()],
+            ..Default::default()
+        };
+        for (input_index, outcome) in [
+            (0, document.copy_pages_with_policy(&[0], &policy).unwrap()),
+            (
+                0,
+                document.extract_pages_with_policy(&[0], &policy).unwrap(),
+            ),
+            (
+                1,
+                plain
+                    .merge_pages_with_policy(&[&document], &policy)
+                    .unwrap(),
+            ),
+            (
+                1,
+                plain
+                    .insert_pages_with_policy(0, &document, &[0], &policy)
+                    .unwrap(),
+            ),
+        ] {
+            assert_eq!(
+                outcome.report.omitted_document_entries,
+                vec![OmittedDocumentEntry {
+                    input_index,
+                    location: DocumentEntryLocation::Catalog,
+                    key: key.as_bytes().to_vec(),
+                }]
+            );
+            assert!(
+                !outcome
+                    .bytes
+                    .windows(b"catalog-only-marker".len())
+                    .any(|window| window == b"catalog-only-marker"),
+                "{key}"
+            );
+            open(&outcome.bytes).validate().unwrap();
+        }
+        assert_eq!(input, original);
+        assert_eq!(document.source_len(), original.len());
+        // Neither observation nor a successful candidate changes the source document.
+        assert_eq!(
+            document.copy_pages(&[0]).unwrap_err().code,
+            PdfErrorCode::UnsupportedFeature
+        );
+    }
+}
+
+#[test]
+fn assembly_checks_unselected_inputs_and_empty_requests_before_omission() {
+    let protected = open(&catalog_structure_pdf("Metadata"));
+    let plain = open(&pdf("A", "B"));
+    let empty = open(&classic(
+        &[
+            b"<< /Type /Catalog /Pages 2 0 R /Metadata 3 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [] /Count 0 >>".to_vec(),
+            stream(b"catalog-only-marker"),
+        ],
+        "",
+    ));
+    for result in [
+        protected.copy_pages(&[]),
+        protected.extract_pages(&[]),
+        protected.merge_pages(&[]),
+        plain.insert_pages(0, &protected, &[]),
+        plain.merge_pages(&[&empty]),
+    ] {
+        assert_eq!(result.unwrap_err().code, PdfErrorCode::UnsupportedFeature);
+    }
+    let policy = PageAssemblyPolicy {
+        remove_catalog_entries: vec![b"Metadata".to_vec()],
+        ..Default::default()
+    };
+    let outcome = plain
+        .merge_pages_with_policy(&[&empty, &protected], &policy)
+        .unwrap();
+    assert_eq!(
+        outcome
+            .report
+            .omitted_document_entries
+            .iter()
+            .map(|entry| entry.input_index)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+}
+
+#[test]
+fn catalog_permission_does_not_authorize_trailer_or_other_catalog_entries() {
+    let input = classic(
+        &[
+            b"<< /Type /Catalog /Pages 2 0 R /Metadata 4 0 R /VendorExtension 5 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>".to_vec(),
+            stream(b"catalog-only-marker"),
+            b"<< /PrivateData (private) >>".to_vec(),
+            b"<< /Title (document-title) >>".to_vec(),
+        ],
+        " /Info 6 0 R",
+    );
+    let document = open(&input);
+    let mut policy = PageAssemblyPolicy {
+        remove_catalog_entries: vec![b"Metadata".to_vec(), b"Info".to_vec()],
+        ..Default::default()
+    };
+    assert_eq!(
+        document
+            .copy_pages_with_policy(&[0], &policy)
+            .unwrap_err()
+            .code,
+        PdfErrorCode::UnsupportedFeature
+    );
+    policy
+        .remove_catalog_entries
+        .push(b"VendorExtension".to_vec());
+    let error = document.copy_pages_with_policy(&[0], &policy).unwrap_err();
+    assert_eq!(error.code, PdfErrorCode::UnsupportedFeature);
+    assert!(error.message.contains("Info"));
+    policy.remove_trailer_entries.push(b"Info".to_vec());
+    let outcome = document.copy_pages_with_policy(&[0], &policy).unwrap();
+    assert!(
+        outcome
+            .report
+            .omitted_document_entries
+            .contains(&OmittedDocumentEntry {
+                input_index: 0,
+                location: DocumentEntryLocation::Trailer,
+                key: b"Info".to_vec()
+            })
+    );
+    assert!(!String::from_utf8_lossy(&outcome.bytes).contains("document-title"));
+}
+
+#[test]
+fn classic_trailer_entries_need_exact_explicit_removal() {
+    for (key, value) in [
+        ("Info", "<< /Title (trailer-only-marker) >>"),
+        ("ID", "[<01234567> <89ABCDEF>]"),
+        ("VendorExtension", "(trailer-only-marker)"),
+        ("W", "[1 2 1]"),
+        ("Filter", "/FlateDecode"),
+        ("Type", "/VendorTrailer"),
+    ] {
+        let document = open(&classic(
+            &[
+                b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>".to_vec(),
+            ],
+            &format!(" /{key} {value}"),
+        ));
+        assert_eq!(
+            document.copy_pages(&[0]).unwrap_err().code,
+            PdfErrorCode::UnsupportedFeature,
+            "{key}"
+        );
+        let policy = PageAssemblyPolicy {
+            remove_trailer_entries: vec![key.as_bytes().to_vec()],
+            ..Default::default()
+        };
+        let outcome = document.copy_pages_with_policy(&[0], &policy).unwrap();
+        assert_eq!(
+            outcome.report.omitted_document_entries,
+            vec![OmittedDocumentEntry {
+                input_index: 0,
+                location: DocumentEntryLocation::Trailer,
+                key: key.as_bytes().to_vec(),
+            }]
+        );
+        assert!(!String::from_utf8_lossy(&outcome.bytes).contains("trailer-only-marker"));
+    }
+}
 
 fn pdf(first: &str, second: &str) -> Vec<u8> {
     let first_content = format!("BT /F1 12 Tf ({first}) Tj ET");
@@ -147,8 +401,23 @@ fn extracts_duplicates_with_transitive_resources_and_deterministic_order() {
     let b = reopened.query_text_all("B").unwrap();
     assert_eq!(a.len(), 1);
     assert_eq!(b.len(), 2);
-    assert!(b[0].object_number < a[0].object_number);
-    assert!(a[0].object_number < b[1].object_number);
+    assert_ne!(b[0].object_number, a[0].object_number);
+    assert_eq!(b[0].object_number, b[1].object_number);
+    assert_eq!(b[0].generation, b[1].generation);
+    assert_eq!(
+        reopened
+            .extract_text_spans()
+            .unwrap()
+            .spans
+            .into_iter()
+            .map(|span| (span.page_index, span.text))
+            .collect::<Vec<_>>(),
+        [(0, "B".into()), (1, "A".into()), (2, "B".into())]
+    );
+    assert_eq!(
+        output.bytes,
+        document.extract_pages(&[1, 0, 1]).unwrap().bytes
+    );
 }
 
 #[test]
@@ -399,4 +668,17 @@ fn rejects_unsafe_transform_and_security_boundaries() {
         encrypted.extract_pages(&[0]).unwrap_err().code,
         PdfErrorCode::UnsafeRewrite
     );
+    let policy = PageAssemblyPolicy {
+        remove_catalog_entries: vec![b"AcroForm".to_vec(), b"Perms".to_vec()],
+        remove_trailer_entries: vec![b"Encrypt".to_vec()],
+    };
+    for document in [&signed, &encrypted] {
+        assert_eq!(
+            document
+                .extract_pages_with_policy(&[0], &policy)
+                .unwrap_err()
+                .code,
+            PdfErrorCode::UnsafeRewrite
+        );
+    }
 }

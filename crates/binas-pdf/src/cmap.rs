@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::{error::PdfError, limits::Limits};
+use crate::{error::PdfError, limits::Limits, parser::ParseBudget};
 
 #[derive(Clone, Debug)]
 struct CodeSpaceRange {
@@ -16,10 +16,23 @@ pub struct ToUnicodeCMap {
 
 impl ToUnicodeCMap {
     pub fn parse(input: &[u8], limits: &Limits) -> Result<Self, PdfError> {
+        let budget = ParseBudget::new(limits, binas_core::CancellationToken::new());
+        Self::parse_with_budget(input, limits, &budget)
+    }
+
+    /// Logical expanded UTF-8 mapping bytes are capped by max_total_decoded_bytes;
+    /// each destination is capped by max_token_bytes. Allocator overhead is excluded.
+    pub(crate) fn parse_with_budget(
+        input: &[u8],
+        limits: &Limits,
+        budget: &ParseBudget,
+    ) -> Result<Self, PdfError> {
         if input.len() > limits.max_input_bytes {
             return Err(PdfError::limit("CMap input exceeds max_input_bytes"));
         }
-        let tokens = Lexer::new(input, limits).all()?;
+        budget.charge_work(input.len().saturating_add(1))?;
+        let tokens = Lexer::new(input, limits, budget).all()?;
+        let mut mapping_bytes = 0usize;
         let mut cmap = Self {
             codespaces: Vec::new(),
             mappings: BTreeMap::new(),
@@ -27,6 +40,7 @@ impl ToUnicodeCMap {
         let mut index = 0;
 
         while index < tokens.len() {
+            budget.charge_work(1)?;
             let TokenKind::Word(operator) = &tokens[index].kind else {
                 index += 1;
                 continue;
@@ -58,6 +72,7 @@ impl ToUnicodeCMap {
                     for _ in 0..count {
                         let start = hex_at(&tokens, index, "codespace start")?.to_vec();
                         let end_value = hex_at(&tokens, index + 1, "codespace end")?.to_vec();
+                        budget.charge_work(cmap.codespaces.len().saturating_add(1))?;
                         cmap.add_codespace(start, end_value, tokens[index].offset)?;
                         index += 2;
                     }
@@ -68,6 +83,9 @@ impl ToUnicodeCMap {
                         let destination = decode_utf16be(
                             string_at(&tokens, index + 1, "bfchar destination")?,
                             tokens[index + 1].offset,
+                            limits,
+                            budget,
+                            &mut mapping_bytes,
                         )?;
                         cmap.add_mapping(source, destination, tokens[index].offset, limits)?;
                         index += 2;
@@ -81,11 +99,12 @@ impl ToUnicodeCMap {
                             PdfError::syntax("missing bfrange destination", input.len())
                         })?;
                         cmap.add_range(
-                            &start,
-                            &end_value,
+                            (&start, &end_value),
                             destination,
                             tokens[index].offset,
                             limits,
+                            budget,
+                            &mut mapping_bytes,
                         )?;
                         index += 3;
                     }
@@ -105,6 +124,7 @@ impl ToUnicodeCMap {
         }
 
         for source in cmap.mappings.keys() {
+            budget.charge_work(cmap.codespaces.len().saturating_add(1))?;
             if !cmap.in_codespace(source) {
                 return Err(PdfError::syntax(
                     "CMap source mapping is outside declared codespace ranges",
@@ -113,6 +133,10 @@ impl ToUnicodeCMap {
             }
         }
         Ok(cmap)
+    }
+
+    pub(crate) fn lookup_counts(&self) -> (usize, usize) {
+        (self.codespaces.len(), self.mappings.len())
     }
 
     pub fn mapping(&self, source: &[u8]) -> Option<&str> {
@@ -179,12 +203,14 @@ impl ToUnicodeCMap {
 
     fn add_range(
         &mut self,
-        start: &[u8],
-        end: &[u8],
+        source_range: (&[u8], &[u8]),
         destination: &Token,
         offset: usize,
         limits: &Limits,
+        budget: &ParseBudget,
+        mapping_bytes: &mut usize,
     ) -> Result<(), PdfError> {
+        let (start, end) = source_range;
         validate_source_range(start, end, offset)?;
         let first = bytes_to_u32(start);
         let last = bytes_to_u32(end);
@@ -203,6 +229,7 @@ impl ToUnicodeCMap {
             TokenKind::Hex(initial) | TokenKind::Literal(initial) => {
                 let mut value = initial.clone();
                 for delta in 0..count {
+                    budget.charge_work(value.len().saturating_add(1))?;
                     if delta != 0 && !increment_be(&mut value) {
                         return Err(PdfError::syntax(
                             "CMap sequential destination range overflows",
@@ -210,7 +237,8 @@ impl ToUnicodeCMap {
                         ));
                     }
                     let source = range_source(first, delta, start.len())?;
-                    let decoded = decode_utf16be(&value, destination.offset)?;
+                    let decoded =
+                        decode_utf16be(&value, destination.offset, limits, budget, mapping_bytes)?;
                     self.add_mapping(source, decoded, offset, limits)?;
                 }
             }
@@ -222,6 +250,7 @@ impl ToUnicodeCMap {
                     ));
                 }
                 for (delta, value) in values.iter().enumerate() {
+                    budget.charge_work(1)?;
                     let encoded = match &value.kind {
                         TokenKind::Hex(encoded) | TokenKind::Literal(encoded) => encoded,
                         _ => {
@@ -232,7 +261,8 @@ impl ToUnicodeCMap {
                         }
                     };
                     let source = range_source(first, delta, start.len())?;
-                    let decoded = decode_utf16be(encoded, value.offset)?;
+                    let decoded =
+                        decode_utf16be(encoded, value.offset, limits, budget, mapping_bytes)?;
                     self.add_mapping(source, decoded, offset, limits)?;
                 }
             }
@@ -272,20 +302,46 @@ fn validate_source_range(start: &[u8], end: &[u8], offset: usize) -> Result<(), 
     Ok(())
 }
 
-fn decode_utf16be(input: &[u8], offset: usize) -> Result<String, PdfError> {
+fn decode_utf16be(
+    input: &[u8],
+    offset: usize,
+    limits: &Limits,
+    budget: &ParseBudget,
+    mapping_bytes: &mut usize,
+) -> Result<String, PdfError> {
     if input.is_empty() || !input.len().is_multiple_of(2) {
         return Err(PdfError::syntax(
             "CMap destination is not valid UTF-16BE",
             offset,
         ));
     }
-    char::decode_utf16(
+    let mut output = String::new();
+    for decoded in char::decode_utf16(
         input
             .chunks_exact(2)
             .map(|pair| u16::from_be_bytes([pair[0], pair[1]])),
-    )
-    .collect::<Result<String, _>>()
-    .map_err(|_| PdfError::syntax("CMap destination has an unpaired UTF-16 surrogate", offset))
+    ) {
+        let character = decoded.map_err(|_| {
+            PdfError::syntax("CMap destination has an unpaired UTF-16 surrogate", offset)
+        })?;
+        let width = character.len_utf8();
+        budget.charge_work(width + 1)?;
+        let destination_bytes = output
+            .len()
+            .checked_add(width)
+            .ok_or_else(|| PdfError::limit("CMap destination size overflows"))?;
+        let total = mapping_bytes
+            .checked_add(width)
+            .ok_or_else(|| PdfError::limit("CMap mapping bytes overflow"))?;
+        if destination_bytes > limits.max_token_bytes || total > limits.max_total_decoded_bytes {
+            return Err(PdfError::limit(
+                "CMap expanded Unicode exceeds token or aggregate decoded byte limit",
+            ));
+        }
+        *mapping_bytes = total;
+        output.push(character);
+    }
+    Ok(output)
 }
 
 fn bytes_to_u32(value: &[u8]) -> u32 {
@@ -401,15 +457,17 @@ struct Lexer<'a> {
     limits: &'a Limits,
     pos: usize,
     tokens: usize,
+    budget: &'a ParseBudget,
 }
 
 impl<'a> Lexer<'a> {
-    fn new(input: &'a [u8], limits: &'a Limits) -> Self {
+    fn new(input: &'a [u8], limits: &'a Limits, budget: &'a ParseBudget) -> Self {
         Self {
             input,
             limits,
             pos: 0,
             tokens: 0,
+            budget,
         }
     }
 
@@ -422,7 +480,8 @@ impl<'a> Lexer<'a> {
     }
 
     fn next(&mut self, depth: usize) -> Result<Option<Token>, PdfError> {
-        self.skip_ws_and_comments();
+        self.budget.charge_work(1)?;
+        self.skip_ws_and_comments()?;
         if self.pos == self.input.len() {
             return Ok(None);
         }
@@ -454,19 +513,21 @@ impl<'a> Lexer<'a> {
         Ok(Some(Token { kind, offset }))
     }
 
-    fn skip_ws_and_comments(&mut self) {
+    fn skip_ws_and_comments(&mut self) -> Result<(), PdfError> {
         loop {
             while self.input.get(self.pos).is_some_and(|byte| is_ws(*byte)) {
+                self.budget.charge_work(1)?;
                 self.pos += 1;
             }
             if self.input.get(self.pos) != Some(&b'%') {
-                return;
+                return Ok(());
             }
             while self
                 .input
                 .get(self.pos)
                 .is_some_and(|byte| !matches!(*byte, b'\r' | b'\n'))
             {
+                self.budget.charge_work(1)?;
                 self.pos += 1;
             }
         }
@@ -480,6 +541,7 @@ impl<'a> Lexer<'a> {
             while self.input.get(self.pos).is_some_and(|byte| {
                 !is_ws(*byte) && !matches!(*byte, b'<' | b'[' | b']' | b'(' | b'%')
             }) {
+                self.budget.charge_work(1)?;
                 self.pos += 1;
             }
         }
@@ -497,6 +559,7 @@ impl<'a> Lexer<'a> {
         self.pos += 1;
         let mut digits = Vec::new();
         loop {
+            self.budget.charge_work(1)?;
             let byte = *self
                 .input
                 .get(self.pos)
@@ -525,6 +588,7 @@ impl<'a> Lexer<'a> {
         digits
             .chunks_exact(2)
             .map(|pair| {
+                self.budget.charge_work(1)?;
                 let high = hex_value(pair[0]);
                 let low = hex_value(pair[1]);
                 Ok((high << 4) | low)
@@ -539,7 +603,7 @@ impl<'a> Lexer<'a> {
         self.pos += 1;
         let mut values = Vec::new();
         loop {
-            self.skip_ws_and_comments();
+            self.skip_ws_and_comments()?;
             if self.input.get(self.pos) == Some(&b']') {
                 self.pos += 1;
                 return Ok(values);
@@ -563,6 +627,7 @@ impl<'a> Lexer<'a> {
         let mut output = Vec::new();
         let mut literal_depth = 1usize;
         while let Some(&byte) = self.input.get(self.pos) {
+            self.budget.charge_work(1)?;
             self.pos += 1;
             match byte {
                 b'\\' => {
@@ -735,5 +800,93 @@ mod tests {
         };
         let error = ToUnicodeCMap::parse(b"[[<0041>]]", &limits).unwrap_err();
         assert_eq!(error.code, PdfErrorCode::ResourceLimit);
+    }
+
+    #[test]
+    fn caps_expanded_mapping_bytes_before_range_growth() {
+        let input = b"1 begincodespacerange <00> <ff> endcodespacerange 1 beginbfrange <00> <31> <0041004100410041> endbfrange";
+        let limits = Limits {
+            max_total_decoded_bytes: 199,
+            ..Limits::default()
+        };
+        assert_eq!(
+            ToUnicodeCMap::parse(input, &limits).unwrap_err().code,
+            PdfErrorCode::ResourceLimit
+        );
+        let limits = Limits {
+            max_total_decoded_bytes: 200,
+            ..limits
+        };
+        let cmap = ToUnicodeCMap::parse(input, &limits).unwrap();
+        assert_eq!(cmap.lookup_counts(), (1, 50));
+        assert_eq!(cmap.mapping(&[0x31]), Some("AAAr"));
+    }
+
+    #[test]
+    fn caps_destination_utf8_even_when_encoded_string_fits() {
+        let input = format!(
+            "1 begincodespacerange <00> <ff> endcodespacerange 1 beginbfchar <01> <{}> endbfchar",
+            "0800".repeat(20)
+        );
+        let limits = Limits {
+            max_token_bytes: 48,
+            ..Limits::default()
+        };
+        assert_eq!(
+            ToUnicodeCMap::parse(input.as_bytes(), &limits)
+                .unwrap_err()
+                .code,
+            PdfErrorCode::ResourceLimit
+        );
+        let limits = Limits {
+            max_token_bytes: 60,
+            ..limits
+        };
+        assert_eq!(
+            ToUnicodeCMap::parse(input.as_bytes(), &limits)
+                .unwrap()
+                .mapping(&[1])
+                .unwrap()
+                .len(),
+            60
+        );
+    }
+
+    #[test]
+    fn shared_budget_charges_expansion_retries_and_cancellation() {
+        let input = b"1 begincodespacerange <00> <ff> endcodespacerange 1 beginbfrange <00> <31> <0041004100410041> endbfrange";
+        let limits = Limits {
+            max_decode_work_bytes: input.len() * 2 + 100,
+            ..Limits::default()
+        };
+        // The compact lexical input fits, but expanding its mappings consumes
+        // additional retained work and fails before all fifty mappings exist.
+        assert_eq!(
+            ToUnicodeCMap::parse(input, &limits).unwrap_err().code,
+            PdfErrorCode::ResourceLimit
+        );
+        let limits = Limits {
+            max_decode_work_bytes: 4096,
+            ..Limits::default()
+        };
+        let token = binas_core::CancellationToken::new();
+        let budget = ParseBudget::new(&limits, token.clone());
+        ToUnicodeCMap::parse_with_budget(input, &limits, &budget).unwrap();
+        let mut exhausted = false;
+        for _ in 0..10 {
+            if let Err(error) = ToUnicodeCMap::parse_with_budget(input, &limits, &budget) {
+                assert_eq!(error.code, PdfErrorCode::ResourceLimit);
+                exhausted = true;
+                break;
+            }
+        }
+        assert!(exhausted);
+        token.cancel();
+        assert_eq!(
+            ToUnicodeCMap::parse_with_budget(input, &limits, &budget)
+                .unwrap_err()
+                .code,
+            PdfErrorCode::Cancelled
+        );
     }
 }

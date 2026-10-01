@@ -36,15 +36,54 @@ fn extracts_page_font_operator_and_best_known_geometry() {
 }
 
 #[test]
-fn preserves_supported_spans_and_reports_unsupported_streams() {
+fn unknown_earlier_contents_state_prevents_interpreting_later_parts() {
     let input = include_bytes!("fixtures/pdf/p2-unsupported-nonimage-filter-text.pdf");
     let document = PdfEngine::default()
         .open(input, OpenOptions::default())
         .unwrap();
     let extraction = document.extract_text_spans().unwrap();
-    assert_eq!(extraction.spans.len(), 1);
-    assert_eq!(extraction.spans[0].text, "SUPPORTED-P2");
+    // /Contents [4 0 R 5 0 R] is one logical sequence. The unsupported
+    // /FooDecode part can change fonts, matrices or lexical operand state;
+    // the later raw stream cannot be interpreted with invented defaults.
+    assert!(extraction.spans.is_empty());
     assert_eq!(extraction.warnings.len(), 1);
+}
+
+#[test]
+fn unsupported_form_does_not_poison_caller_font_or_graphics_state() {
+    for (entries, content) in [
+        (" /Filter /FooDecode", b"opaque".as_slice()),
+        ("", b"/GS1 gs".as_slice()),
+    ] {
+        let input=classic(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 6 0 R >> /XObject << /Unknown 5 0 R >> >> >>".to_vec(),
+            stream("",b"2 0 0 2 10 20 cm BT /F1 12 Tf 1 0 0 1 30 40 Tm (before) Tj ET /Unknown Do BT 1 0 0 1 50 60 Tm (after) Tj ET"),
+            stream(&format!(" /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Matrix [3 0 0 3 99 88] /Resources << >>{entries}"),content),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        ]);
+        let extraction = PdfEngine::default()
+            .open(&input, OpenOptions::default())
+            .unwrap()
+            .extract_text_spans()
+            .unwrap();
+        assert_eq!(extraction.warnings.len(), 1);
+        assert_eq!(
+            extraction
+                .spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<Vec<_>>(),
+            ["before", "after"]
+        );
+        let after = &extraction.spans[1];
+        assert_eq!(after.object_number, 4);
+        assert_eq!(after.font_name.as_deref(), Some("F1"));
+        assert_eq!(after.geometry.font_size, Some(12.));
+        assert_eq!(after.geometry.user_matrix, [2., 0., 0., 2., 10., 20.]);
+        assert_eq!(after.geometry.origin, Some([110., 140.]));
+    }
 }
 
 #[test]

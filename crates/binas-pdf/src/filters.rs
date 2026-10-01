@@ -1,9 +1,10 @@
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     io::{self, Read, Write},
 };
 
-use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
+use flate2::{Compress, Compression, FlushCompress, Status, read::ZlibDecoder, write::ZlibEncoder};
 
 use crate::{PdfError, limits::Limits, parser::Value};
 
@@ -44,6 +45,81 @@ pub fn decode_filter_chain(
     decode_params: &[Option<DecodeParams>],
     max_output: usize,
 ) -> Result<Vec<u8>, PdfError> {
+    decode_filter_chain_work(input, filters, decode_params, max_output, &DecodeWork(None))
+}
+
+/// Work units include an attempt, filter input reads, materialized decoded and
+/// dictionary payload bytes/initialized slots, and predictor reads/writes.
+/// Packed predictor samples round each accessed sample up to whole bytes.
+/// Flate additionally prepays its
+/// bounded output buffer offers (including unused capacity) and input read-ahead.
+/// These conservative charges are cumulative even when decoding fails; they are
+/// not a measurement of live memory or CPU instructions.
+pub(crate) fn decode_filter_chain_with_context(
+    input: &[u8],
+    filters: &[PdfFilter],
+    decode_params: &[Option<DecodeParams>],
+    max_output: usize,
+    context: &binas_core::OperationContext,
+) -> Result<Vec<u8>, PdfError> {
+    decode_filter_chain_work(
+        input,
+        filters,
+        decode_params,
+        max_output,
+        &DecodeWork(Some(context)),
+    )
+}
+
+struct DecodeWork<'a>(Option<&'a binas_core::OperationContext>);
+
+impl DecodeWork<'_> {
+    fn charge(&self, units: usize) -> Result<(), PdfError> {
+        if let Some(context) = self.0 {
+            context
+                .charge_work(
+                    u64::try_from(units)
+                        .map_err(|_| PdfError::limit("decode work overflows u64"))?,
+                )
+                .map_err(PdfError::from_context)?;
+        }
+        Ok(())
+    }
+
+    fn push(&self, output: &mut Vec<u8>, byte: u8, limit: usize) -> Result<(), PdfError> {
+        self.charge(1)?;
+        push_bounded(output, byte, limit)
+    }
+
+    fn extend(&self, output: &mut Vec<u8>, bytes: &[u8], limit: usize) -> Result<(), PdfError> {
+        for chunk in bytes.chunks(8192) {
+            self.charge(chunk.len())?;
+            extend_bounded(output, chunk, limit)?;
+        }
+        Ok(())
+    }
+
+    fn copy(&self, input: &[u8], limit: usize) -> Result<Vec<u8>, PdfError> {
+        if input.len() > limit {
+            return Err(PdfError::limit("decoded stream exceeds output limit"));
+        }
+        let mut output = Vec::new();
+        for chunk in input.chunks(8192) {
+            self.charge(chunk.len())?; // read, independently from the destination copy
+            self.extend(&mut output, chunk, limit)?;
+        }
+        Ok(output)
+    }
+}
+
+fn decode_filter_chain_work(
+    input: &[u8],
+    filters: &[PdfFilter],
+    decode_params: &[Option<DecodeParams>],
+    max_output: usize,
+    work: &DecodeWork<'_>,
+) -> Result<Vec<u8>, PdfError> {
+    work.charge(1)?;
     if filters.len() != decode_params.len() {
         return Err(PdfError::syntax(
             "Filter and DecodeParms arrays must have equal lengths",
@@ -52,30 +128,37 @@ pub fn decode_filter_chain(
     }
 
     if filters.is_empty() {
-        return bounded_copy(input, max_output);
+        return work.copy(input, max_output);
     }
-    let mut output = input.to_vec();
+    let mut output = Cow::Borrowed(input);
     for (filter, params) in filters.iter().zip(decode_params) {
+        work.charge(1)?;
         let has_params = params.is_some();
         let params = params.unwrap_or_default();
         validate_params(filter, params, has_params)?;
-        output = match filter {
-            PdfFilter::FlateDecode => decode_flate(&output, max_output)?,
-            PdfFilter::ASCIIHexDecode => decode_ascii_hex(&output, max_output)?,
-            PdfFilter::ASCII85Decode => decode_ascii85(&output, max_output)?,
-            PdfFilter::RunLengthDecode => decode_run_length(&output, max_output)?,
-            PdfFilter::LzwDecode => decode_lzw(&output, params.early_change, max_output)?,
+        output = Cow::Owned(match filter {
+            PdfFilter::FlateDecode => decode_flate(&output, max_output, work)?,
+            PdfFilter::ASCIIHexDecode => decode_ascii_hex(&output, max_output, work)?,
+            PdfFilter::ASCII85Decode => decode_ascii85(&output, max_output, work)?,
+            PdfFilter::RunLengthDecode => decode_run_length(&output, max_output, work)?,
+            PdfFilter::LzwDecode => decode_lzw(&output, params.early_change, max_output, work)?,
             PdfFilter::Unsupported(name) => {
                 return Err(PdfError::unsupported(format!(
                     "unsupported PDF stream filter /{name}"
                 )));
             }
-        };
+        });
         if matches!(filter, PdfFilter::FlateDecode | PdfFilter::LzwDecode) {
-            output = decode_predictor(output, params, max_output)?;
+            output = Cow::Owned(decode_predictor(
+                output.into_owned(),
+                params,
+                max_output,
+                work,
+            )?);
         }
     }
-    Ok(output)
+    work.charge(0)?;
+    Ok(output.into_owned())
 }
 
 pub(crate) fn encode_pdf_stream(
@@ -129,6 +212,183 @@ pub(crate) fn encode_flate(input: &[u8], max_output: usize) -> Result<Vec<u8>, P
         .finish()
         .map_err(|error| PdfError::limit(format!("Flate encode failed: {error}")))?;
     Ok(output.bytes)
+}
+
+/// Encodes one zlib stream at a fixed best-compression level. The caller must
+/// retain the returned reservations with the encoded bytes. They account for
+/// logical output bytes, excluding Vec capacity/metadata, the borrowed input,
+/// the stack buffer and codec scratch allocations.
+///
+/// Work prepays bounded input/output offers to the codec and materialized output
+/// copies. Unused offers are still spent work, including on failure. Checkpoints
+/// surround bounded codec calls and finalization; they neither yield a WASM
+/// event loop nor interrupt a codec call already in progress.
+pub(crate) fn encode_flate_with_context(
+    input: &[u8],
+    max_output: usize,
+    context: &binas_core::OperationContext,
+) -> Result<(Vec<u8>, Vec<binas_core::Reservation>), PdfError> {
+    // Even an empty stream costs an attempt. Cancellation/zero work therefore
+    // fail before the codec allocates its state.
+    context.charge_work(1).map_err(PdfError::from_context)?;
+    let mut encoder = Compress::new(Compression::best(), true);
+    let mut output = Vec::new();
+    let mut reservations = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    let mut offset = 0_usize;
+    let mut offer = 64_usize;
+    loop {
+        context.checkpoint().map_err(PdfError::from_context)?;
+        let end = offset.saturating_add(8192).min(input.len());
+        let chunk = &input[offset..end];
+        // Probe one extra encoded byte to distinguish exact-limit completion
+        // from an oversized stream without allocating past max_output.
+        let offered = offer.min(max_output.saturating_sub(output.len()).saturating_add(1));
+        let units = chunk
+            .len()
+            .checked_add(offered)
+            .and_then(|units| units.checked_add(1))
+            .ok_or_else(|| PdfError::limit("Flate encode work overflows"))?;
+        context
+            .charge_work(
+                u64::try_from(units)
+                    .map_err(|_| PdfError::limit("Flate encode work exceeds u64"))?,
+            )
+            .map_err(PdfError::from_context)?;
+        let flush = if end == input.len() {
+            FlushCompress::Finish
+        } else {
+            FlushCompress::None
+        };
+        let before_in = encoder.total_in();
+        let before_out = encoder.total_out();
+        let status = encoder
+            .compress(chunk, &mut buffer[..offered], flush)
+            .map_err(|error| PdfError::verification(format!("Flate encode failed: {error}")))?;
+        context.checkpoint().map_err(PdfError::from_context)?;
+        let consumed = usize::try_from(encoder.total_in() - before_in)
+            .map_err(|_| PdfError::limit("Flate encoded input count exceeds usize"))?;
+        let produced = usize::try_from(encoder.total_out() - before_out)
+            .map_err(|_| PdfError::limit("Flate encoded output count exceeds usize"))?;
+        if consumed > chunk.len() || produced > offered {
+            return Err(PdfError::verification(
+                "Flate codec exceeded its buffer offers",
+            ));
+        }
+        offset = offset
+            .checked_add(consumed)
+            .ok_or_else(|| PdfError::limit("Flate encoded input offset overflows"))?;
+        if output
+            .len()
+            .checked_add(produced)
+            .is_none_or(|len| len > max_output)
+        {
+            return Err(PdfError::limit("encoded stream exceeds max_stream_bytes"));
+        }
+        if produced != 0 {
+            context
+                .charge_work(produced as u64)
+                .map_err(PdfError::from_context)?;
+            let reservation = context
+                .reserve(produced as u64)
+                .map_err(PdfError::from_context)?;
+            output.try_reserve_exact(produced).map_err(|error| {
+                PdfError::limit(format!("Flate output allocation failed: {error}"))
+            })?;
+            output.extend_from_slice(&buffer[..produced]);
+            reservations.push(reservation);
+        }
+        if status == Status::StreamEnd {
+            if offset != input.len() {
+                return Err(PdfError::verification(
+                    "Flate stream ended before consuming input",
+                ));
+            }
+            context.checkpoint().map_err(PdfError::from_context)?;
+            return Ok((output, reservations));
+        }
+        if consumed == 0 && produced == 0 {
+            return Err(PdfError::verification("Flate encoder made no progress"));
+        }
+        offer = (offer * 2).min(buffer.len());
+    }
+}
+
+/// Fixed PNG Up row decorrelation followed by the same bounded zlib encoder.
+/// Image geometry, sample format and source decode parameters are validated by
+/// the caller. Reconstructing these differences restores the original sample
+/// order and values.
+///
+/// The complete predictor buffer is reserved before allocation. Its prepaid
+/// work includes current/previous sample reads and output writes (including a
+/// virtual zero previous row). Cancellation is checked every 8192 samples, even
+/// within wide rows. The temporary buffer reservation is released on return;
+/// returned reservations account only the encoded output. `max_output` bounds
+/// the encoded stream; scratch is bounded by checked geometry and the context.
+pub(crate) fn encode_png_up_flate_with_context(
+    samples: &[u8],
+    row_bytes: usize,
+    height: usize,
+    max_output: usize,
+    context: &binas_core::OperationContext,
+) -> Result<(Vec<u8>, Vec<binas_core::Reservation>), PdfError> {
+    context.charge_work(1).map_err(PdfError::from_context)?;
+    if row_bytes == 0 || height == 0 {
+        return Err(PdfError::syntax(
+            "PNG Up requires nonempty complete rows",
+            0,
+        ));
+    }
+    let sample_count = row_bytes
+        .checked_mul(height)
+        .ok_or_else(|| PdfError::limit("PNG Up sample geometry overflows"))?;
+    if samples.len() != sample_count {
+        return Err(PdfError::syntax(
+            "PNG Up samples do not match row geometry",
+            0,
+        ));
+    }
+    if max_output == 0 {
+        return Err(PdfError::limit("PNG Up encoded output limit is zero"));
+    }
+    let predicted_length = row_bytes
+        .checked_add(1)
+        .and_then(|row| row.checked_mul(height))
+        .ok_or_else(|| PdfError::limit("PNG Up buffer size overflows"))?;
+    let units = sample_count
+        .checked_mul(3)
+        .and_then(|units| units.checked_add(height))
+        .and_then(|units| u64::try_from(units).ok())
+        .ok_or_else(|| PdfError::limit("PNG Up work size overflows"))?;
+    context.charge_work(units).map_err(PdfError::from_context)?;
+    let _predictor_storage = context
+        .reserve(
+            u64::try_from(predicted_length)
+                .map_err(|_| PdfError::limit("PNG Up buffer exceeds u64"))?,
+        )
+        .map_err(PdfError::from_context)?;
+    let mut predicted = Vec::new();
+    predicted
+        .try_reserve_exact(predicted_length)
+        .map_err(|error| PdfError::limit(format!("PNG Up allocation failed: {error}")))?;
+    for (row_index, row) in samples.chunks_exact(row_bytes).enumerate() {
+        context.checkpoint().map_err(PdfError::from_context)?;
+        predicted.push(2); // PNG Up selector, also present for fixed Predictor12.
+        for (chunk_index, chunk) in row.chunks(8192).enumerate() {
+            context.checkpoint().map_err(PdfError::from_context)?;
+            let column = chunk_index * 8192;
+            for (index, &sample) in chunk.iter().enumerate() {
+                let previous = if row_index == 0 {
+                    0
+                } else {
+                    samples[(row_index - 1) * row_bytes + column + index]
+                };
+                predicted.push(sample.wrapping_sub(previous));
+            }
+        }
+    }
+    context.checkpoint().map_err(PdfError::from_context)?;
+    encode_flate_with_context(&predicted, max_output, context)
 }
 
 fn parse_filters(value: &Value, max_items: usize) -> Result<Vec<PdfFilter>, PdfError> {
@@ -311,18 +571,57 @@ fn validate_params(
     Ok(())
 }
 
-fn decode_flate(input: &[u8], max_output: usize) -> Result<Vec<u8>, PdfError> {
-    let mut reader = ZlibDecoder::new(input);
+struct DecodeReader<'a, 'c> {
+    input: &'a [u8],
+    work: &'a DecodeWork<'c>,
+    error: Option<PdfError>,
+}
+
+impl Read for DecodeReader<'_, '_> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let count = self.input.len().min(output.len()).min(1024);
+        if let Err(error) = self.work.charge(count) {
+            self.error = Some(error);
+            return Err(io::Error::other("decode context stopped input"));
+        }
+        output[..count].copy_from_slice(&self.input[..count]);
+        self.input = &self.input[count..];
+        Ok(count)
+    }
+}
+
+fn decode_flate(
+    input: &[u8],
+    max_output: usize,
+    work: &DecodeWork<'_>,
+) -> Result<Vec<u8>, PdfError> {
+    let mut reader = ZlibDecoder::new(DecodeReader {
+        input,
+        work,
+        error: None,
+    });
     let mut output = Vec::new();
     let mut chunk = [0_u8; 8192];
+    let mut offer = 64_usize;
     loop {
-        let read = reader
-            .read(&mut chunk)
-            .map_err(|error| PdfError::syntax(format!("invalid FlateDecode stream: {error}"), 0))?;
+        // One extra byte distinguishes exact-limit EOF from expansion past it.
+        let offered = offer.min(max_output.saturating_sub(output.len()).saturating_add(1));
+        work.charge(offered)?;
+        let read = match reader.read(&mut chunk[..offered]) {
+            Ok(read) => read,
+            Err(error) => {
+                return Err(reader.get_mut().error.take().unwrap_or_else(|| {
+                    PdfError::syntax(format!("invalid FlateDecode stream: {error}"), 0)
+                }));
+            }
+        };
         if read == 0 {
             return Ok(output);
         }
-        extend_bounded(&mut output, &chunk[..read], max_output)?;
+        work.extend(&mut output, &chunk[..read], max_output)?;
+        if read == offered {
+            offer = (offer * 2).min(chunk.len());
+        }
     }
 }
 
@@ -517,13 +816,18 @@ impl BitWriter {
     }
 }
 
-fn decode_ascii_hex(input: &[u8], max_output: usize) -> Result<Vec<u8>, PdfError> {
+fn decode_ascii_hex(
+    input: &[u8],
+    max_output: usize,
+    work: &DecodeWork<'_>,
+) -> Result<Vec<u8>, PdfError> {
     let mut output = Vec::new();
     let mut high = None;
     for &byte in input {
+        work.charge(1)?;
         if byte == b'>' {
             if let Some(nibble) = high {
-                push_bounded(&mut output, nibble << 4, max_output)?;
+                work.push(&mut output, nibble << 4, max_output)?;
             }
             return Ok(output);
         }
@@ -537,7 +841,7 @@ fn decode_ascii_hex(input: &[u8], max_output: usize) -> Result<Vec<u8>, PdfError
             _ => return Err(PdfError::syntax("invalid ASCIIHexDecode byte", 0)),
         };
         if let Some(previous) = high.take() {
-            push_bounded(&mut output, previous << 4 | nibble, max_output)?;
+            work.push(&mut output, previous << 4 | nibble, max_output)?;
         } else {
             high = Some(nibble);
         }
@@ -548,32 +852,39 @@ fn decode_ascii_hex(input: &[u8], max_output: usize) -> Result<Vec<u8>, PdfError
     ))
 }
 
-fn decode_ascii85(input: &[u8], max_output: usize) -> Result<Vec<u8>, PdfError> {
+fn decode_ascii85(
+    input: &[u8],
+    max_output: usize,
+    work: &DecodeWork<'_>,
+) -> Result<Vec<u8>, PdfError> {
     let mut output = Vec::new();
     let mut group = [0_u8; 5];
     let mut count = 0;
     let mut index = 0;
     let mut terminated = false;
     while index < input.len() {
+        work.charge(1)?;
         let byte = input[index];
         index += 1;
         if byte.is_ascii_whitespace() {
             continue;
         }
         if byte == b'<' && count == 0 && input.get(index) == Some(&b'~') {
+            work.charge(1)?;
             index += 1;
             continue;
         }
         if byte == b'~' {
+            work.charge(1)?;
             if input.get(index) != Some(&b'>') {
                 return Err(PdfError::syntax("invalid ASCII85Decode end marker", 0));
             }
             index += 1;
-            if input[index..]
-                .iter()
-                .any(|byte| !byte.is_ascii_whitespace())
-            {
-                return Err(PdfError::syntax("data follows ASCII85Decode end marker", 0));
+            for byte in &input[index..] {
+                work.charge(1)?;
+                if !byte.is_ascii_whitespace() {
+                    return Err(PdfError::syntax("data follows ASCII85Decode end marker", 0));
+                }
             }
             terminated = true;
             break;
@@ -582,7 +893,7 @@ fn decode_ascii85(input: &[u8], max_output: usize) -> Result<Vec<u8>, PdfError> 
             if count != 0 {
                 return Err(PdfError::syntax("ASCII85Decode z inside a group", 0));
             }
-            extend_bounded(&mut output, &[0; 4], max_output)?;
+            work.extend(&mut output, &[0; 4], max_output)?;
             continue;
         }
         if !(b'!'..=b'u').contains(&byte) {
@@ -591,7 +902,7 @@ fn decode_ascii85(input: &[u8], max_output: usize) -> Result<Vec<u8>, PdfError> 
         group[count] = byte - b'!';
         count += 1;
         if count == 5 {
-            append_ascii85_group(&mut output, &group, 4, max_output)?;
+            append_ascii85_group(&mut output, &group, 4, max_output, work)?;
             count = 0;
         }
     }
@@ -606,7 +917,7 @@ fn decode_ascii85(input: &[u8], max_output: usize) -> Result<Vec<u8>, PdfError> 
     }
     if count > 1 {
         group[count..].fill(84);
-        append_ascii85_group(&mut output, &group, count - 1, max_output)?;
+        append_ascii85_group(&mut output, &group, count - 1, max_output, work)?;
     }
     Ok(output)
 }
@@ -616,6 +927,7 @@ fn append_ascii85_group(
     group: &[u8; 5],
     take: usize,
     max_output: usize,
+    work: &DecodeWork<'_>,
 ) -> Result<(), PdfError> {
     let mut value = 0_u32;
     for digit in group {
@@ -624,13 +936,18 @@ fn append_ascii85_group(
             .and_then(|value| value.checked_add(u32::from(*digit)))
             .ok_or_else(|| PdfError::syntax("ASCII85Decode group overflows", 0))?;
     }
-    extend_bounded(output, &value.to_be_bytes()[..take], max_output)
+    work.extend(output, &value.to_be_bytes()[..take], max_output)
 }
 
-fn decode_run_length(input: &[u8], max_output: usize) -> Result<Vec<u8>, PdfError> {
+fn decode_run_length(
+    input: &[u8],
+    max_output: usize,
+    work: &DecodeWork<'_>,
+) -> Result<Vec<u8>, PdfError> {
     let mut output = Vec::new();
     let mut index = 0;
     while let Some(&header) = input.get(index) {
+        work.charge(1)?;
         index += 1;
         match header {
             0..=127 => {
@@ -639,16 +956,19 @@ fn decode_run_length(input: &[u8], max_output: usize) -> Result<Vec<u8>, PdfErro
                     .checked_add(length)
                     .filter(|end| *end <= input.len())
                     .ok_or_else(|| PdfError::syntax("RunLengthDecode literal exceeds input", 0))?;
-                extend_bounded(&mut output, &input[index..end], max_output)?;
+                work.charge(length)?;
+                work.extend(&mut output, &input[index..end], max_output)?;
                 index = end;
             }
             128 => return Ok(output),
             129..=255 => {
+                work.charge(1)?;
                 let byte = *input.get(index).ok_or_else(|| {
                     PdfError::syntax("RunLengthDecode repeat is missing a byte", 0)
                 })?;
                 index += 1;
                 let length = 257 - usize::from(header);
+                work.charge(length)?;
                 ensure_capacity(&output, length, max_output)?;
                 output.resize(output.len() + length, byte);
             }
@@ -660,22 +980,29 @@ fn decode_run_length(input: &[u8], max_output: usize) -> Result<Vec<u8>, PdfErro
     ))
 }
 
-fn decode_lzw(input: &[u8], early_change: u8, max_output: usize) -> Result<Vec<u8>, PdfError> {
+fn decode_lzw(
+    input: &[u8],
+    early_change: u8,
+    max_output: usize,
+    work: &DecodeWork<'_>,
+) -> Result<Vec<u8>, PdfError> {
     let mut reader = BitReader::new(input);
-    let mut dictionary = initial_lzw_dictionary();
+    let mut dictionary = initial_lzw_dictionary(work)?;
     let mut next_code = 258_usize;
     let mut width = 9_u8;
     let mut previous: Option<Vec<u8>> = None;
     let mut output = Vec::new();
 
     loop {
+        // Include a shared boundary byte again when the next code is unaligned.
+        work.charge((reader.bit % 8 + usize::from(width)).div_ceil(8))?;
         let code = reader
             .read(width)
             .ok_or_else(|| PdfError::syntax("LZWDecode stream is missing its end marker", 0))?
             as usize;
         match code {
             256 => {
-                dictionary = initial_lzw_dictionary();
+                dictionary = initial_lzw_dictionary(work)?;
                 next_code = 258;
                 width = 9;
                 previous = None;
@@ -686,26 +1013,31 @@ fn decode_lzw(input: &[u8], early_change: u8, max_output: usize) -> Result<Vec<u
         }
 
         let entry = if let Some(Some(entry)) = dictionary.get(code) {
+            work.charge(entry.len())?;
             entry.clone()
         } else if code == next_code {
             let previous = previous
                 .as_ref()
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| PdfError::syntax("invalid LZWDecode code", 0))?;
+            work.charge(previous.len())?;
             let mut entry = previous.clone();
             ensure_capacity(&entry, 1, max_output)?;
+            work.charge(1)?;
             entry.push(previous[0]);
             entry
         } else {
             return Err(PdfError::syntax("invalid LZWDecode code", 0));
         };
 
-        extend_bounded(&mut output, &entry, max_output)?;
+        work.extend(&mut output, &entry, max_output)?;
         if let Some(previous) = previous.as_ref()
             && next_code < 4096
         {
+            work.charge(previous.len())?;
             let mut value = previous.clone();
             ensure_capacity(&value, 1, max_output)?;
+            work.charge(1)?;
             value.push(entry[0]);
             dictionary[next_code] = Some(value);
             next_code += 1;
@@ -717,12 +1049,14 @@ fn decode_lzw(input: &[u8], early_change: u8, max_output: usize) -> Result<Vec<u
     }
 }
 
-fn initial_lzw_dictionary() -> Vec<Option<Vec<u8>>> {
+fn initial_lzw_dictionary(work: &DecodeWork<'_>) -> Result<Vec<Option<Vec<u8>>>, PdfError> {
+    // Fixed slot initialization and the 256 literal payload bytes are work too.
+    work.charge(4096 + 256)?;
     let mut dictionary = vec![None; 4096];
     for (value, entry) in dictionary.iter_mut().take(256).enumerate() {
         *entry = Some(vec![value as u8]);
     }
-    dictionary
+    Ok(dictionary)
 }
 
 struct BitReader<'a> {
@@ -753,11 +1087,13 @@ fn decode_predictor(
     input: Vec<u8>,
     params: DecodeParams,
     max_output: usize,
+    work: &DecodeWork<'_>,
 ) -> Result<Vec<u8>, PdfError> {
+    work.charge(1)?;
     match params.predictor {
         1 => Ok(input),
-        2 => decode_tiff_predictor(input, params, max_output),
-        10..=15 => decode_png_predictor(input, params, max_output),
+        2 => decode_tiff_predictor(input, params, max_output, work),
+        10..=15 => decode_png_predictor(input, params, max_output, work),
         _ => Err(PdfError::unsupported(format!(
             "unsupported predictor {}",
             params.predictor
@@ -806,9 +1142,11 @@ fn decode_tiff_predictor(
     mut input: Vec<u8>,
     params: DecodeParams,
     max_output: usize,
+    work: &DecodeWork<'_>,
 ) -> Result<Vec<u8>, PdfError> {
+    work.charge(1)?;
     let (samples, row_bytes, _) = predictor_geometry(params)?;
-    if !input.len().is_multiple_of(row_bytes) {
+    if row_bytes == 0 || !input.len().is_multiple_of(row_bytes) {
         return Err(PdfError::syntax("partial TIFF predictor row", 0));
     }
     if input.len() > max_output {
@@ -818,6 +1156,7 @@ fn decode_tiff_predictor(
     let mask = (1_u64 << bits) - 1;
     for row in input.chunks_exact_mut(row_bytes) {
         for sample in 0..samples {
+            work.charge(bits.div_ceil(8) * if sample >= params.colors { 3 } else { 2 })?;
             let mut value = read_packed_sample(row, sample, bits);
             if sample >= params.colors {
                 value = (value + read_packed_sample(row, sample - params.colors, bits)) & mask;
@@ -879,7 +1218,9 @@ fn decode_png_predictor(
     input: Vec<u8>,
     params: DecodeParams,
     max_output: usize,
+    work: &DecodeWork<'_>,
 ) -> Result<Vec<u8>, PdfError> {
+    work.charge(1)?;
     let (_, row_bytes, bytes_per_pixel) = predictor_geometry(params)?;
     let encoded_row = row_bytes
         .checked_add(1)
@@ -894,16 +1235,25 @@ fn decode_png_predictor(
     if output_len > max_output {
         return Err(PdfError::limit("decoded stream exceeds output limit"));
     }
+    if row_count == 0 {
+        return Ok(Vec::new());
+    }
 
+    // Pay for output reservation and previous-row initialization before allocation.
+    work.charge(output_len)?;
+    work.charge(row_bytes)?;
     let mut output = Vec::with_capacity(output_len);
     let mut previous = vec![0_u8; row_bytes];
     for encoded in input.chunks_exact(encoded_row) {
+        work.charge(1)?;
         let filter = encoded[0];
         if filter > 4 {
             return Err(PdfError::syntax("invalid PNG predictor row filter", 0));
         }
+        work.charge(row_bytes)?;
         let mut row = vec![0_u8; row_bytes];
         for column in 0..row_bytes {
+            work.charge(5)?; // encoded/left/up/up-left reads and reconstructed byte
             let left = column
                 .checked_sub(bytes_per_pixel)
                 .map_or(0, |index| row[index]);
@@ -921,7 +1271,7 @@ fn decode_png_predictor(
             };
             row[column] = encoded[column + 1].wrapping_add(predicted);
         }
-        output.extend_from_slice(&row);
+        work.extend(&mut output, &row, max_output)?;
         previous = row;
     }
     Ok(output)
@@ -1027,6 +1377,550 @@ fn ensure_capacity(output: &[u8], additional: usize, max_output: usize) -> Resul
         return Err(PdfError::limit("decoded stream exceeds output limit"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod encoder_work {
+    use super::*;
+    use crate::PdfErrorCode;
+    use binas_core::{BudgetLimits, CancellationToken, OperationContext, ResourceBudget};
+
+    fn context(live: u64, work: u64) -> OperationContext {
+        OperationContext::new(
+            ResourceBudget::new(BudgetLimits {
+                max_live_bytes: live,
+                max_work_units: work,
+            }),
+            CancellationToken::new(),
+        )
+    }
+
+    fn varied_input() -> Vec<u8> {
+        // Deterministic incompressible data exercises several input/output steps
+        // and partial reservations without relying on random or wall-clock tests.
+        let mut state = 0x1234_5678_u32;
+        (0..32_769)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn png_up_known_bytes_wide_rows_and_output_reservations() {
+        let context = context(100_000, 10_000_000);
+        let (encoded, reservations) =
+            encode_png_up_flate_with_context(&[0, 128, 255, 255, 127, 0], 3, 2, 100_000, &context)
+                .unwrap();
+        let mut predicted = Vec::new();
+        ZlibDecoder::new(encoded.as_slice())
+            .read_to_end(&mut predicted)
+            .unwrap();
+        assert_eq!(predicted, [2, 0, 128, 255, 2, 255, 255, 1]);
+        assert_eq!(context.budget().snapshot().live_bytes, encoded.len() as u64);
+        drop((encoded, reservations));
+        assert_eq!(context.budget().snapshot().live_bytes, 0);
+
+        let samples: Vec<_> = (0..8193)
+            .map(|index| index as u8)
+            .chain((0..8193).map(|index| (index as u8).wrapping_add(7)))
+            .collect();
+        let (encoded, reservations) =
+            encode_png_up_flate_with_context(&samples, 8193, 2, 100_000, &context).unwrap();
+        let mut predicted = Vec::new();
+        ZlibDecoder::new(encoded.as_slice())
+            .read_to_end(&mut predicted)
+            .unwrap();
+        assert_eq!(predicted.len(), 16388);
+        assert_eq!(predicted[0], 2);
+        assert_eq!(&predicted[1..8194], &samples[..8193]);
+        assert_eq!(predicted[8194], 2);
+        assert!(predicted[8195..].iter().all(|byte| *byte == 7));
+        drop((encoded, reservations));
+        assert_eq!(context.budget().snapshot().live_bytes, 0);
+    }
+
+    #[test]
+    fn png_up_geometry_work_and_live_limits_fail_without_retained_scratch() {
+        for (row, height) in [(0, 2), (3, 0), (3, 3), (usize::MAX, 2)] {
+            let context = context(100_000, 10_000_000);
+            assert!(
+                encode_png_up_flate_with_context(b"123456", row, height, 100_000, &context)
+                    .is_err()
+            );
+            assert_eq!(context.budget().snapshot().live_bytes, 0);
+        }
+        for (live, work, output) in [
+            (7, 100_000, 100_000),
+            (8, 100_000, 100_000),
+            (100_000, 20, 100_000),
+            (100_000, 100_000, 0),
+        ] {
+            let limited = context(live, work);
+            assert_eq!(
+                encode_png_up_flate_with_context(b"123456", 3, 2, output, &limited)
+                    .unwrap_err()
+                    .code,
+                PdfErrorCode::ResourceLimit
+            );
+            assert_eq!(limited.budget().snapshot().live_bytes, 0);
+        }
+        let cancelled = context(0, 0);
+        cancelled.cancellation().cancel();
+        assert_eq!(
+            encode_png_up_flate_with_context(b"123456", 3, 2, 100_000, &cancelled)
+                .unwrap_err()
+                .code,
+            PdfErrorCode::Cancelled
+        );
+        assert_eq!(cancelled.budget().snapshot(), Default::default());
+    }
+
+    #[test]
+    fn png_up_retries_keep_prepaid_transform_and_codec_work_spent() {
+        let baseline = context(100_000, 10_000_000);
+        drop(encode_png_up_flate_with_context(b"123456", 3, 2, 100_000, &baseline).unwrap());
+        let spent = baseline.budget().snapshot().work_units;
+        let repeated = context(100_000, spent);
+        drop(encode_png_up_flate_with_context(b"123456", 3, 2, 100_000, &repeated).unwrap());
+        assert_eq!(repeated.budget().snapshot().live_bytes, 0);
+        assert_eq!(repeated.budget().snapshot().work_units, spent);
+        assert_eq!(
+            encode_png_up_flate_with_context(b"123456", 3, 2, 100_000, &repeated)
+                .unwrap_err()
+                .code,
+            PdfErrorCode::ResourceLimit
+        );
+        assert_eq!(repeated.budget().snapshot().work_units, spent);
+    }
+
+    #[test]
+    fn encoder_work_exact_round_trip_retains_then_releases_output_accounting() {
+        for input in [Vec::new(), vec![b'A'; 32_769], varied_input()] {
+            let context = context(100_000, 10_000_000);
+            let (encoded, reservations) =
+                encode_flate_with_context(&input, 100_000, &context).unwrap();
+            let mut decoded = Vec::new();
+            ZlibDecoder::new(encoded.as_slice())
+                .read_to_end(&mut decoded)
+                .unwrap();
+            assert_eq!(decoded, input);
+            assert_eq!(context.budget().snapshot().live_bytes, encoded.len() as u64);
+            assert_eq!(
+                reservations.iter().map(|entry| entry.bytes()).sum::<u64>(),
+                encoded.len() as u64
+            );
+            let spent = context.budget().snapshot().work_units;
+            assert!(spent > input.len() as u64);
+            drop((encoded, reservations));
+            assert_eq!(context.budget().snapshot().live_bytes, 0);
+            assert_eq!(context.budget().snapshot().work_units, spent);
+        }
+    }
+
+    #[test]
+    fn encoder_work_output_and_live_limits_release_partial_reservations() {
+        let input = varied_input();
+        let baseline_context = context(100_000, 10_000_000);
+        let (baseline, baseline_reservations) =
+            encode_flate_with_context(&input, 100_000, &baseline_context).unwrap();
+        let length = baseline.len();
+        let exact = context(length as u64, 10_000_000);
+        let (encoded, reservations) = encode_flate_with_context(&input, length, &exact).unwrap();
+        assert_eq!(encoded, baseline);
+        drop((encoded, reservations));
+        assert_eq!(exact.budget().snapshot().live_bytes, 0);
+        for (live, output) in [(100_000, length - 1), ((length - 1) as u64, 100_000)] {
+            let limited = context(live, 10_000_000);
+            assert_eq!(
+                encode_flate_with_context(&input, output, &limited)
+                    .unwrap_err()
+                    .code,
+                PdfErrorCode::ResourceLimit
+            );
+            assert_eq!(limited.budget().snapshot().live_bytes, 0);
+            assert!(limited.budget().snapshot().work_units > 0);
+        }
+        drop((baseline, baseline_reservations));
+    }
+
+    #[test]
+    fn encoder_work_cancelled_and_zero_work_fail_before_codec_allocation() {
+        let cancelled = context(0, 0);
+        cancelled.cancellation().cancel();
+        assert_eq!(
+            encode_flate_with_context(b"input", 100_000, &cancelled)
+                .unwrap_err()
+                .code,
+            PdfErrorCode::Cancelled
+        );
+        assert_eq!(cancelled.budget().snapshot(), Default::default());
+        let zero = context(0, 0);
+        assert_eq!(
+            encode_flate_with_context(b"", 100_000, &zero)
+                .unwrap_err()
+                .code,
+            PdfErrorCode::ResourceLimit
+        );
+        assert_eq!(zero.budget().snapshot(), Default::default());
+        let empty_limit = context(0, 100_000);
+        assert_eq!(
+            encode_flate_with_context(b"", 0, &empty_limit)
+                .unwrap_err()
+                .code,
+            PdfErrorCode::ResourceLimit
+        );
+        assert_eq!(empty_limit.budget().snapshot().live_bytes, 0);
+        assert!(empty_limit.budget().snapshot().work_units > 0);
+    }
+
+    #[test]
+    fn encoder_work_retries_and_late_failures_keep_spent_work() {
+        let input = varied_input();
+        let baseline = context(100_000, 10_000_000);
+        drop(encode_flate_with_context(&input, 100_000, &baseline).unwrap());
+        let work = baseline.budget().snapshot().work_units;
+        let repeated = context(100_000, work);
+        drop(encode_flate_with_context(&input, 100_000, &repeated).unwrap());
+        assert_eq!(repeated.budget().snapshot().work_units, work);
+        assert_eq!(
+            encode_flate_with_context(&input, 100_000, &repeated)
+                .unwrap_err()
+                .code,
+            PdfErrorCode::ResourceLimit
+        );
+        assert_eq!(repeated.budget().snapshot().work_units, work);
+        assert_eq!(repeated.budget().snapshot().live_bytes, 0);
+        let exhausted = context(100_000, work - 1);
+        assert_eq!(
+            encode_flate_with_context(&input, 100_000, &exhausted)
+                .unwrap_err()
+                .code,
+            PdfErrorCode::ResourceLimit
+        );
+        assert_eq!(exhausted.budget().snapshot().live_bytes, 0);
+        assert!(exhausted.budget().snapshot().work_units > 1);
+    }
+}
+
+#[cfg(test)]
+mod decoder_work {
+    use super::*;
+    use crate::PdfErrorCode;
+    use binas_core::{BudgetLimits, CancellationToken, OperationContext, ResourceBudget};
+
+    fn context(units: u64) -> OperationContext {
+        OperationContext::new(
+            ResourceBudget::new(BudgetLimits {
+                max_live_bytes: u64::MAX,
+                max_work_units: units,
+            }),
+            CancellationToken::new(),
+        )
+    }
+
+    fn decode(
+        input: &[u8],
+        filter: PdfFilter,
+        maximum: usize,
+        context: &OperationContext,
+    ) -> Result<Vec<u8>, PdfError> {
+        decode_filter_chain_with_context(input, &[filter], &[None], maximum, context)
+    }
+
+    #[test]
+    fn decoder_work_malformed_retries_cannot_reset_spent_work() {
+        let context = context(7);
+        for expected in [3, 6] {
+            assert_eq!(
+                decode(b"!", PdfFilter::ASCIIHexDecode, 100, &context)
+                    .unwrap_err()
+                    .code,
+                PdfErrorCode::InvalidSyntax
+            );
+            assert_eq!(context.budget().snapshot().work_units, expected);
+        }
+        assert_eq!(
+            decode(b"!", PdfFilter::ASCIIHexDecode, 100, &context)
+                .unwrap_err()
+                .code,
+            PdfErrorCode::ResourceLimit
+        );
+        assert_eq!(context.budget().snapshot().work_units, 7);
+        let context = self::context(10);
+        assert!(
+            decode_filter_chain_with_context(
+                b"invalid",
+                &[PdfFilter::FlateDecode],
+                &[],
+                0,
+                &context
+            )
+            .is_err()
+        );
+        assert_eq!(context.budget().snapshot().work_units, 1);
+    }
+
+    #[test]
+    fn decoder_work_expansion_and_output_caps_are_independent() {
+        let input = [129, b'A', 128]; // Three encoded bytes expand to 128 samples.
+        let context = context(20);
+        assert_eq!(
+            decode(&input, PdfFilter::RunLengthDecode, 1000, &context)
+                .unwrap_err()
+                .code,
+            PdfErrorCode::ResourceLimit
+        );
+        assert!(context.budget().snapshot().work_units > 0);
+        let context = self::context(1000);
+        assert_eq!(
+            decode(&input, PdfFilter::RunLengthDecode, 100, &context)
+                .unwrap_err()
+                .code,
+            PdfErrorCode::ResourceLimit
+        );
+        assert!(context.budget().snapshot().work_units >= 128);
+        let context = self::context(1000);
+        assert_eq!(
+            decode(&input, PdfFilter::RunLengthDecode, 128, &context).unwrap(),
+            vec![b'A'; 128]
+        );
+        assert!(context.budget().snapshot().work_units > input.len() as u64);
+    }
+
+    #[test]
+    fn decoder_work_chains_charge_each_intermediate_read_and_write() {
+        let context = context(100);
+        let output = decode_filter_chain_with_context(
+            b"34313E>",
+            &[PdfFilter::ASCIIHexDecode, PdfFilter::ASCIIHexDecode],
+            &[None, None],
+            3,
+            &context,
+        )
+        .unwrap();
+        assert_eq!(output, b"A");
+        assert_eq!(context.budget().snapshot().work_units, 17);
+        let insufficient = self::context(16);
+        assert_eq!(
+            decode_filter_chain_with_context(
+                b"34313E>",
+                &[PdfFilter::ASCIIHexDecode, PdfFilter::ASCIIHexDecode],
+                &[None, None],
+                3,
+                &insufficient
+            )
+            .unwrap_err()
+            .code,
+            PdfErrorCode::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn decoder_work_all_filters_preserve_compatibility_outputs_and_bill_failures() {
+        let data = b"ABABABABABABABABABABABABABABABAB";
+        let cases = [
+            (
+                PdfFilter::FlateDecode,
+                encode_flate(data, 1000).unwrap(),
+                vec![0xff, 0xff],
+            ),
+            (
+                PdfFilter::ASCIIHexDecode,
+                encode_ascii_hex(data, 1000).unwrap(),
+                b"!".to_vec(),
+            ),
+            (
+                PdfFilter::ASCII85Decode,
+                encode_ascii85(data, 1000).unwrap(),
+                b"v".to_vec(),
+            ),
+            (
+                PdfFilter::RunLengthDecode,
+                encode_run_length(data, 1000).unwrap(),
+                vec![255],
+            ),
+            (
+                PdfFilter::LzwDecode,
+                encode_lzw(data, 1, 1000).unwrap(),
+                vec![0xff],
+            ),
+        ];
+        for (filter, encoded, malformed) in cases {
+            let context = context(1_000_000);
+            let expected =
+                decode_filter_chain(&encoded, std::slice::from_ref(&filter), &[None], 1000)
+                    .unwrap();
+            assert_eq!(
+                decode(&encoded, filter.clone(), 1000, &context).unwrap(),
+                expected
+            );
+            assert_eq!(expected, data);
+            let previous = context.budget().snapshot().work_units;
+            assert!(decode(&malformed, filter, 1000, &context).is_err());
+            assert!(context.budget().snapshot().work_units > previous);
+        }
+        let context = context(100);
+        assert_eq!(
+            decode_filter_chain_with_context(b"copy", &[], &[], 4, &context).unwrap(),
+            b"copy"
+        );
+        assert_eq!(context.budget().snapshot().work_units, 9);
+    }
+
+    #[test]
+    fn decoder_work_flate_charges_expansion_before_codec_steps() {
+        let data = vec![0_u8; 100_000];
+        let encoded = encode_flate(&data, 1000).unwrap();
+        let context = context(2000);
+        assert_eq!(
+            decode(&encoded, PdfFilter::FlateDecode, data.len(), &context)
+                .unwrap_err()
+                .code,
+            PdfErrorCode::ResourceLimit
+        );
+        assert!(context.budget().snapshot().work_units > encoded.len() as u64);
+        let context = self::context(1_000_000);
+        assert_eq!(
+            decode(&encoded, PdfFilter::FlateDecode, data.len(), &context).unwrap(),
+            data
+        );
+        assert!(context.budget().snapshot().work_units > 100_000);
+        let tiny = encode_flate(b"a", 100).unwrap();
+        let context = self::context(1000);
+        assert_eq!(
+            decode(&tiny, PdfFilter::FlateDecode, 100_000_000, &context).unwrap(),
+            b"a"
+        );
+        assert!(context.budget().snapshot().work_units < 1000);
+    }
+
+    #[test]
+    fn decoder_work_predictors_and_dictionary_resets_are_not_free() {
+        for (predictor, encoded, expected) in
+            [(2, vec![2, 1], vec![2, 3]), (12, vec![0, 2, 3], vec![2, 3])]
+        {
+            let compressed = encode_flate(&encoded, 100).unwrap();
+            let baseline = context(1000);
+            decode(&compressed, PdfFilter::FlateDecode, 100, &baseline).unwrap();
+            let predicted = context(1000);
+            let params = DecodeParams {
+                predictor,
+                columns: 2,
+                ..Default::default()
+            };
+            let output = decode_filter_chain_with_context(
+                &compressed,
+                &[PdfFilter::FlateDecode],
+                &[Some(params)],
+                100,
+                &predicted,
+            )
+            .unwrap();
+            assert_eq!(output, expected);
+            assert!(
+                predicted.budget().snapshot().work_units
+                    > baseline.budget().snapshot().work_units + expected.len() as u64
+            );
+        }
+        let mut writer = BitWriter::new(100);
+        for code in [256, 256, 257] {
+            writer.write(code, 9).unwrap();
+        }
+        let encoded = writer.finish().unwrap();
+        let context = context(100_000);
+        assert!(
+            decode(&encoded, PdfFilter::LzwDecode, 100, &context)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(context.budget().snapshot().work_units >= 3 * (4096 + 256));
+    }
+
+    #[test]
+    fn decoder_work_cancellation_is_typed_and_does_not_charge() {
+        let context = context(100);
+        context.cancellation().cancel();
+        assert_eq!(
+            decode(b"41>", PdfFilter::ASCIIHexDecode, 1, &context)
+                .unwrap_err()
+                .code,
+            PdfErrorCode::Cancelled
+        );
+        assert_eq!(context.budget().snapshot().work_units, 0);
+    }
+
+    #[test]
+    fn decoder_work_malformed_predictors_retain_work_and_empty_rows_do_not_allocate() {
+        for (predictor, bytes) in [(2, vec![1]), (12, vec![0, 1]), (12, vec![9, 1, 2])] {
+            let compressed = encode_flate(&bytes, 100).unwrap();
+            let context = context(10_000);
+            let params = DecodeParams {
+                predictor,
+                columns: 2,
+                ..Default::default()
+            };
+            for _ in 0..2 {
+                let previous = context.budget().snapshot().work_units;
+                assert_eq!(
+                    decode_filter_chain_with_context(
+                        &compressed,
+                        &[PdfFilter::FlateDecode],
+                        &[Some(params)],
+                        100,
+                        &context
+                    )
+                    .unwrap_err()
+                    .code,
+                    PdfErrorCode::InvalidSyntax
+                );
+                assert!(context.budget().snapshot().work_units > previous);
+            }
+        }
+        let context = context(10);
+        let params = DecodeParams {
+            predictor: 12,
+            columns: 100_000_000,
+            ..Default::default()
+        };
+        assert!(
+            decode_png_predictor(vec![], params, 0, &DecodeWork(Some(&context)))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(context.budget().snapshot().work_units, 1);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn decoder_work_long_whitespace_scan_observes_cancellation_inside_loop() {
+        let context = context(u64::MAX);
+        let observer = context.clone();
+        let input = vec![b' '; 10_000_000];
+        let worker =
+            std::thread::spawn(move || decode(&input, PdfFilter::ASCIIHexDecode, 1, &context));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while observer.budget().snapshot().work_units < 1000 {
+            assert!(
+                !worker.is_finished(),
+                "decoder ended before exercising its loop"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "decoder did not begin work"
+            );
+            std::thread::yield_now();
+        }
+        observer.cancellation().cancel();
+        assert_eq!(
+            worker.join().unwrap().unwrap_err().code,
+            PdfErrorCode::Cancelled
+        );
+        assert!(observer.budget().snapshot().work_units < 10_000_002);
+    }
 }
 
 #[cfg(test)]
@@ -1260,7 +2154,7 @@ mod tests {
             ..DecodeParams::default()
         };
         assert_eq!(
-            decode_tiff_predictor(vec![0x11, 0x11], params, 2).unwrap(),
+            decode_tiff_predictor(vec![0x11, 0x11], params, 2, &DecodeWork(None)).unwrap(),
             vec![0x12, 0x34]
         );
     }
@@ -1280,7 +2174,7 @@ mod tests {
                 ..DecodeParams::default()
             };
             assert_eq!(
-                decode_png_predictor(vec![0, 1, 2], params, 2).unwrap(),
+                decode_png_predictor(vec![0, 1, 2], params, 2, &DecodeWork(None)).unwrap(),
                 [1, 2]
             );
         }

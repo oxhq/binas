@@ -1,0 +1,44 @@
+%PDF-1.7
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 6 0 R /MarkInfo << /Marked true >> >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >>  /StructParents 0 >>
+endobj
+4 0 obj
+<< /Length 44 >>
+stream
+/Figure << /MCID 0 >> BDC 0 0 20 20 re f EMC
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+6 0 obj
+<< /Type /StructTreeRoot /K [7 0 R] /ParentTree 8 0 R /ParentTreeNextKey 1 >>
+endobj
+7 0 obj
+<< /Type /StructElem /S /Figure /P 6 0 R /Pg 3 0 R /K 0 /Alt <FEFF0049006D006100670065006E003A002000630061006600E900204E2D65870020D83DDE00> >>
+endobj
+8 0 obj
+<< /Nums [0 [7 0 R]] >>
+endobj
+xref
+0 9
+0000000000 65535 f 
+0000000009 00000 n 
+0000000109 00000 n 
+0000000166 00000 n 
+0000000310 00000 n 
+0000000404 00000 n 
+0000000474 00000 n 
+0000000567 00000 n 
+0000000725 00000 n 
+trailer
+<< /Size 9 /Root 1 0 R  >>
+startxref
+764
+%%EOF

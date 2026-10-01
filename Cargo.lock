@@ -160,6 +160,7 @@ version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -195,6 +196,7 @@ dependencies = [
 name = "binas-pdf-wasm"
 version = "0.1.1"
 dependencies = [
+ "binas-core",
  "binas-pdf",
  "js-sys",
  "serde",

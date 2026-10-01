@@ -3,7 +3,7 @@ use std::{
     sync::Arc,
 };
 
-use binas_core::Span;
+use binas_core::{CancellationToken, Source, SourceId, SourceSpan, Span};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -25,11 +25,60 @@ impl PdfEngine {
     }
 
     pub fn open(&self, input: &[u8], options: OpenOptions) -> Result<PdfDocument, PdfError> {
-        let bytes: Arc<[u8]> = input.into();
+        let bytes = Source::copy_from_slice(input, self.config.limits.max_input_bytes)
+            .map_err(|error| PdfError::limit(error.to_string()))?;
+        self.open_source(bytes, options)
+    }
+
+    /// Takes ownership of the existing input allocation without copying its payload.
+    pub fn open_owned(
+        &self,
+        input: Vec<u8>,
+        options: OpenOptions,
+    ) -> Result<PdfDocument, PdfError> {
+        let bytes = Source::from_owned(input, self.config.limits.max_input_bytes)
+            .map_err(|error| PdfError::limit(error.to_string()))?;
+        self.open_source(bytes, options)
+    }
+
+    /// Shares an immutable input allocation. Parsing still allocates objects.
+    pub fn open_shared(
+        &self,
+        input: Arc<[u8]>,
+        options: OpenOptions,
+    ) -> Result<PdfDocument, PdfError> {
+        let bytes = Source::from_shared(input, self.config.limits.max_input_bytes)
+            .map_err(|error| PdfError::limit(error.to_string()))?;
+        self.open_source(bytes, options)
+    }
+
+    /// Opens an existing immutable source without rehashing or copying its bytes.
+    pub fn open_source(
+        &self,
+        bytes: Source,
+        options: OpenOptions,
+    ) -> Result<PdfDocument, PdfError> {
+        self.open_source_with_cancellation(bytes, options, CancellationToken::new())
+    }
+
+    /// Opens an immutable source with cooperative cancellation at decode work
+    /// checkpoints. This does not make every parser loop interruptible.
+    pub fn open_source_with_cancellation(
+        &self,
+        bytes: Source,
+        options: OpenOptions,
+        cancellation: CancellationToken,
+    ) -> Result<PdfDocument, PdfError> {
+        if cancellation.is_cancelled() {
+            return Err(PdfError::from_context(binas_core::ContextError::Cancelled));
+        }
+        if bytes.len() > self.config.limits.max_input_bytes {
+            return Err(PdfError::limit("input exceeds max_input_bytes"));
+        }
         let parsed = if options.repair {
-            parser::parse_document_repair(&bytes, &self.config.limits)?
+            parser::parse_document_repair(&bytes, &self.config.limits, cancellation.clone())?
         } else {
-            parser::parse_document(&bytes, &self.config.limits)?
+            parser::parse_document(&bytes, &self.config.limits, cancellation.clone())?
         };
         Ok(PdfDocument {
             bytes,
@@ -47,12 +96,13 @@ impl PdfEngine {
         if options.repair {
             return Err(PdfError::unsupported("PDF repair mode is not implemented"));
         }
-        let encrypted = self.open_skeleton(input)?;
+        let mut encrypted = self.open_skeleton(input)?;
         if !crate::security::inspect_encryption(&encrypted)?.encrypted {
-            return self.open(input, options);
+            parser::finish_compressed_objects(&mut encrypted.parsed)?;
+            return Ok(encrypted);
         }
         let plaintext = encrypted.decrypt_to_plain(password)?;
-        self.open(&plaintext.bytes, options)
+        self.open_owned(plaintext.bytes, options)
     }
 
     pub fn decrypt_input_to_plain(
@@ -79,8 +129,10 @@ impl PdfEngine {
     }
 
     pub(crate) fn open_skeleton(&self, input: &[u8]) -> Result<PdfDocument, PdfError> {
-        let bytes: Arc<[u8]> = input.into();
-        let parsed = parser::parse_document_skeleton(&bytes, &self.config.limits)?;
+        let bytes = Source::copy_from_slice(input, self.config.limits.max_input_bytes)
+            .map_err(|error| PdfError::limit(error.to_string()))?;
+        let parsed =
+            parser::parse_document_skeleton(&bytes, &self.config.limits, CancellationToken::new())?;
         Ok(PdfDocument {
             bytes,
             parsed,
@@ -101,7 +153,7 @@ impl Default for PdfEngine {
 
 #[derive(Clone, Debug)]
 pub struct PdfDocument {
-    bytes: Arc<[u8]>,
+    bytes: Source,
     parsed: ParsedDocument,
     config: EngineConfig,
 }
@@ -119,11 +171,11 @@ pub struct InspectResult {
 pub struct PageGeometry {
     pub media_box: [f64; 4],
     pub crop_box: [f64; 4],
-    /// `None` means the page tree has no effective `/BleedBox`; no fallback is applied.
+    /// Direct page `/BleedBox`, or `None`; no fallback or parent inheritance is applied.
     pub bleed_box: Option<[f64; 4]>,
-    /// `None` means the page tree has no effective `/TrimBox`; no fallback is applied.
+    /// Direct page `/TrimBox`, or `None`; no fallback or parent inheritance is applied.
     pub trim_box: Option<[f64; 4]>,
-    /// `None` means the page tree has no effective `/ArtBox`; no fallback is applied.
+    /// Direct page `/ArtBox`, or `None`; no fallback or parent inheritance is applied.
     pub art_box: Option<[f64; 4]>,
     pub rotation_degrees: i32,
 }
@@ -186,10 +238,16 @@ pub struct TextExtraction {
     pub warnings: Vec<TextExtractionWarning>,
 }
 
-struct TextExtractionState {
+struct TextPart<'a> {
+    reference: ObjectRef,
+    resources: Option<&'a Value>,
+}
+
+struct TextExtractionState<'a> {
     budget: ParseBudget,
     cmap_cache: BTreeMap<ObjectRef, FontDecoder>,
     stream_visits: usize,
+    parts: Vec<TextPart<'a>>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -200,6 +258,29 @@ pub struct ValidationResult {
 }
 
 impl PdfDocument {
+    /// Clones the document with a different decode cancellation token while
+    /// retaining the same shared cache and spent decode work. Source/stream
+    /// payloads and object/xref maps are shared. Later mutations copy sparse
+    /// change-map metadata and the affected object; this is not an operation
+    /// transaction or a reset of resource quotas.
+    pub fn with_cancellation(&self, cancellation: CancellationToken) -> Self {
+        let mut document = self.clone();
+        document.parsed.decode_cancellation = cancellation;
+        document
+    }
+
+    /// Reports managed decoded-payload retention and cumulative decode work,
+    /// excluding parser graphs, allocator overhead and decoder scratch memory.
+    pub fn decode_metrics(&self) -> crate::DecodeMetrics {
+        self.parsed.decode_state.metrics()
+    }
+
+    /// Evicts cached results without refunding spent work. Outstanding decoded
+    /// handles keep their allocation reservations until the last handle drops.
+    pub fn clear_decode_cache(&self) {
+        self.parsed.decode_state.clear_cache();
+    }
+
     pub(crate) fn with_parsed(&self, parsed: ParsedDocument) -> Self {
         Self {
             bytes: self.bytes.clone(),
@@ -241,9 +322,9 @@ impl PdfDocument {
         let crop_box = self
             .inherited_page_box(page, b"CropBox", "crop box")?
             .unwrap_or(media_box);
-        let bleed_box = self.inherited_page_box(page, b"BleedBox", "bleed box")?;
-        let trim_box = self.inherited_page_box(page, b"TrimBox", "trim box")?;
-        let art_box = self.inherited_page_box(page, b"ArtBox", "art box")?;
+        let bleed_box = self.direct_page_box(page, b"BleedBox", "bleed box")?;
+        let trim_box = self.direct_page_box(page, b"TrimBox", "trim box")?;
+        let art_box = self.direct_page_box(page, b"ArtBox", "art box")?;
         let rotation_degrees = match self.inherited_page_value(page, b"Rotate")? {
             None => 0,
             Some(Value::Integer(rotation)) => rotation.rem_euclid(360) as i32,
@@ -310,46 +391,87 @@ impl PdfDocument {
     }
 
     pub fn extract_text_spans(&self) -> Result<TextExtraction, PdfError> {
+        self.extract_text_for_pages(self.page_refs()?.into_iter().enumerate())
+    }
+
+    /// Extracts one page using its original zero-based index. The page tree is
+    /// resolved, but unrelated page content streams are not decoded or parsed.
+    pub fn extract_page_text_spans(&self, page_index: usize) -> Result<TextExtraction, PdfError> {
+        let pages = self.page_refs()?;
+        let page = *pages.get(page_index).ok_or_else(|| {
+            PdfError::selection(format!(
+                "page index {page_index} exceeds page count {}",
+                pages.len()
+            ))
+        })?;
+        self.extract_text_for_pages([(page_index, page)])
+    }
+
+    /// Caller supplies already resolved page identities and original indices.
+    /// One extraction state shares stream quotas and CMap analysis across them.
+    pub(crate) fn extract_text_for_pages(
+        &self,
+        pages: impl IntoIterator<Item = (usize, ObjectRef)>,
+    ) -> Result<TextExtraction, PdfError> {
         let mut spans = Vec::new();
         let mut warnings = Vec::new();
         let mut state = TextExtractionState {
-            budget: ParseBudget::default(),
+            budget: ParseBudget::for_document(self.parsed()),
             cmap_cache: BTreeMap::new(),
             stream_visits: 0,
+            parts: Vec::new(),
         };
-        for (page_index, page_reference) in self.page_refs()?.into_iter().enumerate() {
+        state.budget.charge_work(0)?;
+        for (selected_index, (page_index, page_reference)) in pages.into_iter().enumerate() {
+            state.budget.charge_work(0)?;
+            if selected_index >= self.parsed.limits.max_pages {
+                return Err(PdfError::limit(
+                    "selected extraction page count exceeds limit",
+                ));
+            }
             let resources = self.inherited_resources(page_reference)?;
             let mut active_forms = BTreeSet::new();
+            state.parts.clear();
+            let mut content_state = content::ContentTextState::new();
+            let mut complete = true;
             for reference in self.page_content_refs(page_reference)? {
-                self.extract_text_stream(
+                if !self.extract_text_stream(
                     page_index,
                     reference,
                     resources,
                     [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
                     0,
+                    &mut content_state,
                     &mut active_forms,
                     &mut state,
                     &mut spans,
                     &mut warnings,
-                )?;
+                )? {
+                    complete = false;
+                    break;
+                }
+            }
+            if complete {
+                content_state.finish()?;
             }
         }
         Ok(TextExtraction { spans, warnings })
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn extract_text_stream(
-        &self,
+    fn extract_text_stream<'a>(
+        &'a self,
         page_index: usize,
         reference: ObjectRef,
-        resources: Option<&Value>,
+        resources: Option<&'a Value>,
         parent_matrix: [f64; 6],
         depth: usize,
+        content_state: &mut content::ContentTextState,
         active_forms: &mut BTreeSet<ObjectRef>,
-        state: &mut TextExtractionState,
+        state: &mut TextExtractionState<'a>,
         spans: &mut Vec<TextSpan>,
         warnings: &mut Vec<TextExtractionWarning>,
-    ) -> Result<(), PdfError> {
+    ) -> Result<bool, PdfError> {
         state.stream_visits = state
             .stream_visits
             .checked_add(1)
@@ -359,7 +481,11 @@ impl PdfDocument {
         }
 
         let object = self.parsed.object(reference)?;
-        let filtered = dict_get(&object.value, b"Filter").is_some();
+        let part_index = state.parts.len();
+        state.parts.push(TextPart {
+            reference,
+            resources,
+        });
         let encoded = object.stream.as_ref().ok_or_else(|| {
             PdfError::syntax("text content reference is not a stream", object.offset)
         })?;
@@ -378,25 +504,80 @@ impl PdfDocument {
                     code: error.code,
                     message: error.message,
                 });
-                return Ok(());
+                return Ok(false);
             }
             Err(error) => return Err(error),
         };
-        let extraction = content::extract_text_show_with_xobjects(&stream, 0, &self.parsed.limits)?;
+        let extraction = match content::extract_text_show_part(
+            &stream,
+            0,
+            part_index,
+            content_state,
+            &self.parsed.limits,
+            &mut state.budget,
+        ) {
+            Ok(extraction) => extraction,
+            Err(error) if error.code == PdfErrorCode::UnsupportedFeature => {
+                warnings.push(TextExtractionWarning {
+                    page_index,
+                    object_number: reference.number,
+                    generation: reference.generation,
+                    code: error.code,
+                    message: error.message,
+                });
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
         for event in extraction.events {
             match event {
                 content::TextShowEvent::Text(item) => {
+                    let origin = state.parts.get(item.part_index).ok_or_else(|| {
+                        PdfError::verification("text token part provenance is missing")
+                    })?;
+                    let reference = origin.reference;
+                    let origin_object = self.parsed.object(reference)?;
+                    let encoded = origin_object.stream.as_ref().ok_or_else(|| {
+                        PdfError::verification("text token origin is not a stream")
+                    })?;
+                    let filtered = dict_get(&origin_object.value, b"Filter").is_some();
+                    let font_resources = match item.font_part_index {
+                        Some(index) => {
+                            state
+                                .parts
+                                .get(index)
+                                .ok_or_else(|| {
+                                    PdfError::verification(
+                                        "text font context provenance is missing",
+                                    )
+                                })?
+                                .resources
+                        }
+                        None if item.font.is_none() => None,
+                        None => {
+                            return Err(PdfError::verification(
+                                "active font has no defining resource context",
+                            ));
+                        }
+                    };
                     let (text, to_unicode) = self.decode_text_item(
-                        resources,
+                        font_resources,
                         item.font.as_deref(),
                         &item.raw,
                         &mut state.budget,
                         &mut state.cmap_cache,
                     )?;
-                    let source_span = if filtered {
-                        None
-                    } else {
-                        Some(shift_span(item.decoded_span, object.stream_offset)?)
+                    // A staged replacement or imported foreign payload has no
+                    // byte range in this document's original input. Numeric
+                    // parser offsets alone do not establish exact provenance.
+                    let source_span = match encoded.source_span() {
+                        Some(range) if !filtered && range.source() == self.source_id() => {
+                            let start = usize::try_from(range.span().start()).map_err(|_| {
+                                PdfError::limit("stream source offset exceeds usize")
+                            })?;
+                            Some(shift_span(item.decoded_span, start)?)
+                        }
+                        _ => None,
                     };
                     let font_name = item.font.as_deref().map(font_name).transpose()?;
                     let operator = String::from_utf8(item.operator)
@@ -404,10 +585,14 @@ impl PdfDocument {
                     let geometry = item
                         .geometry
                         .ok_or_else(|| PdfError::verification("text user matrix is missing"))?;
-                    let user_matrix = multiply_affine(parent_matrix, geometry.user_matrix);
+                    let user_matrix = multiply_affine(parent_matrix, geometry.user_matrix)?;
                     let combined = geometry
                         .text_matrix
-                        .map(|matrix| multiply_affine(user_matrix, matrix));
+                        .map(|matrix| multiply_affine(user_matrix, matrix))
+                        .transpose()?;
+                    let origin = combined
+                        .map(|matrix| raised_origin(matrix, geometry.text_rise))
+                        .transpose()?;
                     spans.push(TextSpan {
                         page_index,
                         text,
@@ -421,7 +606,7 @@ impl PdfDocument {
                         geometry: TextGeometry {
                             user_matrix,
                             text_matrix: geometry.text_matrix,
-                            origin: combined.map(|matrix| [matrix[4], matrix[5]]),
+                            origin,
                             font_size: geometry.font_size,
                             confidence: if combined.is_some() {
                                 TextGeometryConfidence::ExactOrigin
@@ -446,26 +631,30 @@ impl PdfDocument {
                     let form = self.parsed.object(form_reference)?;
                     let form_resources = self.form_resources(&form.value, resources)?;
                     let form_parent = multiply_affine(
-                        multiply_affine(parent_matrix, invocation.user_matrix),
+                        multiply_affine(parent_matrix, invocation.user_matrix)?,
                         self.form_matrix(&form.value)?,
-                    );
+                    )?;
+                    let mut form_state = content::ContentTextState::for_form(&invocation);
                     let result = self.extract_text_stream(
                         page_index,
                         form_reference,
                         form_resources,
                         form_parent,
                         depth + 1,
+                        &mut form_state,
                         active_forms,
                         state,
                         spans,
                         warnings,
                     );
                     active_forms.remove(&form_reference);
-                    result?;
+                    if result? {
+                        form_state.finish()?;
+                    }
                 }
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     fn form_xobject_reference(
@@ -526,6 +715,12 @@ impl PdfDocument {
             return Ok(inherited);
         };
         let resources = self.resolve_value(resources)?;
+        // PDF 32000-1:2008 7.3.9: a null dictionary value is equivalent
+        // to an absent entry. Preserve this method's existing absent-resource fallback.
+        if matches!(resources, Value::Null) {
+            return Ok(inherited);
+        }
+
         if !matches!(resources, Value::Dict(_)) {
             return Err(PdfError::syntax(
                 "Form XObject /Resources is not a dictionary",
@@ -585,16 +780,32 @@ impl PdfDocument {
                     })?;
                     let decoded =
                         parser::decode_stream(&object.value, stream, &self.parsed.limits, budget)?;
-                    let cmap = crate::cmap::ToUnicodeCMap::parse(&decoded, &self.parsed.limits)?;
+                    let cmap = crate::cmap::ToUnicodeCMap::parse_with_budget(
+                        &decoded,
+                        &self.parsed.limits,
+                        budget,
+                    )?;
                     entry.insert(FontDecoder::new(cmap))
                 }
             };
-            return Ok((decoder.decode(encoded)?, true));
+            return Ok((
+                decoder.decode_bounded(encoded, &self.parsed.limits, budget)?,
+                true,
+            ));
         }
+        if encoded.len() > self.parsed.limits.max_token_bytes {
+            return Err(PdfError::limit("decoded text exceeds max_token_bytes"));
+        }
+        budget.charge_work(encoded.len())?;
         let text = std::str::from_utf8(encoded).map_err(|_| {
             PdfError::unsupported("font has no ToUnicode CMap and text bytes are not UTF-8")
         })?;
-        Ok((text.to_owned(), false))
+        let mut owned = String::new();
+        owned
+            .try_reserve_exact(text.len())
+            .map_err(|_| PdfError::limit("decoded text allocation failed"))?;
+        owned.push_str(text);
+        Ok((owned, false))
     }
 
     fn to_unicode_ref(
@@ -706,7 +917,10 @@ impl PdfDocument {
         Ok(())
     }
 
-    fn page_content_refs(&self, page_ref: ObjectRef) -> Result<Vec<ObjectRef>, PdfError> {
+    pub(crate) fn page_content_refs(
+        &self,
+        page_ref: ObjectRef,
+    ) -> Result<Vec<ObjectRef>, PdfError> {
         let mut refs = Vec::new();
         let page = self.parsed.object(page_ref)?;
         match dict_get(&page.value, b"Contents") {
@@ -743,7 +957,27 @@ impl PdfDocument {
             .transpose()
     }
 
-    fn inherited_resources(&self, page_ref: ObjectRef) -> Result<Option<&Value>, PdfError> {
+    fn direct_page_box(
+        &self,
+        page_ref: ObjectRef,
+        key: &[u8],
+        label: &str,
+    ) -> Result<Option<[f64; 4]>, PdfError> {
+        let page = self.parsed.object(page_ref)?;
+        let Some(value) = dict_get(&page.value, key) else {
+            return Ok(None);
+        };
+        let value = self.resolve_value(value)?;
+        if matches!(value, Value::Null) {
+            return Ok(None);
+        }
+        crate::pages::page_rectangle(self, Some(value), label).map(Some)
+    }
+
+    pub(crate) fn inherited_resources(
+        &self,
+        page_ref: ObjectRef,
+    ) -> Result<Option<&Value>, PdfError> {
         self.inherited_page_value(page_ref, b"Resources")
     }
 
@@ -760,7 +994,10 @@ impl PdfDocument {
             }
             let object = self.parsed.object(current)?;
             if let Some(value) = dict_get(&object.value, key) {
-                return self.resolve_value(value).map(Some);
+                let value = self.resolve_value(value)?;
+                if !matches!(value, Value::Null) {
+                    return Ok(Some(value));
+                }
             }
             match dict_ref(&object.value, b"Parent") {
                 Some(parent) => current = parent,
@@ -770,7 +1007,7 @@ impl PdfDocument {
         Err(PdfError::limit("page inheritance depth exceeds limit"))
     }
 
-    fn resolve_value<'a>(&'a self, mut value: &'a Value) -> Result<&'a Value, PdfError> {
+    pub(crate) fn resolve_value<'a>(&'a self, mut value: &'a Value) -> Result<&'a Value, PdfError> {
         let mut visited = BTreeSet::new();
         for _ in 0..=self.parsed.limits.max_parser_depth {
             match value {
@@ -790,8 +1027,25 @@ impl PdfDocument {
         self.bytes.len()
     }
 
-    pub(crate) fn source(&self) -> &[u8] {
+    /// Identity of the immutable input bytes; inspection does not change it.
+    pub fn source_id(&self) -> SourceId {
+        self.bytes.id()
+    }
+
+    /// Qualifies an exact input range. Decoded content offsets are not source ranges.
+    pub fn source_span(&self, span: Span) -> Result<SourceSpan, PdfError> {
+        self.bytes
+            .qualified_span(span)
+            .map_err(|error| PdfError::unsafe_rewrite(error.to_string()))
+    }
+
+    /// Read-only input storage, shared by document clones.
+    pub fn input_source(&self) -> &Source {
         &self.bytes
+    }
+
+    pub(crate) fn source(&self) -> &[u8] {
+        self.bytes.as_bytes()
     }
 
     pub(crate) fn engine_config(&self) -> &EngineConfig {
@@ -812,15 +1066,33 @@ fn shift_span(span: Span, base: usize) -> Result<Span, PdfError> {
         .map_err(|_| PdfError::limit("content source span is invalid"))
 }
 
-fn multiply_affine(left: [f64; 6], right: [f64; 6]) -> [f64; 6] {
-    [
+fn multiply_affine(left: [f64; 6], right: [f64; 6]) -> Result<[f64; 6], PdfError> {
+    let result = [
         left[0] * right[0] + left[2] * right[1],
         left[1] * right[0] + left[3] * right[1],
         left[0] * right[2] + left[2] * right[3],
         left[1] * right[2] + left[3] * right[3],
         left[0] * right[4] + left[2] * right[5] + left[4],
         left[1] * right[4] + left[3] * right[5] + left[5],
-    ]
+    ];
+    if result.iter().all(|value| value.is_finite()) {
+        Ok(result)
+    } else {
+        Err(PdfError::syntax(
+            "composed text/Form matrix is not finite",
+            0,
+        ))
+    }
+}
+
+fn raised_origin(matrix: [f64; 6], rise: f64) -> Result<[f64; 2], PdfError> {
+    // Text rise acts on the vertical coordinate in unscaled text space, before Tm/CTM.
+    let origin = [matrix[2] * rise + matrix[4], matrix[3] * rise + matrix[5]];
+    if origin.iter().all(|value| value.is_finite()) {
+        Ok(origin)
+    } else {
+        Err(PdfError::syntax("text origin with rise is not finite", 0))
+    }
 }
 
 fn font_name(value: &[u8]) -> Result<String, PdfError> {

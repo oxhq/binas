@@ -799,6 +799,64 @@ fn reads_recursive_page_label_number_trees() {
 }
 
 #[test]
+fn reads_pdf_alphabetic_label_boundaries_as_repeated_letters() {
+    // ISO 32000-1 Table 159: the next 26 labels after A..Z are AA..ZZ.
+    for (style, expected) in [("A", ["Z", "AA", "BB"]), ("a", ["z", "aa", "bb"])] {
+        let document = open(&classic(&[
+            format!("<< /Type /Catalog /Pages 2 0 R /PageLabels << /Nums [0 << /S /{style} /St 26 >>] >> >>").into_bytes(),
+            b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R >>".to_vec(),
+        ]));
+        assert_eq!(
+            read_page_labels(&document)
+                .unwrap()
+                .iter()
+                .map(|label| label.label.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn label_reader_treats_null_dictionary_values_as_absent() {
+    for (tree, expected) in [
+        ("null", "1"),
+        (
+            "<< /Nums [0 << /S null /P null /St null >>] /Kids null /Limits null >>",
+            "",
+        ),
+        ("<< /Nums null /Kids null /Limits null >>", "1"),
+    ] {
+        let document = open(&classic(&[
+            format!("<< /Type /Catalog /Pages 2 0 R /PageLabels {tree} >>").into_bytes(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R >>".to_vec(),
+        ]));
+        assert_eq!(read_page_labels(&document).unwrap()[0].label, expected);
+    }
+}
+
+#[test]
+fn huge_alphabetic_and_roman_labels_fail_before_render_allocation() {
+    for style in ["A", "a", "R", "r", "D"] {
+        let document = open(&classic(&[
+            format!("<< /Type /Catalog /Pages 2 0 R /PageLabels << /Nums [0 << /S /{style} /St 9223372036854775807 >>] >> >>").into_bytes(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R >>".to_vec(),
+        ]));
+        let labels = read_page_labels(&document);
+        if style == "D" {
+            assert_eq!(labels.unwrap()[0].label, "9223372036854775807");
+        } else {
+            assert_eq!(labels.unwrap_err().code, PdfErrorCode::ResourceLimit);
+        }
+    }
+}
+
+#[test]
 fn updates_and_removes_flat_page_label_specs() {
     let source = classic(&[
         b"<< /Type /Catalog /Pages 2 0 R /PageLabels 6 0 R /CatalogCustom (keep) >>".to_vec(),

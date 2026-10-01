@@ -1,6 +1,5 @@
 use binas_core::Span;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::{
     OpenOptions, PdfDocument, PdfEngine, PdfError, SurgicalTextEditRequest, edit::encode_same_span,
@@ -105,7 +104,7 @@ impl PdfDocument {
         Ok(BatchTextEditPlan {
             edits,
             source_bytes: self.source_len(),
-            source_sha256: hex(&Sha256::digest(self.source())),
+            source_sha256: hex(self.source_id().digest()),
         })
     }
 
@@ -115,7 +114,7 @@ impl PdfDocument {
     ) -> Result<BatchTextEditOutcome, PdfError> {
         refuse_security_boundaries(self.parsed())?;
         if plan.source_bytes != self.source_len()
-            || plan.source_sha256 != hex(&Sha256::digest(self.source()))
+            || plan.source_sha256 != hex(self.source_id().digest())
             || plan.edits.is_empty()
             || plan.edits.len() > self.engine_config().limits.max_container_items
         {

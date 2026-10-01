@@ -122,7 +122,7 @@ pub struct XfaDatasetMutationOutcome {
 struct PacketData {
     label: String,
     reference: ObjectRef,
-    bytes: Vec<u8>,
+    bytes: crate::decode_cache::DecodedPayload,
 }
 
 struct DatasetPacket {
@@ -444,7 +444,7 @@ impl PdfDocument {
                     .map_err(|_| PdfError::limit("XFA stream length exceeds i64"))?,
             ),
         );
-        object.stream = Some(encoded);
+        object.stream = Some(encoded.into());
         let canonical = self.with_parsed(parsed).canonicalize()?;
         let reopened = crate::PdfEngine::new(self.engine_config().clone())
             .open(&canonical.bytes, crate::OpenOptions::default())?;
@@ -737,7 +737,7 @@ fn rewrite_xfa_packet(
                 .map_err(|_| PdfError::limit("XFA stream length exceeds i64"))?,
         ),
     );
-    object.stream = Some(encoded);
+    object.stream = Some(encoded.into());
     let canonical = document.with_parsed(parsed).canonicalize()?;
     let reopened = crate::PdfEngine::new(document.engine_config().clone())
         .open(&canonical.bytes, crate::OpenOptions::default())
@@ -1317,7 +1317,7 @@ fn packet_data(document: &PdfDocument) -> Result<Vec<PacketData>, PdfError> {
     let Some(xfa) = acroform.get(b"XFA".as_slice()) else {
         return Ok(Vec::new());
     };
-    let mut budget = ParseBudget::default();
+    let mut budget = ParseBudget::for_document(parsed);
     match xfa {
         Value::Ref(reference) => Ok(vec![read_packet(document, *reference, "xfa", &mut budget)?]),
         Value::Array(values) if values.len() % 2 == 0 => values

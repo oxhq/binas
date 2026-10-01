@@ -10,7 +10,7 @@ use crate::{
     error::{PdfError, PdfErrorCode},
     forms::{AppearanceStatus, list_form_fields, refuse_unsafe_interactive_edit},
     limits::OpenOptions,
-    parser::{ObjectRef, ParsedDocument, Value},
+    parser::{ObjectRef, ParseBudget, ParsedDocument, Value},
     writer::{append_object_revisions, next_object_reference},
 };
 
@@ -260,6 +260,7 @@ impl PdfDocument {
                 rewritten_appearance.stream.as_deref().unwrap_or_default(),
                 0,
                 &rewritten.parsed().limits,
+                &mut ParseBudget::for_document(rewritten.parsed()),
             )?
             .iter()
             .any(|item| {
@@ -894,6 +895,7 @@ fn appearance_text_matches(
             object.stream.as_deref().unwrap_or_default(),
             0,
             &document.parsed().limits,
+            &mut ParseBudget::for_document(document.parsed()),
         )?
         .iter()
         .any(|item| item.text == text && item.font.as_deref() == Some(font_name)))

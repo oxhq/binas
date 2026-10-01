@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "fixtures": [
+    {
+      "path": "metadata.pdf",
+      "sha256": "6c42a04294c5f558a7e0e8ec9dd7e2151006c42f887226bcb5816b820280f25c",
+      "origin": "original_generated",
+      "license": "Apache-2.0",
+      "mandatory": true,
+      "expected_effect": "refuse_unrequested_loss",
+      "catalog_entries": [
+        "Metadata"
+      ],
+      "trailer_entries": [
+        "Info"
+      ]
+    },
+    {
+      "path": "outlines.pdf",
+      "sha256": "2f7c0211b8c5e2dd1245cfe1959ea181133eaec31086ce66759955dbf90342aa",
+      "origin": "original_generated",
+      "license": "Apache-2.0",
+      "mandatory": true,
+      "expected_effect": "refuse_unrequested_loss",
+      "catalog_entries": [
+        "Outlines"
+      ],
+      "trailer_entries": []
+    },
+    {
+      "path": "names.pdf",
+      "sha256": "0ea12d5819e860e616765b5c402a74646e437ed936605f3fd399eb3f21984350",
+      "origin": "original_generated",
+      "license": "Apache-2.0",
+      "mandatory": true,
+      "expected_effect": "refuse_unrequested_loss",
+      "catalog_entries": [
+        "Names"
+      ],
+      "trailer_entries": []
+    },
+    {
+      "path": "labels.pdf",
+      "sha256": "b66a8451b85dc5a759ced69d4f5f08a8792aa904e49cfe26ae6706916acf1ddc",
+      "origin": "original_generated",
+      "license": "Apache-2.0",
+      "mandatory": true,
+      "expected_effect": "refuse_unrequested_loss",
+      "catalog_entries": [
+        "PageLabels"
+      ],
+      "trailer_entries": []
+    },
+    {
+      "path": "unicode-alt-tags.pdf",
+      "sha256": "e81dfd2ee8d6c2c25a61b5cf194f4d3203acb12cb3698579e324ef06e639473a",
+      "origin": "original_generated",
+      "license": "Apache-2.0",
+      "mandatory": true,
+      "expected_effect": "refuse_unrequested_loss",
+      "catalog_entries": [
+        "StructTreeRoot",
+        "MarkInfo"
+      ],
+      "trailer_entries": []
+    },
+    {
+      "path": "type3-shared.pdf",
+      "sha256": "42370c67047e1878374c8e81a3c5418c3000515fcdf5bd9e80cc9435ab292445",
+      "origin": "original_generated",
+      "license": "Apache-2.0",
+      "mandatory": true,
+      "expected_effect": "extract_reversed_pages_preserves_text_and_glyph_stream",
+      "catalog_entries": [],
+      "trailer_entries": []
+    },
+    {
+      "path": "type3-separate.pdf",
+      "sha256": "12f26ccd42875d258450a9b69ba80146fa70c25f175af68819d41549bc16aafe",
+      "origin": "original_generated",
+      "license": "Apache-2.0",
+      "mandatory": true,
+      "expected_effect": "extract_reversed_pages_preserves_text_and_glyph_stream",
+      "catalog_entries": [],
+      "trailer_entries": []
+    }
+  ]
+}

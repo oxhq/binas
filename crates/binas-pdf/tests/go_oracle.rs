@@ -29,6 +29,17 @@ struct Vector {
     known_difference: Option<String>,
     #[serde(default)]
     go_parse_error: bool,
+    #[serde(default)]
+    query_differences: Vec<QueryDifference>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueryDifference {
+    query: String,
+    rust_error: String,
+    go_count: usize,
+    reason: String,
 }
 
 #[derive(Deserialize)]
@@ -67,6 +78,35 @@ fn matches_the_frozen_go_oracle_for_the_redistributable_corpus() {
     let engine = PdfEngine::default();
 
     for vector in manifest.vectors {
+        let mut difference_queries = BTreeSet::new();
+        for difference in &vector.query_differences {
+            assert!(
+                difference_queries.insert(difference.query.as_str()),
+                "duplicate query difference in {}",
+                vector.file
+            );
+            assert!(
+                vector.queries.contains(&difference.query),
+                "unexecuted query difference in {}",
+                vector.file
+            );
+            assert!(
+                !difference.reason.trim().is_empty(),
+                "query difference must explain semantics"
+            );
+            assert_eq!(
+                difference.rust_error, "unsupported_feature",
+                "only explicit unsupported-query differences are registered"
+            );
+            assert!(
+                vector.expected_error.is_none(),
+                "query differences cannot hide behind open failures"
+            );
+            assert!(
+                oracle.is_some(),
+                "named query difference requires execution of the frozen Go oracle"
+            );
+        }
         let path = fixture_root.join(&vector.file);
         let bytes = fs::read(&path).unwrap();
         if let Some(expected) = vector.expected_error {
@@ -122,7 +162,22 @@ fn matches_the_frozen_go_oracle_for_the_redistributable_corpus() {
             );
         }
         for query in vector.queries {
-            let rust_count = document.query_text_all(&query).unwrap().len();
+            let difference = vector
+                .query_differences
+                .iter()
+                .find(|difference| difference.query == query);
+            let rust = document.query_text_all(&query);
+            let rust_count = if let Some(difference) = difference {
+                assert_eq!(
+                    rust.unwrap_err().code.as_str(),
+                    difference.rust_error,
+                    "Rust named query difference: {}",
+                    vector.file
+                );
+                None
+            } else {
+                Some(rust.unwrap().len())
+            };
             if let Some(oracle) = &oracle {
                 let go = go_json(
                     oracle,
@@ -140,7 +195,10 @@ fn matches_the_frozen_go_oracle_for_the_redistributable_corpus() {
                     ],
                 );
                 assert_eq!(
-                    rust_count,
+                    difference
+                        .map(|difference| difference.go_count)
+                        .or(rust_count)
+                        .unwrap(),
                     go["count"].as_u64().unwrap() as usize,
                     "query parity for {} in {}",
                     query,

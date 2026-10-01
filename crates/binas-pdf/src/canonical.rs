@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -7,11 +5,8 @@ use crate::{
     document::{PdfDocument, PdfEngine},
     error::PdfError,
     limits::OpenOptions,
-    parser::Value,
-    writer::{
-        Output, dict_get, dict_integer, refuse_security_boundaries, require_classic_offset,
-        write_name, write_object, write_value,
-    },
+    parser::{ParseBudget, Value},
+    writer::{dict_get, refuse_security_boundaries, write_compact_document},
 };
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -45,71 +40,7 @@ impl PdfDocument {
         refuse_security_boundaries(self.parsed())?;
         let old_pages = self.page_count()?;
         let old_text = text_query_semantics(self)?;
-        let mut output = Output::new(self.engine_config().limits.max_output_bytes);
-        output.push(b"%PDF-")?;
-        output.push(self.parsed().version.as_bytes())?;
-        output.push(b"\n%\xE2\xE3\xCF\xD3\n")?;
-
-        let mut offsets = BTreeMap::new();
-        for (reference, object) in &self.parsed().objects {
-            if offsets.contains_key(&reference.number) {
-                return Err(PdfError::unsafe_rewrite(
-                    "canonical output cannot represent multiple live generations of one object",
-                ));
-            }
-            let offset = output.len();
-            require_classic_offset(offset)?;
-            offsets.insert(reference.number, (offset, reference.generation));
-            output.formatted(format_args!(
-                "{} {} obj\n",
-                reference.number, reference.generation
-            ))?;
-            write_object(&mut output, object, self.parsed().limits.max_parser_depth)?;
-            output.push(b"\nendobj\n")?;
-        }
-
-        let max_object = offsets.keys().next_back().copied().unwrap_or(0);
-        let graph_size = usize::try_from(max_object)
-            .ok()
-            .and_then(|number| number.checked_add(1))
-            .ok_or_else(|| PdfError::limit("canonical xref size overflows"))?;
-        let trailer_size = dict_integer(&self.parsed().trailer, b"Size")
-            .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or(0);
-        let size = graph_size.max(trailer_size).max(1);
-        if size > self.engine_config().limits.max_xref_entries {
-            return Err(PdfError::limit(
-                "canonical xref size exceeds max_xref_entries",
-            ));
-        }
-
-        let xref_offset = output.len();
-        require_classic_offset(xref_offset)?;
-        output.formatted(format_args!("xref\n0 {size}\n"))?;
-        output.push(b"0000000000 65535 f \n")?;
-        for number in 1..size {
-            match u32::try_from(number)
-                .ok()
-                .and_then(|number| offsets.get(&number))
-            {
-                Some((offset, generation)) => {
-                    output.formatted(format_args!("{offset:010} {generation:05} n \n"))?
-                }
-                None => output.push(b"0000000000 00000 f \n")?,
-            }
-        }
-        output.push(b"trailer\n<<")?;
-        output.formatted(format_args!(" /Size {size}"))?;
-        for key in [b"Root".as_slice(), b"Info".as_slice(), b"ID".as_slice()] {
-            if let Some(value) = dict_get(&self.parsed().trailer, key) {
-                output.push(b" ")?;
-                write_name(&mut output, key)?;
-                output.push(b" ")?;
-                write_value(&mut output, value, 0, self.parsed().limits.max_parser_depth)?;
-            }
-        }
-        output.formatted(format_args!(">>\nstartxref\n{xref_offset}\n%%EOF\n"))?;
-        let bytes = output.into_bytes();
+        let (bytes, xref_offset) = write_compact_document(self, None)?;
 
         let rewritten = PdfEngine::new(self.engine_config().clone())
             .open(&bytes, OpenOptions::default())
@@ -142,7 +73,7 @@ impl PdfDocument {
                 mode: "canonical".into(),
                 input_bytes: self.source_len(),
                 output_bytes: bytes.len(),
-                object_count: offsets.len(),
+                object_count: self.parsed().objects.len(),
                 xref_offset,
             },
             bytes,
@@ -151,47 +82,79 @@ impl PdfDocument {
     }
 }
 
-type TextSemantics = Vec<(u32, u16, String)>;
+// Include page and physical operand identity; an operator can occur in a later
+// Contents part without moving the string it consumes into that other object.
+type TextSemantics = Vec<(usize, u32, u16, String)>;
 
 fn text_query_semantics(document: &PdfDocument) -> Result<Option<TextSemantics>, PdfError> {
-    let mut references = Vec::new();
-    for page_ref in document.page_refs()? {
+    let mut semantics = Vec::new();
+    let mut budget = ParseBudget::for_document(document.parsed());
+    let mut available = true;
+    for (page_index, page_ref) in document.page_refs()?.into_iter().enumerate() {
+        budget.charge_work(0)?;
         let page = document.parsed().object(page_ref)?;
-        match dict_get(&page.value, b"Contents") {
-            None => {}
-            Some(Value::Ref(reference)) => references.push(*reference),
-            Some(Value::Array(values)) => {
-                for value in values {
+        let references = match dict_get(&page.value, b"Contents") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Ref(reference)) => vec![*reference],
+            Some(Value::Array(values)) => values
+                .iter()
+                .map(|value| {
                     let Value::Ref(reference) = value else {
                         return Err(PdfError::syntax(
                             "page /Contents array contains a non-reference",
                             page.offset,
                         ));
                     };
-                    references.push(*reference);
-                }
-            }
+                    Ok(*reference)
+                })
+                .collect::<Result<Vec<_>, PdfError>>()?,
             Some(_) => {
                 return Err(PdfError::unsupported(
                     "direct page content streams are not implemented",
                 ));
             }
+        };
+        let mut filtered = false;
+        for reference in &references {
+            let object = document.parsed().object(*reference)?;
+            if object.stream.is_none() {
+                return Err(PdfError::syntax(
+                    "page content reference is not a stream",
+                    object.offset,
+                ));
+            }
+            filtered |= dict_get(&object.value, b"Filter")
+                .is_some_and(|filter| !matches!(filter, Value::Null));
         }
+        if filtered {
+            // Preserve the legacy explicit unavailable result for filtered text.
+            // Never parse later unfiltered parts with a fabricated initial state.
+            // Other complete pages are still checked; unsupported graphics-state
+            // interpretation there must not be hidden by this unavailable page.
+            available = false;
+            continue;
+        }
+        let mut state = content::ContentTextState::new();
+        for (part_index, reference) in references.iter().enumerate() {
+            let object = document.parsed().object(*reference)?;
+            let extraction = content::extract_text_show_part(
+                object.stream.as_deref().expect("stream checked above"),
+                0,
+                part_index,
+                &mut state,
+                &document.parsed().limits,
+                &mut budget,
+            )?;
+            for event in extraction.events {
+                if let content::TextShowEvent::Text(item) = event {
+                    let origin = references.get(item.part_index).ok_or_else(|| {
+                        PdfError::verification("canonical text operand provenance is missing")
+                    })?;
+                    semantics.push((page_index, origin.number, origin.generation, item.text));
+                }
+            }
+        }
+        state.finish()?;
     }
-    let mut semantics = Vec::new();
-    for reference in references {
-        let object = document.parsed().object(reference)?;
-        if dict_get(&object.value, b"Filter").is_some() {
-            return Ok(None);
-        }
-        let stream = object.stream.as_deref().ok_or_else(|| {
-            PdfError::syntax("page content reference is not a stream", object.offset)
-        })?;
-        for item in
-            content::extract_text_show(stream, object.stream_offset, &document.parsed().limits)?
-        {
-            semantics.push((reference.number, reference.generation, item.text));
-        }
-    }
-    Ok(Some(semantics))
+    Ok(available.then_some(semantics))
 }
