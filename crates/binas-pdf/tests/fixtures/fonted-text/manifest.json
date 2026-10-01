@@ -1,0 +1,111 @@
+{
+  "license": "Apache-2.0",
+  "provenance": "Original local generator; fixed helper sources reused from frozen P3a; no downloaded corpus",
+  "target_object": [
+    4,
+    0
+  ],
+  "shared_font_object": [
+    8,
+    0
+  ],
+  "shared_resources_object": [
+    7,
+    0
+  ],
+  "ToUnicode_object": [
+    27,
+    0
+  ],
+  "sentinel_object": [
+    28,
+    0
+  ],
+  "replacement": {
+    "page": 0,
+    "match_ordinal": 0,
+    "old": "ALPHA",
+    "new": "OMEGA-LONG",
+    "shared_policy": "Reject"
+  },
+  "predeclared_target_change_region_pdf": [
+    35,
+    143,
+    170,
+    169
+  ],
+  "fixtures": [
+    {
+      "name": "fonted-text-plain.pdf",
+      "sha256": "ca34caa35dae7bab27ad3e0fe83b7b4ee6e7c73265d3a3f938b355f06502356e",
+      "bytes": 5156,
+      "objects": 28,
+      "generation": 0,
+      "trailer_size": 29,
+      "role": "public source fixture or refusal control"
+    },
+    {
+      "name": "fonted-text-plain-golden.pdf",
+      "sha256": "4ff18cc86b519c5277e1a413a5255a8e967c8faf6273cbca0f456b9af2b6f518",
+      "bytes": 5161,
+      "objects": 28,
+      "generation": 0,
+      "trailer_size": 29,
+      "role": "independently generated expected document"
+    },
+    {
+      "name": "fonted-text-flate.pdf",
+      "sha256": "998e786af3759e8bf62de7502746b54bd967c8a3c7f2c2ee0696e04fff7b91aa",
+      "bytes": 5176,
+      "objects": 28,
+      "generation": 0,
+      "trailer_size": 29,
+      "role": "public source fixture or refusal control"
+    },
+    {
+      "name": "fonted-text-flate-golden.pdf",
+      "sha256": "93de304d41bbc23a3389abb06d14ce31dfe0962780efde418891f81ef9a1186c",
+      "bytes": 5181,
+      "objects": 28,
+      "generation": 0,
+      "trailer_size": 29,
+      "role": "independently generated expected document"
+    },
+    {
+      "name": "fonted-text-missing-cmap.pdf",
+      "sha256": "0ffe59c653f3d54f2b98be29746907ea535989f54f6af70e0598f37ae9c599ab",
+      "bytes": 5138,
+      "objects": 28,
+      "generation": 0,
+      "trailer_size": 29,
+      "role": "public source fixture or refusal control"
+    },
+    {
+      "name": "fonted-text-missing-replacement.pdf",
+      "sha256": "5e99d2ad792c5d977ecd5d60e1e589385dcdbec7c644f23e16c7c20b40803e05",
+      "bytes": 5144,
+      "objects": 28,
+      "generation": 0,
+      "trailer_size": 29,
+      "role": "public source fixture or refusal control"
+    },
+    {
+      "name": "fonted-text-ambiguous-cmap.pdf",
+      "sha256": "48b02c2d32d0a111271e36b379d38c3e32da4518170b5db32f82aac8a06a2e21",
+      "bytes": 5156,
+      "objects": 28,
+      "generation": 0,
+      "trailer_size": 29,
+      "role": "public source fixture or refusal control"
+    },
+    {
+      "name": "fonted-text-shared-contents.pdf",
+      "sha256": "f335d4fa77a1dd4cf14841b2881d9f6c9d683f83ebbc6e11e84ddfb792489f2c",
+      "bytes": 5156,
+      "objects": 28,
+      "generation": 0,
+      "trailer_size": 29,
+      "role": "public source fixture or refusal control"
+    }
+  ]
+}
