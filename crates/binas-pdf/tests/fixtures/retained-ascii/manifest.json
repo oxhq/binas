@@ -1,0 +1,122 @@
+{
+  "license": "Apache-2.0",
+  "provenance": "Original local fixture generator oracle.py; no downloaded corpus",
+  "fixtures": [
+    {
+      "name": "retained-ascii-plain.pdf",
+      "sha256": "78389e2d011197adb76401cb3efe4037f3c66fb55d78f3e3b313a3f8256820f9",
+      "bytes": 4048,
+      "objects": 27,
+      "target_object": [
+        4,
+        0
+      ],
+      "target_match_ordinal": 0,
+      "signature_note": null
+    },
+    {
+      "name": "fonted-refusal.pdf",
+      "sha256": "f74893c1e4b156e0cfa3618a62ccc85d8d004dd2debb70b997405629878f9488",
+      "bytes": 4059,
+      "objects": 27,
+      "target_object": [
+        4,
+        0
+      ],
+      "target_match_ordinal": 0,
+      "signature_note": null
+    },
+    {
+      "name": "shared-owner.pdf",
+      "sha256": "26a4b190e0cdfff8d978f5352e75b07d85c404b5fc824f46dc081b6d915e0faf",
+      "bytes": 4047,
+      "objects": 27,
+      "target_object": [
+        4,
+        0
+      ],
+      "target_match_ordinal": 0,
+      "signature_note": null
+    },
+    {
+      "name": "signature-marker.pdf",
+      "sha256": "d4a4f1ed3fa9e7eadf20408e1fd255489097ff09b5df61cb9014b1f500b37804",
+      "bytes": 4192,
+      "objects": 28,
+      "target_object": [
+        4,
+        0
+      ],
+      "target_match_ordinal": 0,
+      "signature_note": "syntactic refusal marker only, not a genuine signed PDF"
+    },
+    {
+      "name": "repeated-owner.pdf",
+      "sha256": "f63e487ca6e3d5e28dc5b13a8ea2b5f888c7df2853501044814197fbcbf4956c",
+      "bytes": 4056,
+      "objects": 27,
+      "target_object": [
+        4,
+        0
+      ],
+      "target_match_ordinal": 0,
+      "signature_note": null
+    },
+    {
+      "name": "foreign-owner.pdf",
+      "sha256": "0c61628217eeb482b5f1d9d6e0f16a2848a944bec96f9ca0dedf6e8d7432615f",
+      "bytes": 4117,
+      "objects": 28,
+      "target_object": [
+        4,
+        0
+      ],
+      "target_match_ordinal": 0,
+      "signature_note": null
+    },
+    {
+      "name": "indirect-length.pdf",
+      "sha256": "b4faeabd2d80f8a1a03df6701e11759d57cefc3f26118ce4aeee4989c157c3e4",
+      "bytes": 4071,
+      "objects": 28,
+      "target_object": [
+        4,
+        0
+      ],
+      "target_match_ordinal": 0,
+      "signature_note": null
+    },
+    {
+      "name": "unsupported-gs.pdf",
+      "sha256": "a74e34efea23125cfb75b44ea04252b1bd41988e3a51f9207eabd252f9f4f0aa",
+      "bytes": 4144,
+      "objects": 28,
+      "target_object": [
+        4,
+        0
+      ],
+      "target_match_ordinal": 0,
+      "signature_note": null
+    },
+    {
+      "name": "retained-ascii-flate.pdf",
+      "sha256": "dc5b69e6a09b162d3862507a9f4728aae64b4efeab596a2062a9cf22890a1c2a",
+      "bytes": 4068,
+      "objects": 27,
+      "target_object": [
+        4,
+        0
+      ],
+      "target_match_ordinal": 0,
+      "signature_note": null
+    },
+    {
+      "name": "encrypted-fonted.pdf",
+      "sha256": "f033e0f16908581fa15aaa0c208e2b223c9b399f0f045818ec223518681b16f5",
+      "bytes": 4381,
+      "provenance": "pypdf 6.10.0 clone/encrypt of original fonted-refusal.pdf",
+      "encryption": "RC4-40 actual encryption, explicit open refusal control",
+      "target_object": null
+    }
+  ]
+}
