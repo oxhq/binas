@@ -348,6 +348,23 @@ impl PdfRevision {
     pub fn annotations(&self) -> Result<Vec<Annotation>, PdfError> {
         list_annotations(self.state.value())
     }
+    /// Extract a committed page with the caller's cancellation token. One coarse
+    /// admission unit is charged; PDF decode limits remain separate accounting.
+    /// Source spans retain their original provenance after staged stream changes.
+    pub fn extract_page_text_spans(
+        &self,
+        page_index: usize,
+        context: &OperationContext,
+    ) -> Result<crate::TextExtraction, PdfError> {
+        context.charge_work(1).map_err(PdfError::from_context)?;
+        let extraction = self
+            .state
+            .value()
+            .with_cancellation(context.cancellation().clone())
+            .extract_page_text_spans(page_index)?;
+        context.checkpoint().map_err(PdfError::from_context)?;
+        Ok(extraction)
+    }
     /// Stable indirect page identities in the current revision's physical order.
     pub fn page_ids(&self) -> Result<Vec<PdfReferenceTarget>, PdfError> {
         Ok(self

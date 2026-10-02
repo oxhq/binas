@@ -39,6 +39,7 @@ mod public_key_encryption;
 mod reference_index;
 mod resource_usage;
 mod security;
+mod session;
 mod signatures;
 mod signing;
 pub mod standards;
@@ -166,6 +167,7 @@ pub use reference_index::{
 };
 pub use resource_usage::{PdfResourceKind, PdfResourceUsage, PdfResourceUse, PdfUsageGap};
 pub use security::{EncryptionMetadata, inspect_encryption};
+pub use session::{PdfSession, PdfSessionError, PdfSessionPlanHandle};
 pub use signatures::{
     CmsParseStatus, CmsValidation, DigestMatchStatus, RevocationStatus, SignatureCryptoStatus,
     SignatureInspection, SignatureTrustOptions, TimestampInspection, TimestampStatus, TrustStatus,

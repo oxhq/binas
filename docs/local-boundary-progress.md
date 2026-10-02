@@ -1,4 +1,4 @@
-# Local h4x boundary progress: P3 text cohort
+# Local h4x boundary progress: retained text sessions
 
 This is local development evidence for the h4x boundary plan, not the support
 contract of the published `binas-pdf 0.1.1`. Package versions have not changed.
@@ -12,7 +12,7 @@ Release version and support scope must be reviewed before publication.
 | P2b | Narrow raw ASCII text capability negotiation and runtime result acceptance, Incremental/Compact | Font-aware page edits use the existing page-text API; no new negotiated capability |
 | P3a | Independent structural preservation for the admitted plain/Flate raw text cohort; unchanged valid pages render identically | Fontless target appearance explicitly unverified |
 | P3b | Independent font/CMap, exact text and visible golden-edit evidence for one admitted fonted plain/Flate cohort; explicit refusals | Cohort closed locally; no general font, producer, reflow or accessibility guarantee |
-| P4 | Pending | Bounded native/WASM retained sessions, limits, cancellation, disposal and snapshot parity |
+| P4a | Local candidate: bounded raw sessions, ownership/disposal, native and real Chromium Rust parity, public JS exports in Node/Chromium | Cooperative pre-call cancellation; no worker termination/recovery or process peak-memory claim |
 | P5 | Pending | Additional compatibility/producer cases and oracles with licensed provenance |
 | P6 | Pending | Performance, artifact/package contents, version/support review and migration; public crate acceptance in minimal Oxpdf consumer after authorized release |
 | P7 | Outside this scope | Editor/UI expansion |
@@ -46,9 +46,16 @@ tools nor gain a runtime external-oracle guarantee from passing a suite. Increme
 preserves prior source bytes: replacement is not secure deletion. Compact here
 also is not certified secure redaction.
 
-Next bounded package: P4a, native/WASM retained-session contract and artifact
-verification. First inventory existing session APIs and installed target/tooling;
-define ownership, limits, cancellation, stale snapshot and explicit disposal
-behavior, then test the same admitted operations across native and WASM. Missing
-WASM runtime/target is a concrete prerequisite to resolve before claiming parity.
-Keep Oxpdf as a minimal acceptance consumer, without editor features or overrides.
+The bounded session contract is in [pdf-sessions.md](pdf-sessions.md). Its raw
+operation remains the existing P2b capability. The fonted P3b cohort runs through
+the shared Rust revision API in the real browser runtime, without introducing a
+fonted JS capability. Both runtime routes compare to frozen independently checked
+P3 output bytes. Packaging/migration evidence is separate from runtime receipts.
+
+Remaining P4 work is a user-scoped support decision: this synchronous single-thread
+profile can close without promising worker cancellation/recovery or total memory
+control. Implement those only if selected for release support. P5 is one bounded
+producer-diverse held-out text qualification cohort with licensed provenance and
+independent effect/refusal checks. P6 retains measured performance, version/support
+decision, final release artefact review and authorized public installation proof.
+Keep Oxpdf as a minimal acceptance consumer; expand neither editor nor UI.

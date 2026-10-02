@@ -1,3 +1,6 @@
+mod session;
+pub use session::{WasmPdfSession, WasmPdfSessionPlan};
+
 use binas_pdf::{
     EngineConfig, FilteredEditOutcome, FilteredTextEditRequest, FontEditOutcome,
     FontTextEditRequest, IncrementalEditOutcome, IncrementalTextEditRequest, Limits, OpenOptions,
