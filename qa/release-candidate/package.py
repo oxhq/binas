@@ -125,8 +125,8 @@ def main():
     (consumer / 'Cargo.toml').write_text(text)
     run('consumer-lock', [cargo, 'generate-lockfile', '--offline'], consumer)
 
-    def metadata(name, directory):
-        path = run(name, [cargo, 'metadata', '--format-version', '1', '--offline', '--locked'], directory)
+    def metadata(name, directory, overrides=()):
+        path = run(name, [cargo, 'metadata', '--format-version', '1', '--offline', '--locked'] + list(overrides), directory)
         data = json.loads(path.read_text())
         for key in ('binas-core', 'binas-pdf'):
             packages = [p for p in data['packages'] if p['name'] == key]
@@ -145,7 +145,10 @@ def main():
     # The executable is built from the already extracted CLI artifact using
     # artifact-only sibling overrides and its own lock, never from the checkout.
     cli = artifacts['binas-cli']
-    run('cli-artifact-lock', [cargo, 'generate-lockfile', '--offline'] + patch, cli)
+    # Preserve the packaged dependency pins; a fresh generate-lockfile can
+    # select index versions absent from an offline cache. Apply artifact-only
+    # sibling resolution while retaining the archive lock with --locked.
+    metadata('cli-artifact-metadata', cli, patch)
     run('cli-artifact-run', [cargo, 'run', '--offline', '--locked'] + patch +
         ['--', 'inspect', str(out / 'consumer-compact.pdf'), '--json'], cli)
     if args.msrv:
