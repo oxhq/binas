@@ -1,0 +1,75 @@
+{
+  "schema": 1,
+  "license": "Apache-2.0",
+  "origin": "Reuses the original Binas text-field-fill.pdf fixture unchanged; no derivative source PDF generated.",
+  "source_path": "fixtures/text-field-fill.pdf",
+  "source_sha256": "c9852c3613b050cc841f94d40008f1526e8cacfb16df162655e3c74e96d6e587",
+  "source_bytes": 8043,
+  "source_provenance_path": "fixtures/text-field-fill.provenance.json",
+  "source_provenance_sha256": "324f8979a867754d3f5e11ed10d5b816f208520f30df2e554ff4c9fee02cb9ab",
+  "source_generator_sha256": "5007043bf72551adbfc776c8ec27443ff0c32c865fb76e559171394febd4e2c0",
+  "oracle_sha256": "0fb3036cdd3028dd5b772d36858f8cf892ec37529b9dc161606f42dbecd2b873",
+  "python": "3.12.14",
+  "pypdf": "6.10.0",
+  "request": {
+    "page_index": 1,
+    "excluded_targets": {
+      "remap_to_page_index": 0
+    }
+  },
+  "source_page_mapping": [
+    0
+  ],
+  "removed_page_object": 4,
+  "remap_target_page_object": 3,
+  "surviving_name_widgets": [
+    9
+  ],
+  "unregistered_widgets": [
+    10,
+    12,
+    13
+  ],
+  "unregistered_terminal_fields": [
+    12,
+    13
+  ],
+  "expected_stored_objects": 34,
+  "expected_new_objects": 0,
+  "detached_stored_objects": [
+    [
+      4,
+      0
+    ],
+    [
+      6,
+      0
+    ],
+    [
+      10,
+      0
+    ],
+    [
+      12,
+      0
+    ],
+    [
+      13,
+      0
+    ],
+    [
+      15,
+      0
+    ],
+    [
+      16,
+      0
+    ],
+    [
+      17,
+      0
+    ]
+  ],
+  "secure_erasure": false,
+  "assurance": "Source identity/reader check only. In-memory independent self-check and actual Rust export evidence are separate gates. Original detached objects and incremental history remain."
+}

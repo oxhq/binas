@@ -1,0 +1,47 @@
+{
+  "schema": 1,
+  "license": "Apache-2.0",
+  "origin": "Original lossless image predictor fixture and independent pypdf/RGB gate.\n\nExact 8-bit RGB/Gray samples move from raw Flate to PNG Up12 after a required\ntext edit. Shared image uses, inverse Gray Decode, original soft-mask bytes,\nnavigation and opaque assets remain unchanged. This synthetic evidence is not\ngeneral image/codec/color compatibility, compression performance or conformance.",
+  "external_assets": [],
+  "path": "fixtures/lossless-images.pdf",
+  "bytes": 29845,
+  "sha256": "9d281f444d2aacc3293d1e9d5a56843b52e38a14c6f038c0f0f3ca73e41b7340",
+  "generator": "lossless_image_oracle.py --generate-fixture",
+  "generator_sha256": "f8695eb10e0eb4fb484f2a0400fd3dc9b8332292584a8efd68adcb334d469e51",
+  "oracle_sha256": "92a6d275c209f196015f30e5693b52a59dacfe85dfc6ec7738f9ee1acbaf9262",
+  "python": "3.12.14",
+  "pypdf": "6.10.0",
+  "zlib": "1.3.2",
+  "zlib_runtime": "1.3.2",
+  "page_objects": [
+    3,
+    4
+  ],
+  "optimized_images": [
+    7,
+    8
+  ],
+  "unchanged_mask": 9,
+  "nested_shared_use": 10,
+  "tiny_original_winner": 13,
+  "sample_sha256": {
+    "7": "eb627f20b6842f887c6c5b11c695a44f39d12d0caeb7a64d06f1f82c19ac03b0",
+    "8": "b20d8dca94833e6521897507f26cc25288a75b94c72ef5190b278c8dcff7bf29",
+    "9": "0232de52f2b6de71e399a122762e648997d6b25576cdb52e177a3ae12e14b88b",
+    "13": "69e08c4881cf17af30cb905db1bd95fc6ebbf25ec7d2c714d47e31f8ded99901"
+  },
+  "request": {
+    "required_edit": {
+      "page_index": 0,
+      "old_text": "before",
+      "replacement": "after"
+    },
+    "predictor": 12
+  },
+  "assurance": "Frozen original source identity/reader gate; independent self-check and actual engine evidence are separate.",
+  "oracle_revision": {
+    "source_bytes_unchanged": true,
+    "original_generator_sha256_retained": "f8695eb10e0eb4fb484f2a0400fd3dc9b8332292584a8efd68adcb334d469e51",
+    "reason": "Record only two exact optional display-font diagnostics from the pinned Poppler runtime, identical on independent expectation and all candidates; reject other diagnostics. Source generator output remains byte-identical."
+  }
+}

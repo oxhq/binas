@@ -1,0 +1,56 @@
+{
+  "schema": 1,
+  "license": "Apache-2.0",
+  "origin": "Original Binas synthetic checkbox fixture; no external document or artwork assets.",
+  "external_assets": [],
+  "path": "fixtures/checkbox-states.pdf",
+  "bytes": 4849,
+  "sha256": "1da093d21cf609af2e9d52c4de942c51e5dec62fd5d96d6889aaa8ea85419e3a",
+  "generator": "checkbox_oracle.py --generate-fixture",
+  "generator_sha256": "b522f7ce74176b0a1dd559e5802f643008cb7a66698291600b7441a6f75c110d",
+  "python": "3.12.14",
+  "pypdf": "6.10.0",
+  "page_objects": [
+    3,
+    4
+  ],
+  "combined_field_widget": 5,
+  "nested_parent": 6,
+  "terminal_field": 7,
+  "separate_widget": 8,
+  "shared_normal_appearances": {
+    "Off": 11,
+    "Yes": 12
+  },
+  "acroform": 15,
+  "source_states": {
+    "accept": "Off",
+    "preferences.subscribe": "Yes"
+  },
+  "request": {
+    "states": {
+      "accept": "/Yes",
+      "preferences.subscribe": "/Off"
+    },
+    "page_order": [
+      1,
+      0
+    ]
+  },
+  "retained_assets": {
+    "metadata": 16,
+    "outline": 18,
+    "names": 19,
+    "attachment": 21,
+    "link": 23,
+    "labels": 24
+  },
+  "assurance": "Source strict pypdf checks only. Engine outputs and RGB comparisons require a separate successful gate run.",
+  "oracle_sha256": "03bf6ca17c184e25ce56e2728f87ebf270c9ff04897fcebbb5f8f6c1f8388458",
+  "oracle_revision": {
+    "change": "Scope strict-reader warnings by phase; acknowledge the exact pypdf sparse incremental xref warning only after independent raw xref, Prev and object-header proof, with corruption controls.",
+    "fixture_rewritten": false,
+    "current_generator_matches_frozen_bytes": true,
+    "original_generator_sha256_retained": "b522f7ce74176b0a1dd559e5802f643008cb7a66698291600b7441a6f75c110d"
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "license": "Apache-2.0",
+  "origin": "Original Apache-2.0 targeted form flattening fixture and independent gate.\n\nOnly group.answer is flattened, using two existing shared Form appearances with\na nonidentity Matrix, then pages reorder [1,0]. Unselected fields, checkbox and\nlinks remain interactive. Detached objects remain: this is not secure erasure.\nThe gate checks all original objects/encoded streams and all-page RGB144 output;\nit is a synthetic supported case, not general form or standards conformance.",
+  "external_assets": [],
+  "path": "fixtures/targeted-flatten.pdf",
+  "bytes": 6316,
+  "sha256": "7ded976efbf5785121a0f5872cd246a4946ac68a6e8786be7c58249a68208b8c",
+  "generator": "flatten_oracle.py --generate-fixture",
+  "generator_sha256": "0f5fcd52859de89d1665d5b3d6d749e2e1f43f47511602c2d799987710243fe3",
+  "oracle_sha256": "63422a924cfa95c824234c4f47dd45ccdfa8090b2410de1fd0a7340679b17f99",
+  "python": "3.12.14",
+  "pypdf": "6.10.0",
+  "page_objects": [
+    3,
+    4
+  ],
+  "selected_field": 8,
+  "selected_widgets": [
+    9,
+    10
+  ],
+  "shared_appearance": 14,
+  "retained_fields": [
+    11,
+    12
+  ],
+  "retained_link": 13,
+  "inherited_resources": 30,
+  "colliding_resource_name": "BinasFlatten0",
+  "request": {
+    "field": "group.answer",
+    "page_order": [
+      1,
+      0
+    ]
+  },
+  "assurance": "Source strict-reader check only. Independent expected/self-check and actual engine outputs are separate gates.",
+  "oracle_revision": {
+    "fixture_rewritten": false,
+    "current_generator_matches_frozen_bytes": true,
+    "change": "Add source render mapping/text checks and scoped sparse-xref warning proof with corruption controls; original generator/source hashes retained."
+  }
+}

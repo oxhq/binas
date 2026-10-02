@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "license": "Apache-2.0",
+  "origin": "Reuses the original Binas text-field-fill.pdf fixture unchanged; no derivative PDF generated.",
+  "source_path": "fixtures/text-field-fill.pdf",
+  "source_sha256": "c9852c3613b050cc841f94d40008f1526e8cacfb16df162655e3c74e96d6e587",
+  "source_bytes": 8043,
+  "source_provenance_path": "fixtures/text-field-fill.provenance.json",
+  "source_provenance_sha256": "324f8979a867754d3f5e11ed10d5b816f208520f30df2e554ff4c9fee02cb9ab",
+  "source_generator_sha256": "5007043bf72551adbfc776c8ec27443ff0c32c865fb76e559171394febd4e2c0",
+  "oracle_sha256": "e268e190b3c4c3385f24fb24ce996df2c046ba37578547a943fd14456d6231d6",
+  "python": "3.12.14",
+  "pypdf": "6.10.0",
+  "request": {
+    "page_index": 0,
+    "field_names": {
+      "group.name": "group.name_copy",
+      "group.keep": "group.keep_copy"
+    }
+  },
+  "source_occurrence_mapping": [
+    0,
+    0,
+    1
+  ],
+  "original_destination_retained": 4,
+  "expected_new_objects": 5,
+  "assurance": "Source identity/reader check only; independent self-check and actual engine outputs are separate gates."
+}

@@ -108,12 +108,13 @@ pass declaration.
 | --- | --- | --- |
 | Reorder, geometry, duplicate, delete | Frozen structured fixture; exact inventory/navigation/form/page effects and RGB render comparison for I/C | Other document producers/shapes, logical reading order and universal accessibility remain unchecked |
 | Checkbox, targeted flatten, fixed-template fill | Frozen field/widget/appearance fixtures; field values, active registrations, unrelated objects and RGB output for I/C | Other field types/templates, font substitution and secure erasure remain unchecked |
-| Lossless image storage | Frozen RGB/gray sample/predictor and encoded mask fixture; exact decoded samples/dictionaries plus RGB render for I/C | Image replacement/conversion and a target whole-file size remain unqualified |
+| Lossless image storage | Frozen RGB/gray sample/predictor and encoded mask fixture; exact decoded samples/dictionaries plus RGB render for I/C | Image conversion and a target whole-file size remain unqualified |
+| Legacy raw RGB image replacement | Existing unmasked 2x2 RGB image in the same frozen fixture; exact requested samples and untouched objects/streams; independent pypdf golden and RGB render; mask/incorrect-sample refusals | Other dimensions, encoded JPEG/JPX replacement and color conversion have repository regressions only, without independent qualification here |
 | Retained annotation Contents; legacy annotation/form create/remove | Public nontext consumer and [lifecycle oracle](../../../qa/nontext-boundary/oracle.py); declared field/annotation effects and retained object inventory | Only enumerated consumer cases; no general annotation appearance/accessibility qualification |
 | Legacy page import/extract | Frozen Type3 shared/separate resource controls; inventory/text and independent rendering, including missing-font/altered-glyph controls | Unsupported catalog families still refuse or need explicit reported removal; no broad import preservation |
-| Other legacy image replacement, stream/canonical/security/OCR operations | Repository regressions listed above only; no independent nontext qualification | Not independently or externally qualified by this cohort; keep conditional preconditions and existing APIs |
+| Other legacy encoded image replacement, stream/canonical/security/OCR operations | Repository regressions listed above only; no independent nontext qualification | Not independently or externally qualified by this cohort; keep conditional preconditions and existing APIs |
 
-Observed peak memory is a separate [probe contract](../../../docs/peak-memory.md)
+Observed peak memory is a separate [packaged probe contract](peak-memory.md)
 and [harness](../../../qa/peak-memory/run.py), covering its named native, Node and
 Chromium textual cases plus any explicitly recorded nontext case. Observed OS/
 runtime peaks, byte parity and hard-limit refusals do not turn logical limits into

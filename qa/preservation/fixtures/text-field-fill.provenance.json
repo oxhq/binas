@@ -1,0 +1,71 @@
+{
+  "schema": 1,
+  "license": "Apache-2.0",
+  "origin": "Original Apache-2.0 retained text-field fill fixture and independent gate.\n\nTwo terminal Tx values change in one revision, followed by reorder [1,0]. Each\nselected widget receives a private appearance clone with one replaced text token.\nAn unselected field keeps the shared original appearance. Fonts, static paint,\nclip, geometry, defaults and document structures remain. This fixed Courier\ntemplate case is not arbitrary font, shaping, accessibility or layout assurance.",
+  "external_assets": [],
+  "path": "fixtures/text-field-fill.pdf",
+  "bytes": 8043,
+  "sha256": "c9852c3613b050cc841f94d40008f1526e8cacfb16df162655e3c74e96d6e587",
+  "generator": "text_field_oracle.py --generate-fixture",
+  "generator_sha256": "5007043bf72551adbfc776c8ec27443ff0c32c865fb76e559171394febd4e2c0",
+  "oracle_sha256": "8fb9ec0481ab8809d88a219201adcc011de515193a4d04e5437db0908f27dd19",
+  "python": "3.12.14",
+  "pypdf": "6.10.0",
+  "request": {
+    "fields": {
+      "group.name": "Café (A) \\ B",
+      "code": "Ready (2)"
+    },
+    "page_order": [
+      1,
+      0
+    ]
+  },
+  "source_field_ids": {
+    "group.name": {
+      "field": 8,
+      "widgets": [
+        [
+          9,
+          3
+        ],
+        [
+          10,
+          4
+        ]
+      ],
+      "appearance": 14,
+      "old": "Old"
+    },
+    "code": {
+      "field": 12,
+      "widgets": [
+        [
+          12,
+          4
+        ]
+      ],
+      "appearance": 15,
+      "old": "Start"
+    }
+  },
+  "unselected_shared_owner": 11,
+  "shared_ap_dictionary": 33,
+  "appearance_font": 19,
+  "page_font": 21,
+  "cmap": 22,
+  "explicit_widths": 600,
+  "font_bbox": [
+    -50,
+    -250,
+    650,
+    900
+  ],
+  "assurance": "Original synthetic source only; self-check and Binas outputs require separate gates.",
+  "oracle_revision": {
+    "fixture_rewritten": false,
+    "current_generator_matches_frozen_bytes": true,
+    "original_generator_sha256_retained": "5007043bf72551adbfc776c8ec27443ff0c32c865fb76e559171394febd4e2c0",
+    "change": "Accept only original escaped-literal or canonical uppercase-hex encoding at the independently located source Tj operand, with exact source prefix/suffix and independently parsed requested glyph bytes. Independent render author remains literal. Wrong-text controls mutate either encoding."
+  }
+}
