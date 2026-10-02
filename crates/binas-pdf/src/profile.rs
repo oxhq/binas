@@ -24,6 +24,7 @@ pub enum CapabilityDecision {
 pub struct OperationCapability {
     pub operation: String,
     pub decision: CapabilityDecision,
+    /// Human diagnostic, not a stable identifier or a complete shape preflight.
     pub reason: String,
 }
 
@@ -48,6 +49,7 @@ pub struct DocumentCapabilityProfile {
 impl DocumentCapabilityProfile {
     pub const VERSION: u32 = 1;
 
+    /// Unknown family IDs return `None` and must be treated as unavailable.
     pub fn operation(&self, name: &str) -> Option<&OperationCapability> {
         self.operations
             .iter()
@@ -56,6 +58,9 @@ impl DocumentCapabilityProfile {
 }
 
 impl PdfDocument {
+    /// Coarse document/security inventory. Conditional entries still require
+    /// the selected operation's shape, ownership, writer and resource checks.
+    /// This profile does not qualify a runtime or imply a JavaScript binding.
     pub fn capability_profile(&self) -> Result<DocumentCapabilityProfile, PdfError> {
         let inspected = self.inspect()?;
         let encryption = inspect_encryption(self)?;
@@ -180,11 +185,31 @@ fn operation_capabilities(
             CapabilityDecision::Conditional,
             "supported when page content filters, fonts, and character mappings are decodable",
         ),
-        mutation_capability("canonicalize", mutation_refusal),
-        mutation_capability("page_operations", mutation_refusal),
-        mutation_capability("annotation_mutation", mutation_refusal),
-        mutation_capability("stream_mutation", mutation_refusal),
-        mutation_capability("image_replacement", mutation_refusal),
+        mutation_capability(
+            "canonicalize",
+            mutation_refusal,
+            "requires supported object/filter encoding and output limits; structural rewrite is not complete preservation proof",
+        ),
+        mutation_capability(
+            "page_operations",
+            mutation_refusal,
+            "requires operation-specific page/resource ownership and document-entry policy; assembly omissions must be explicit and reported",
+        ),
+        mutation_capability(
+            "annotation_mutation",
+            mutation_refusal,
+            "requires supported subtype, geometry and ownership; retained Contents edits refuse appearance-bearing annotations",
+        ),
+        mutation_capability(
+            "stream_mutation",
+            mutation_refusal,
+            "requires supported filter/DecodeParms encoding and proven stream ownership; opaque stream semantics are unchecked",
+        ),
+        mutation_capability(
+            "image_replacement",
+            mutation_refusal,
+            "requires supported encoded image shape, dimensions, color space, mask policy and ownership; this is not general image conversion",
+        ),
     ];
     output.push(if let Some(reason) = mutation_refusal {
         capability("form_lifecycle", CapabilityDecision::Refused, reason)
@@ -197,8 +222,8 @@ fn operation_capabilities(
     } else {
         capability(
             "form_lifecycle",
-            CapabilityDecision::Supported,
-            "AcroForm lifecycle mutation is available with operation-specific validation",
+            CapabilityDecision::Conditional,
+            "requires supported AcroForm field/widget ownership and appearances; retained fill and flatten are separate bounded operations, without reflow or font substitution",
         )
     });
     output.push(if encryption.encrypted {
@@ -289,14 +314,14 @@ fn decryption_capability(encryption: &EncryptionMetadata) -> OperationCapability
     }
 }
 
-fn mutation_capability(operation: &str, refusal: Option<&str>) -> OperationCapability {
+fn mutation_capability(
+    operation: &str,
+    refusal: Option<&str>,
+    preconditions: &str,
+) -> OperationCapability {
     match refusal {
         Some(reason) => capability(operation, CapabilityDecision::Refused, reason),
-        None => capability(
-            operation,
-            CapabilityDecision::Conditional,
-            "available when operation-specific structure and filter checks pass",
-        ),
+        None => capability(operation, CapabilityDecision::Conditional, preconditions),
     }
 }
 

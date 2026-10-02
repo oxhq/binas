@@ -86,6 +86,18 @@ fn reports_stable_bounded_secret_free_capabilities() {
         profile.operation("canonicalize").unwrap().decision,
         CapabilityDecision::Conditional
     );
+    for operation in [
+        "page_operations",
+        "annotation_mutation",
+        "stream_mutation",
+        "image_replacement",
+        "form_lifecycle",
+    ] {
+        let capability = profile.operation(operation).unwrap();
+        assert_eq!(capability.decision, CapabilityDecision::Conditional);
+        assert!(!capability.reason.is_empty());
+    }
+    assert!(profile.operation("unknown.future.operation").is_none());
     assert_eq!(
         profile.operation("external_signing").unwrap().decision,
         CapabilityDecision::Supported
@@ -93,6 +105,41 @@ fn reports_stable_bounded_secret_free_capabilities() {
     let json = serde_json::to_string(&profile).unwrap();
     assert!(!json.contains("SECRET-FIELD"));
     assert!(!json.contains("SECRET-ANNOTATION"));
+}
+
+#[test]
+fn conditional_page_inventory_preserves_success_and_shape_refusal_paths() {
+    let document = open(&plain_pdf());
+    assert_eq!(
+        document
+            .capability_profile()
+            .unwrap()
+            .operation("page_operations")
+            .unwrap()
+            .decision,
+        CapabilityDecision::Conditional
+    );
+    let copied = document.copy_pages(&[0]).unwrap();
+    assert!(copied.verification.passed);
+    assert_eq!(open(&copied.bytes).inspect().unwrap().page_count, 1);
+
+    // Parsing and a Conditional family entry do not authorize silently dropping
+    // the original AcroForm when assembling selected pages.
+    let with_form = open(&pdf());
+    assert_eq!(
+        with_form
+            .capability_profile()
+            .unwrap()
+            .operation("page_operations")
+            .unwrap()
+            .decision,
+        CapabilityDecision::Conditional
+    );
+    assert_eq!(
+        with_form.copy_pages(&[0]).unwrap_err().code,
+        binas_pdf::PdfErrorCode::UnsupportedFeature
+    );
+    assert_eq!(binas_pdf::list_form_fields(&with_form).unwrap().len(), 1);
 }
 
 #[test]
@@ -107,6 +154,19 @@ fn reports_encryption_signatures_and_dynamic_xfa_as_operation_boundaries() {
         })
         .unwrap();
     let encrypted_profile = open(&encrypted.bytes).capability_profile().unwrap();
+    for operation in [
+        "canonicalize",
+        "page_operations",
+        "annotation_mutation",
+        "stream_mutation",
+        "image_replacement",
+        "form_lifecycle",
+    ] {
+        assert_eq!(
+            encrypted_profile.operation(operation).unwrap().decision,
+            CapabilityDecision::Refused
+        );
+    }
     assert_eq!(
         encrypted_profile
             .operation("external_signing")
@@ -129,6 +189,18 @@ fn reports_encryption_signatures_and_dynamic_xfa_as_operation_boundaries() {
         signed_profile.operation("canonicalize").unwrap().decision,
         CapabilityDecision::Refused
     );
+    for operation in [
+        "page_operations",
+        "annotation_mutation",
+        "stream_mutation",
+        "image_replacement",
+        "form_lifecycle",
+    ] {
+        assert_eq!(
+            signed_profile.operation(operation).unwrap().decision,
+            CapabilityDecision::Refused
+        );
+    }
 
     let xfa_profile = open(&dynamic_xfa_pdf()).capability_profile().unwrap();
     assert!(xfa_profile.xfa_dynamic);

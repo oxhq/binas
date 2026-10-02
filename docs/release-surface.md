@@ -1,11 +1,19 @@
 # Rust 0.2.0 release candidate
 
-This is an unpublished local candidate. The proposed support profile is bounded
-synchronous textual operation on native Windows/MSVC, Node and single-thread
-Chromium WASM. Publication and support-profile approval remain separate decisions.
+This is an unpublished local candidate. The proposed support profile covers
+bounded synchronous textual and finite nontext operations on native Windows/MSVC,
+with operation-specific shapes in the matrix below. Node and single-thread
+Chromium WASM cover the bounded synchronous textual cohort. Publication and
+support-profile approval remain separate decisions.
 Oxpdf is a minimal consumer, with no editor or UI expansion. The prior frozen
 Go CLI/oracle and rollback contract is preserved in
 [go-release-surface.md](go-release-surface.md).
+
+The [operation/shape/export/runtime matrix](operation-support-matrix.md) names
+the actual retained requests, legacy routes and their finite gates. Page, form,
+annotation and image families are conditional; the coarse capability profile is
+not a complete shape preflight or runtime qualification. Node/Chromium textual
+session evidence does not qualify every native Rust mutation in those runtimes.
 
 ## API and behavior relative to cached registry 0.1.1
 
@@ -34,12 +42,20 @@ report omissions. Legacy verification does not imply broader preservation.
 
 | Original plan | Executed/proposed candidate | Impact |
 | --- | --- | --- |
-| P4 worker recovery/cancel and peak memory | Synchronous/cooperative profile; no recovery, mid-call browser cancel or total heap/CPU bound | Support approval needed; broader P4 remains outside candidate |
-| P5 diverse independent preservation | Small licensed textual cohort with effects/refusals and external oracles | No universal PDF, forms/tags/accessibility or all-operations claim |
-| P6 representative/competitive measurements | Retained/reopen textual equivalents, split phases and bounded independent-session concurrency | No Bento ranking, total copies/allocations/peak memory or broad compression claim |
+| P4 worker recovery/cancel and peak memory | Synchronous/cooperative profile with separate observed process-memory and WASM-linear-memory probes | No worker recovery, mid-call browser cancel, true allocator-heap peak or total process/heap/CPU bound; support approval and broader P4 remain pending |
+| P5 diverse independent preservation | Licensed textual and finite native nontext cohorts with requested-effect/preservation oracles, including supported Tx/checkbox field, page, annotation and lossless-image cases | Only the matrix's named shapes and gates; no universal PDF, arbitrary forms, logical reading order, accessibility or all-operations claim |
+| P6 representative/competitive measurements | Retained/reopen textual equivalents, split phases, bounded independent-session concurrency and observed process/WASM-linear memory for named cases | No Bento ranking, complete copy/allocation accounting, universal memory guarantee or broad compression claim |
 | Oxpdf public package without overrides | Minimal isolated facade/session consumers from extracted artifacts; explicit sibling patches | Local consumption; public registry resolution follows approved publication |
 | Future C ABI/FFI | Direct Rust and generated WASM/JS only | No completed C interface claim |
 | P7 product/editor | Excluded | No UI or general PDF expansion |
+
+The [nontext boundary harness](../qa/nontext-boundary/run.py) and
+[memory probes](../qa/peak-memory/run.py) keep exact outcomes in external evidence.
+Process-memory observations and WASM linear-memory high-water marks are separate
+from managed live/decode/work budgets and true allocator-heap peaks. These probes
+do not raise engine/binding limits or extend JavaScript qualification to the
+native nontext cohort. Their existence and this scope table do not declare a gate
+passed; promotion requires the recorded run for the approved source and artifacts.
 
 ## Publication proposal and rollback
 

@@ -22,6 +22,11 @@ not whole-process memory limits. This API is absent from the published 0.1.1
 crate. See [the session contract](docs/pdf-sessions.md) for
 ownership, errors, cancellation and resource-accounting scope.
 
+The [operation support matrix](docs/operation-support-matrix.md) names the
+conditional page/form/annotation/image shapes, retained and legacy export routes,
+and finite native/JavaScript gates. The coarse capability profile does not
+preflight every shape or qualify every Rust method in Node/Chromium.
+
 The crate archive contains production sources and contracts. Repository tests
 and their fixture corpora are maintained in the checkout; `cargo test` inside an
 extracted archive is not a supported test distribution. See
