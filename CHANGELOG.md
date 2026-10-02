@@ -1,5 +1,19 @@
 # Changelog
 
+## Rust 0.2.0 (local release candidate; unpublished)
+
+- Adds source/revision identities, bounded operation contexts, selected revision
+  reads, retained text preparation/acceptance and native/JavaScript sessions.
+- Keeps raw ASCII and font-aware text edits as separate conditional contracts;
+  receipts expose checked and unchecked scopes rather than universal fidelity.
+- Changes public struct and exhaustive enum surfaces; migration from 0.1.1
+  requires the 0.2 dependency range. See [migration and support](docs/release-surface.md).
+- Packages production sources, licenses and the session contract; repository
+  regression fixtures with unverified provenance are excluded from archives.
+
+This entry identifies local source and artifact work. It does not claim registry
+publication, hosted CI, arbitrary worker recovery, C ABI or total heap/CPU bounds.
+
 ## Rust 0.1.1
 
 - Report the Apache-2.0 SPDX license correctly on crates.io and include the canonical license in every published crate archive.

@@ -1,0 +1,15 @@
+[package]
+name = "binas-release-artifact-consumer"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+binas-pdf = "=__VERSION__"
+binas-core = "=__VERSION__"
+
+[patch.crates-io]
+binas-pdf = { path = "__PDF_ARTIFACT__" }
+binas-core = { path = "__CORE_ARTIFACT__" }

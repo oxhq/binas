@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+include = ["Cargo.toml", "README.md", "LICENSE", "src/**", "docs/**", "examples/session_measure.rs"]
 description = "Bounded, fail-closed PDF inspection and verified rewrite engine"
 readme = "README.md"
 keywords = ["pdf", "parser", "security"]

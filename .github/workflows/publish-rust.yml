@@ -61,12 +61,11 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --locked
-      - name: Verify binas-core package
-        run: cargo package -p binas-core --locked
-      - name: Verify binas-pdf package against local binas-core
-        run: cargo package -p binas-pdf --locked --config 'patch.crates-io.binas-core.path="crates/binas-core"'
-      - name: Verify binas-cli package against local libraries
-        run: cargo package -p binas-cli --locked --config 'patch.crates-io.binas-core.path="crates/binas-core"' --config 'patch.crates-io.binas-pdf.path="crates/binas-pdf"'
+      - name: Verify packaged crates and artifact-only consumer
+        # Unpublished sibling versions need overrides to extracted archives.
+        # Disposable staging may update resolver metadata; source lock stays fixed.
+        # MSRV is a separate gate; this step uses the workflow's active toolchain.
+        run: python3 qa/release-candidate/package.py --source . --out "$RUNNER_TEMP/binas-packages" --target "$RUNNER_TEMP/binas-package-target" --msrv ''
 
   publish-core:
     needs: validate

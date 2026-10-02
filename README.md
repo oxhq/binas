@@ -6,6 +6,10 @@ The engine parses PDF object/content structure, exposes queryable nodes, and app
 
 ## Rust workspace
 
+This checkout prepares an **unpublished Rust 0.2.0 release candidate**. The new
+retained APIs require the local artifacts until publication is approved. See
+[migration and support](docs/release-surface.md) for its bounded profile.
+
 For a published Rust release, add the engine or install the CLI from crates.io:
 
 ```powershell
