@@ -67,6 +67,12 @@ def main():
     for path in filter(None, tracked):
         if (source / path).is_file():
             shutil.copyfile(source / path, staging / path)
+    # Copying exact bytes over a Windows checkout can leave libgit2 stat/EOL
+    # entries dirty even when normalized blobs are identical. Refresh only the
+    # tracked disposable clone; no staged source delta is allowed.
+    run('stage-index-refresh', ['git', 'add', '-u'], staging)
+    assert not subprocess.check_output(['git', '-C', str(staging), 'diff', '--cached', '--name-only']).strip()
+    assert not subprocess.check_output(['git', '-C', str(staging), 'status', '--porcelain']).strip()
     extracted = out / 'extracted'
     archives = out / 'archives'
     extracted.mkdir()
