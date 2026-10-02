@@ -70,7 +70,10 @@ def main():
     # Copying exact bytes over a Windows checkout can leave libgit2 stat/EOL
     # entries dirty even when normalized blobs are identical. Refresh only the
     # tracked disposable clone; no staged source delta is allowed.
-    run('stage-index-refresh', ['git', 'add', '-u'], staging)
+    refresh_paths = out / 'stage-refresh-paths.nul'
+    refresh_paths.write_bytes('\0'.join(filter(None, tracked)).encode('utf-8') + b'\0')
+    run('stage-index-refresh', ['git', '--literal-pathspecs', 'add',
+        '--pathspec-from-file=' + str(refresh_paths), '--pathspec-file-nul'], staging)
     assert not subprocess.check_output(['git', '-C', str(staging), 'diff', '--cached', '--name-only']).strip()
     assert not subprocess.check_output(['git', '-C', str(staging), 'status', '--porcelain']).strip()
     extracted = out / 'extracted'
