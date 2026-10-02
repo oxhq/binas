@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-include = ["Cargo.toml", "README.md", "LICENSE", "src/**", "docs/**"]
+include = ["/Cargo.toml", "/README.md", "/LICENSE", "/src/**", "/docs/**"]
 description = "Shared checked spans, selectors, diagnostics, and verification types for Binas engines"
 readme = "README.md"
 

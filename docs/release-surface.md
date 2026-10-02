@@ -63,3 +63,11 @@ After approval, create the matching `rust-v0.2.0` tag and publish under the exis
 protected process. Then run minimal Oxpdf with registry resolution and no patches.
 Keep 0.1.1 and original inputs/outputs for rollback. This local work performs no
 push, tag, PR, GitHub Actions execution or publication.
+
+The current hosted workflow does not provision the producer corpus, independent
+Python/Poppler oracles or Node/Chromium runtime qualification. Its optional
+external-test entries must not be counted as required corpus passes. This local
+candidate proposal requires the recorded P5/oracle/browser/consumer gates for
+the exact approved source hash as a pre-publication check. The workflow's package
+validation complements that local evidence; hosted multi-OS and public registry
+installation remain unproven by this work.
